@@ -7,8 +7,9 @@
     "use strict";
 
     // Application State
+    const urlParams = new URLSearchParams(window.location.search);
     const state = {
-        tableId: "table-1",
+        tableId: urlParams.get("table_id") || "coinpoker-live",
         ws: null,
         reconnectTimer: null,
         soundEnabled: true,
@@ -153,7 +154,10 @@
     // Hand Evaluation Heuristic for HUD Label
     function determineMadeHandLabel(heroCards, boardCards) {
         if (!heroCards || heroCards.length < 2 || !heroCards[0] || heroCards[0].rank === "?") {
-            return "Awaiting Cards...";
+            if (boardCards && boardCards.length > 0) {
+                return `Board: ${boardCards.map(c => c.rank + c.symbol).join(" ")} (Spectating)`;
+            }
+            return "Spectating Table (Waiting for Hero Seat)...";
         }
 
         const h1 = heroCards[0].rank;
@@ -335,8 +339,14 @@
             }
         });
 
-        // 4. Hand Rank Label
+        // 4. Hand Rank Label & Status
         elements.hudHandRank.textContent = determineMadeHandLabel(parsedHeroCards, boardCards);
+
+        if (!state.currentAdvice) {
+            elements.hudReasoningText.textContent = parsedHeroCards.length === 2
+                ? "Hero cards recognized. Calculating optimal EV action..."
+                : "Spectator Mode · Tracking table pot, bets, and opponent statistics...";
+        }
 
         // 5. Sizing Matrix dynamic calculation
         updateSizingGrid(handState);

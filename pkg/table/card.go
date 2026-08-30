@@ -1,6 +1,7 @@
 package table
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -184,4 +185,39 @@ func ParseCards(s string) ([]Card, error) {
 		res = append(res, c)
 	}
 	return res, nil
+}
+
+// MarshalJSON formats the card as a clean 2-char string (e.g. "Ah", "2d").
+func (c Card) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.String())
+}
+
+// UnmarshalJSON parses a card from either a string ("Ah") or an object ({"rank":14,"suit":1}).
+func (c *Card) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if s == "" || s == "?" || s == "?s" || s == "??" {
+			*c = Card{}
+			return nil
+		}
+		parsed, err := ParseCard(s)
+		if err != nil {
+			*c = Card{}
+			return nil
+		}
+		*c = parsed
+		return nil
+	}
+
+	var raw struct {
+		Rank Rank `json:"rank"`
+		Suit Suit `json:"suit"`
+	}
+	if err := json.Unmarshal(data, &raw); err == nil {
+		c.Rank = raw.Rank
+		c.Suit = raw.Suit
+		return nil
+	}
+
+	return nil
 }
