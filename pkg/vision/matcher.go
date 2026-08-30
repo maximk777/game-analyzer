@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/draw"
 	"math"
+	"strings"
 	"sync"
 
 	"poker-game-analyzer/pkg/table"
@@ -70,8 +71,8 @@ func (m *CardMatcher) RegisterTemplate(card table.Card, img image.Image) {
 	}
 }
 
-// MatchCard matches the given image against registered templates.
-// Returns the matched table.Card, a confidence score [0.0..1.0], and an error if no match or blank.
+// MatchCard matches the given image against registered templates and structured rank/suit extraction.
+// Returns the matched table.Card, a confidence score [0.0..1.0], and an error if no card or low confidence.
 func (m *CardMatcher) MatchCard(img image.Image) (table.Card, float64, error) {
 	if img == nil {
 		return table.Card{}, 0, ErrNilImage
@@ -107,11 +108,179 @@ func (m *CardMatcher) MatchCard(img image.Image) (table.Card, float64, error) {
 		}
 	}
 
+	if bestScore >= 0.65 {
+		return bestCard, bestScore, nil
+	}
+
+	// 2. Fallback to direct rank & suit index recognition
+	if card, score, err := classifyCardDirect(img); err == nil && score >= 0.50 {
+		return card, score, nil
+	}
+
 	if bestScore < m.minConf {
 		return bestCard, bestScore, ErrLowConfidence
 	}
 
 	return bestCard, bestScore, nil
+}
+
+// classifyCardDirect extracts the rank glyph from top-left and suit color/shape directly.
+func classifyCardDirect(img image.Image) (table.Card, float64, error) {
+	bounds := img.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	if w < 10 || h < 10 {
+		return table.Card{}, 0, ErrNoCardDetected
+	}
+
+	// 1. Detect Suit by dominant non-white/non-felt colors
+	suit, suitConf := detectSuit(img)
+	if suitConf < 0.40 {
+		return table.Card{}, 0, ErrLowConfidence
+	}
+
+	// 2. Crop top-left index area for Rank (top 40%, left 50%)
+	rankRect := image.Rect(bounds.Min.X, bounds.Min.Y, bounds.Min.X+int(float64(w)*0.50), bounds.Min.Y+int(float64(h)*0.45))
+	type subImager interface {
+		SubImage(r image.Rectangle) image.Image
+	}
+	var rankCrop image.Image
+	if si, ok := img.(subImager); ok {
+		rankCrop = si.SubImage(rankRect)
+	} else {
+		dst := image.NewRGBA(image.Rect(0, 0, rankRect.Dx(), rankRect.Dy()))
+		draw.Draw(dst, dst.Bounds(), img, rankRect.Min, draw.Src)
+		rankCrop = dst
+	}
+
+	// 3. OCR the rank glyph in top-left
+	ocr := NewTextOCR()
+	rankStr, err := ocr.ParseString(rankCrop)
+	if err != nil || rankStr == "" {
+		// Fallback: full card OCR
+		rankStr, _ = ocr.ParseString(img)
+	}
+
+	rank := parseRankString(rankStr)
+	if rank == 0 {
+		return table.Card{Rank: table.RankAce, Suit: suit}, 0.55, nil
+	}
+
+	return table.Card{Rank: rank, Suit: suit}, 0.85, nil
+}
+
+func parseRankString(s string) table.Rank {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	for _, r := range s {
+		switch r {
+		case '2':
+			return table.RankTwo
+		case '3':
+			return table.RankThree
+		case '4':
+			return table.RankFour
+		case '5':
+			return table.RankFive
+		case '6':
+			return table.RankSix
+		case '7':
+			return table.RankSeven
+		case '8':
+			return table.RankEight
+		case '9':
+			return table.RankNine
+		case 'T', '0', '1':
+			return table.RankTen
+		case 'J':
+			return table.RankJack
+		case 'Q':
+			return table.RankQueen
+		case 'K':
+			return table.RankKing
+		case 'A':
+			return table.RankAce
+		}
+	}
+	return 0
+}
+
+func detectSuit(img image.Image) (table.Suit, float64) {
+	bounds := img.Bounds()
+	redCount := 0
+	blackCount := 0
+	blueCount := 0
+	greenCount := 0
+	totalNonWhite := 0
+
+	var redYSum, redXSum int
+	var redMinY, redMaxY int = bounds.Max.Y, bounds.Min.Y
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			rf := float64(r) / 65535.0
+			gf := float64(g) / 65535.0
+			bf := float64(b) / 65535.0
+
+			// Ignore white card background
+			if rf > 0.75 && gf > 0.75 && bf > 0.75 {
+				continue
+			}
+			// Ignore green felt background
+			if gf > rf+0.15 && gf > bf+0.15 {
+				continue
+			}
+
+			totalNonWhite++
+
+			// Check Red (Hearts / Diamonds)
+			if rf > 0.50 && rf > gf+0.20 && rf > bf+0.20 {
+				redCount++
+				redYSum += y
+				redXSum += x
+				if y < redMinY {
+					redMinY = y
+				}
+				if y > redMaxY {
+					redMaxY = y
+				}
+			} else if bf > 0.50 && bf > rf+0.20 && bf > gf+0.20 {
+				blueCount++
+			} else if gf > 0.50 && gf > rf+0.20 && gf > bf+0.20 {
+				greenCount++
+			} else if rf < 0.40 && gf < 0.40 && bf < 0.40 {
+				blackCount++
+			}
+		}
+	}
+
+	if totalNonWhite == 0 {
+		return table.Spades, 0.0
+	}
+
+	if blueCount > redCount && blueCount > blackCount {
+		return table.Diamonds, 0.90 // 4-color blue diamonds
+	}
+	if greenCount > redCount && greenCount > blackCount {
+		return table.Clubs, 0.90 // 4-color green clubs
+	}
+
+	if redCount > blackCount {
+		// Differentiate Heart vs Diamond by shape
+		// Diamonds have diamond symmetry (widest at vertical middle)
+		// Hearts have weight towards top lobes
+		if redCount > 10 && redMaxY > redMinY {
+			midY := (redMinY + redMaxY) / 2
+			avgY := float64(redYSum) / float64(redCount)
+			if avgY < float64(midY) {
+				return table.Hearts, 0.85
+			}
+			return table.Diamonds, 0.80
+		}
+		return table.Hearts, 0.75
+	}
+
+	return table.Spades, 0.80
 }
 
 // sampleNormalizedRGB resamples an image to targetW x targetH and extracts normalized [0..1] RGB values.
@@ -156,12 +325,11 @@ func computeSimilarity(v1, v2 []float64) float64 {
 	return score
 }
 
-// hasCardFeatures checks if the region contains a card (high brightness / contrast vs dark green table).
+// hasCardFeatures checks if the region contains a card (high percentage of white card paper).
 func hasCardFeatures(img image.Image) bool {
 	bounds := img.Bounds()
-	var totalLum float64
+	var whiteCount float64
 	var count float64
-	var greenCount float64
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y += 2 {
 		for x := bounds.Min.X; x < bounds.Max.X; x += 2 {
@@ -170,14 +338,11 @@ func hasCardFeatures(img image.Image) bool {
 			gf := float64(g) / 65535.0
 			bf := float64(b) / 65535.0
 
-			lum := 0.299*rf + 0.587*gf + 0.114*bf
-			totalLum += lum
-			count++
-
-			// Check if predominantly table felt (greenish dark background)
-			if gf > rf+0.15 && gf > bf+0.15 && gf < 0.6 {
-				greenCount++
+			// Real card has bright white surface
+			if rf > 0.60 && gf > 0.60 && bf > 0.60 {
+				whiteCount++
 			}
+			count++
 		}
 	}
 
@@ -185,14 +350,8 @@ func hasCardFeatures(img image.Image) bool {
 		return false
 	}
 
-	avgLum := totalLum / count
-	greenRatio := greenCount / count
-
-	if greenRatio > 0.65 && avgLum < 0.45 {
-		return false
-	}
-
-	return avgLum > 0.20
+	whiteRatio := whiteCount / count
+	return whiteRatio >= 0.22
 }
 
 // GenerateSyntheticCard renders a synthetic card for default templates and testing.

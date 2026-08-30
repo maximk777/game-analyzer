@@ -112,6 +112,15 @@ var ocrFontTemplates = map[rune][7]string{
 		"   1 ",
 		" 111 ",
 	},
+	',': {
+		"     ",
+		"     ",
+		"     ",
+		"     ",
+		"  11 ",
+		"  11 ",
+		" 1   ",
+	},
 	'.': {
 		"     ",
 		"     ",
@@ -220,6 +229,42 @@ var ocrFontTemplates = map[rune][7]string{
 		"1   1",
 		"1   1",
 	},
+	'J': {
+		"  111",
+		"    1",
+		"    1",
+		"    1",
+		"    1",
+		"1   1",
+		" 111 ",
+	},
+	'Q': {
+		" 111 ",
+		"1   1",
+		"1   1",
+		"1   1",
+		"1 1 1",
+		"1  1 ",
+		" 11 1",
+	},
+	'K': {
+		"1   1",
+		"1  1 ",
+		"1 1  ",
+		"11   ",
+		"1 1  ",
+		"1  1 ",
+		"1   1",
+	},
+	'T': {
+		"11111",
+		"  1  ",
+		"  1  ",
+		"  1  ",
+		"  1  ",
+		"  1  ",
+		"  1  ",
+	},
 }
 
 // TextOCR provides fast OCR for reading bets, stacks, pot, and player labels.
@@ -281,8 +326,14 @@ func (ocr *TextOCR) ParseString(img image.Image) (string, error) {
 		}
 		lastMaxX = g.maxX
 
-		// Check dot / period near bottom of line
-		if gh <= int(float64(lineH)*0.45) && g.minY >= lineMinY+int(float64(lineH)*0.40) {
+		// Check dot / period / comma near bottom of line
+		if gh <= int(float64(lineH)*0.55) && g.minY >= lineMinY+int(float64(lineH)*0.35) {
+			norm := normalizeGlyphInLine(bin, w, g, lineMinY, lineMaxY)
+			r, score := ocr.matchGlyph(norm)
+			if r == ',' && score >= 0.45 {
+				sb.WriteRune(',')
+				continue
+			}
 			sb.WriteRune('.')
 			continue
 		}
@@ -354,11 +405,13 @@ func parseAmountString(s string) (float64, error) {
 
 		multiplier := 1.0
 		cleanToken := strings.TrimFunc(token, func(r rune) bool {
-			return !unicode.IsDigit(r) && r != '.' && r != 'k' && r != 'K' && r != 'm' && r != 'M'
+			return !unicode.IsDigit(r) && r != '.' && r != ',' && r != 'k' && r != 'K' && r != 'm' && r != 'M'
 		})
 		if cleanToken == "" {
 			continue
 		}
+
+		cleanToken = strings.ReplaceAll(cleanToken, ",", "")
 
 		lower := strings.ToLower(cleanToken)
 		if strings.HasSuffix(lower, "k") {

@@ -38,14 +38,15 @@ type Config struct {
 
 // AgentApp encapsulates the entire runtime environment for the live assistant.
 type AgentApp struct {
-	cfg       Config
-	db        *storage.SQLiteDB
-	cache     *storage.MemoryCache
-	llmClient llm.Client
-	prof      *profiler.Profiler
-	srv       *server.Server
-	liveAgent *capture.LiveAgent
-	grabber   capture.FrameGrabber
+	cfg          Config
+	db           *storage.SQLiteDB
+	cache        *storage.MemoryCache
+	llmClient    llm.Client
+	prof         *profiler.Profiler
+	srv          *server.Server
+	liveAgent    *capture.LiveAgent
+	grabber      capture.FrameGrabber
+	macVisionCmd *exec.Cmd
 
 	errCh chan error
 }
@@ -165,12 +166,30 @@ func (app *AgentApp) Start(ctx context.Context) error {
 		}()
 	}
 
+	// On macOS, launch ScreenCaptureKit Vision Helper if available
+	if runtime.GOOS == "darwin" {
+		binPath := "./bin/mac_vision_agent"
+		if _, err := os.Stat(binPath); err == nil {
+			cmd := exec.Command(binPath)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err == nil {
+				app.macVisionCmd = cmd
+				log.Printf("[AGENT] Native macOS ScreenCaptureKit Vision helper started (PID %d)", cmd.Process.Pid)
+			}
+		}
+	}
+
 	return nil
 }
 
 // Stop gracefully shuts down all running agent services.
 func (app *AgentApp) Stop(ctx context.Context) error {
 	var firstErr error
+
+	if app.macVisionCmd != nil && app.macVisionCmd.Process != nil {
+		_ = app.macVisionCmd.Process.Kill()
+	}
 
 	if app.liveAgent != nil {
 		app.liveAgent.Stop()

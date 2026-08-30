@@ -62,42 +62,29 @@ func ListAllWindows() ([]WindowInfo, error) {
 		return nil, fmt.Errorf("native window enumeration only implemented for macOS")
 	}
 
-	// Use AppleScript / JXA to query CoreGraphics window list
-	script := `
-	ObjC.import('Foundation');
-	ObjC.import('CoreGraphics');
-	var rawList = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements, $.kCGNullWindowID);
-	var nsArray = ObjC.castRefToObject(rawList);
-	var res = [];
-	for (var i = 0; i < nsArray.count; i++) {
-		var item = nsArray.objectAtIndex(i);
-		var id = item.objectForKey('kCGWindowNumber');
-		var owner = item.objectForKey('kCGWindowOwnerName');
-		var title = item.objectForKey('kCGWindowName');
-		var bounds = item.objectForKey('kCGWindowBounds');
-		var x = (bounds && bounds.objectForKey('X')) ? bounds.objectForKey('X').js : 0;
-		var y = (bounds && bounds.objectForKey('Y')) ? bounds.objectForKey('Y').js : 0;
-		var w = (bounds && bounds.objectForKey('Width')) ? bounds.objectForKey('Width').js : 0;
-		var h = (bounds && bounds.objectForKey('Height')) ? bounds.objectForKey('Height').js : 0;
-		res.push({
-			id: id ? id.js : 0,
-			owner_name: owner ? owner.js : '',
-			title: title ? title.js : '',
-			x: x,
-			y: y,
-			w: w,
-			h: h,
-			is_on_screen: true
-		});
-	}
-	JSON.stringify(res);
-	`
-	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", script)
+	swiftScript := `import Cocoa
+let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+var res: [[String: Any]] = []
+for w in list {
+    let id = w[kCGWindowNumber as String] as? Int ?? 0
+    let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+    let title = w[kCGWindowName as String] as? String ?? ""
+    let bounds = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+    let x = bounds["X"] as? Double ?? 0
+    let y = bounds["Y"] as? Double ?? 0
+    let w = bounds["Width"] as? Double ?? 0
+    let h = bounds["Height"] as? Double ?? 0
+    res.append(["id": id, "owner_name": owner, "title": title, "x": x, "y": y, "w": w, "h": h, "is_on_screen": true])
+}
+let data = try! JSONSerialization.data(withJSONObject: res, options: [])
+print(String(data: data, encoding: .utf8)!)`
+
+	cmd := exec.Command("swift", "-e", swiftScript)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("osascript failed: %w, stderr: %s", err, stderr.String())
+		return nil, fmt.Errorf("swift window enumeration failed: %w, stderr: %s", err, stderr.String())
 	}
 
 	var rawList []struct {
