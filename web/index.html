@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poker RTA HUD // Real-Time GTO & Exploitative Engine</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body class="theme-dark">
+    <!-- Top Navigation & Control Bar -->
+    <header class="top-nav">
+        <div class="nav-brand">
+            <div class="brand-logo">♠</div>
+            <div class="brand-info">
+                <h1>POKER RTA HUD</h1>
+                <span class="brand-tag">Real-Time Exploitative & GTO Analyzer</span>
+            </div>
+        </div>
+
+        <div class="nav-controls">
+            <div class="control-group">
+                <label for="tableIdInput">Table ID:</label>
+                <input type="text" id="tableIdInput" value="table-1" placeholder="table-1" />
+                <button id="btnConnect" class="btn btn-primary">Connect</button>
+                <button id="btnPauseResume" class="btn btn-secondary">Pause Stream</button>
+            </div>
+
+            <div class="status-group">
+                <div id="connectionPill" class="status-pill status-disconnected">
+                    <span class="status-dot"></span>
+                    <span id="connectionText">Disconnected</span>
+                </div>
+                <div class="metric-pill">
+                    <span class="metric-label">Engine Latency:</span>
+                    <span id="latencyMetric" class="metric-value">-- ms</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Quick Test Action Ribbon -->
+    <div class="test-ribbon">
+        <div class="test-ribbon-title">Test Simulation Controls:</div>
+        <div class="test-buttons">
+            <button id="btnTestStart" class="btn btn-xs btn-outline">1. New Hand</button>
+            <button id="btnTestFlop" class="btn btn-xs btn-outline">2. Deal Flop (A♠ K♦ 2♣)</button>
+            <button id="btnTestTurn" class="btn btn-xs btn-outline">3. Deal Turn (J♥)</button>
+            <button id="btnTestRiver" class="btn btn-xs btn-outline">4. Deal River (8♠)</button>
+            <button id="btnTestBet" class="btn btn-xs btn-outline">5. Opponent Bet $20</button>
+            <button id="btnTestHeroTurn" class="btn btn-xs btn-outline">6. Hero Turn</button>
+            <button id="btnTestEnd" class="btn btn-xs btn-outline">7. Showdown / End</button>
+        </div>
+    </div>
+
+    <!-- Main Application Container -->
+    <main class="main-layout">
+        <!-- Left / Center: Poker Table Canvas & Felt View -->
+        <section class="table-container">
+            <div class="table-header-info">
+                <div class="info-item">
+                    <span class="label">Hand ID:</span>
+                    <span id="handIdDisplay" class="value">--</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Street:</span>
+                    <span id="streetBadge" class="street-badge street-preflop">PREFLOP</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Current Bet:</span>
+                    <span id="currentBetDisplay" class="value">$0.00</span>
+                </div>
+                <div class="info-item">
+                    <span class="label">Min Raise:</span>
+                    <span id="minRaiseDisplay" class="value">$0.00</span>
+                </div>
+            </div>
+
+            <div class="poker-table-wrapper">
+                <!-- Poker Oval Felt -->
+                <div class="poker-felt">
+                    <!-- Felt Texture Ring & Watermark -->
+                    <div class="felt-inner-line"></div>
+                    <div class="felt-watermark">COINPOKER HIGH ROLLER</div>
+
+                    <!-- Center Board Area -->
+                    <div class="center-board">
+                        <div class="pot-container">
+                            <span class="pot-label">TOTAL POT</span>
+                            <div class="pot-amount" id="potDisplay">$0.00</div>
+                        </div>
+
+                        <!-- Community Board Cards (5 Slots) -->
+                        <div class="community-cards" id="communityCardsContainer">
+                            <div class="card-slot empty" data-slot="0"><span class="slot-placeholder">Flop</span></div>
+                            <div class="card-slot empty" data-slot="1"><span class="slot-placeholder">Flop</span></div>
+                            <div class="card-slot empty" data-slot="2"><span class="slot-placeholder">Flop</span></div>
+                            <div class="card-slot empty" data-slot="3"><span class="slot-placeholder">Turn</span></div>
+                            <div class="card-slot empty" data-slot="4"><span class="slot-placeholder">River</span></div>
+                        </div>
+                    </div>
+
+                    <!-- 6 Player Seats Arranged in 6-Max Ring -->
+                    <div class="seats-layer" id="seatsContainer">
+                        <!-- Seats dynamically populated by app.js -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bottom Live Action Log & Event Stream -->
+            <div class="events-panel">
+                <div class="events-panel-header">
+                    <h3>Live Event Ticker & Action History</h3>
+                    <span id="eventCountBadge" class="badge">0 events</span>
+                </div>
+                <div class="events-log-list" id="eventsLogList">
+                    <div class="event-log-entry info">
+                        <span class="timestamp">[00:00:00]</span>
+                        <span class="event-text">Awaiting table connection...</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Right Side: Hero RTA Decision & Advisory HUD Panel -->
+        <aside class="rta-sidebar">
+            <div class="sidebar-card rta-card">
+                <div class="rta-header">
+                    <div class="rta-title-group">
+                        <span class="rta-pill">REAL-TIME ADVICE</span>
+                        <h2>Hero RTA Advisor</h2>
+                    </div>
+                    <div class="hero-hole-cards" id="heroCardsContainer">
+                        <div class="mini-card empty">?</div>
+                        <div class="mini-card empty">?</div>
+                    </div>
+                </div>
+
+                <!-- Equity & Pot Odds Gauges -->
+                <div class="gauges-section">
+                    <div class="gauge-container">
+                        <div class="gauge-header">
+                            <span class="gauge-label">HERO EQUITY (Monte Carlo)</span>
+                            <span class="gauge-val text-accent" id="equityValueDisplay">0.0%</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill equity-fill" id="equityBarFill" style="width: 0%;"></div>
+                        </div>
+                    </div>
+
+                    <div class="gauge-container">
+                        <div class="gauge-header">
+                            <span class="gauge-label">POT ODDS TO CALL</span>
+                            <span class="gauge-val text-warning" id="potOddsValueDisplay">0.0%</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill pot-odds-fill" id="potOddsBarFill" style="width: 0%;"></div>
+                        </div>
+                    </div>
+
+                    <div class="ev-comparison-pill" id="evVerdictPill">
+                        <span class="verdict-icon">⚖</span>
+                        <span id="evVerdictText">Waiting for active Hero decision...</span>
+                    </div>
+                </div>
+
+                <!-- Primary Recommended Action Highlight Box -->
+                <div class="primary-recommendation-box" id="primaryActionBox">
+                    <div class="recommendation-badge-label">OPTIMAL ACTION</div>
+                    <div class="primary-action-content">
+                        <div class="action-main-text" id="primaryActionText">CHECK / FOLD</div>
+                        <div class="action-amount-text" id="primaryActionAmount">$0.00</div>
+                    </div>
+                    <div class="action-ev-badge" id="primaryActionEV">EV: +$0.00</div>
+                </div>
+
+                <!-- Action Sizing Matrix -->
+                <div class="sizing-matrix-section">
+                    <div class="section-subtitle">Sizing & Alternative EV Matrix</div>
+                    <div class="sizing-grid" id="sizingGrid">
+                        <div class="sizing-btn disabled">
+                            <span class="btn-label">Fold</span>
+                            <span class="btn-ev">$0.00</span>
+                        </div>
+                        <div class="sizing-btn disabled">
+                            <span class="btn-label">Check / Call</span>
+                            <span class="btn-ev">--</span>
+                        </div>
+                        <div class="sizing-btn disabled">
+                            <span class="btn-label">2.5x Raise</span>
+                            <span class="btn-ev">--</span>
+                        </div>
+                        <div class="sizing-btn disabled">
+                            <span class="btn-label">33% Pot</span>
+                            <span class="btn-ev">--</span>
+                        </div>
+                        <div class="sizing-btn disabled">
+                            <span class="btn-label">66% Pot</span>
+                            <span class="btn-ev">--</span>
+                        </div>
+                        <div class="sizing-btn disabled">
+                            <span class="btn-label">All-In</span>
+                            <span class="btn-ev">--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tactical Reasoning & Exploit Breakdown -->
+                <div class="reasoning-section">
+                    <div class="section-subtitle">Tactical Reasoning & Opponent Exploits</div>
+                    <div class="reasoning-box" id="reasoningText">
+                        Awaiting game action to generate real-time Monte Carlo decision trees and LLM exploitative profiles...
+                    </div>
+                </div>
+            </div>
+
+            <!-- Opponent Profile Quick Inspect Card -->
+            <div class="sidebar-card opponent-inspect-card">
+                <div class="inspect-header">
+                    <h3>Opponent Profiler & Exploits</h3>
+                    <span class="badge" id="inspectPlayerName">Select Opponent</span>
+                </div>
+                <div class="inspect-body" id="opponentInspectBody">
+                    <p class="placeholder-text">Click any player seat on the table to inspect their deep LLM profile, tendencies, and exploitative notes.</p>
+                </div>
+            </div>
+        </aside>
+    </main>
+
+    <script src="/app.js"></script>
+</body>
+</html>

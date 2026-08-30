@@ -462,3 +462,30 @@ func TestIngestEvent_NoHeroCards_NoRecommendation(t *testing.T) {
 		t.Errorf("expected state to be cached")
 	}
 }
+
+func TestMountStatic(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+	srv.MountStatic("../../web")
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /, got %d", w.Code)
+	}
+
+	if !bytes.Contains(w.Body.Bytes(), []byte("POKER RTA HUD")) {
+		t.Errorf("expected index.html content to contain 'POKER RTA HUD'")
+	}
+
+	// Test static CSS file
+	reqCSS := httptest.NewRequest("GET", "/style.css", nil)
+	wCSS := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wCSS, reqCSS)
+
+	if wCSS.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /style.css, got %d", wCSS.Code)
+	}
+}

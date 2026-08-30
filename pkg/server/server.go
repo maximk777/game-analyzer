@@ -90,6 +90,11 @@ func (s *Server) Router() http.Handler {
 	return s.mux
 }
 
+// MountStatic serves static assets from the specified local directory.
+func (s *Server) MountStatic(dir string) {
+	s.mux.Handle("GET /", http.FileServer(http.Dir(dir)))
+}
+
 // Hub returns the underlying WebSocket hub.
 func (s *Server) Hub() *WSHub {
 	return s.hub
