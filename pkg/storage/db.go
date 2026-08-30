@@ -247,6 +247,39 @@ func (s *SQLiteDB) SaveHandHistory(h table.HandState) error {
 	return nil
 }
 
+// ListHandHistories returns the most recently saved hands, newest first. It is
+// what makes a session reviewable at all: hands are keyed by a minted id, so
+// listing is the only way to find them after the fact.
+func (s *SQLiteDB) ListHandHistories(limit int) ([]table.HandState, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := s.db.Query(
+		`SELECT state_json FROM hand_histories ORDER BY created_at DESC, rowid DESC LIMIT ?;`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list hand histories: %w", err)
+	}
+	defer rows.Close()
+
+	var out []table.HandState
+	for rows.Next() {
+		var stateJSON string
+		if err := rows.Scan(&stateJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan hand history: %w", err)
+		}
+		var h table.HandState
+		if err := json.Unmarshal([]byte(stateJSON), &h); err != nil {
+			return nil, fmt.Errorf("failed to decode hand history: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read hand histories: %w", err)
+	}
+	return out, nil
+}
+
 // GetHandHistory retrieves and unmarshals a HandState snapshot by handID. Returns nil, nil if not found.
 func (s *SQLiteDB) GetHandHistory(handID string) (*table.HandState, error) {
 	query := `SELECT state_json FROM hand_histories WHERE hand_id = ?;`

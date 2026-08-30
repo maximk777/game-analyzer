@@ -218,3 +218,46 @@ func TestRange_SampleCombo(t *testing.T) {
 		}
 	}
 }
+
+// Range notation used by the preflop charts. The strict parser refuses what it
+// does not understand rather than silently widening to the whole deck, so every
+// form the charts rely on has to be covered here.
+func TestParseRange_NotationUsedByCharts(t *testing.T) {
+	cases := []struct {
+		notation string
+		combos   int
+	}{
+		{"AA", 6},
+		{"AKs", 4},
+		{"AKo", 12},
+		{"77+", 48},     // 77 through AA
+		{"ATs+", 16},    // ATs, AJs, AQs, AKs
+		{"AA-JJ", 24},   // four pairs
+		{"T9s-54s", 24}, // six connectors, same gap
+		{"K2s-K8s", 28}, // seven kickers under a fixed high card
+		{"A2o-A8o", 84}, // the same, offsuit
+		{"22+, ATs+, KQo", 106},
+	}
+
+	for _, c := range cases {
+		r, err := ParseRangeStrict(c.notation)
+		if err != nil {
+			t.Errorf("%q: %v", c.notation, err)
+			continue
+		}
+		if len(r.Combos) != c.combos {
+			t.Errorf("%q: got %d combos, want %d", c.notation, len(r.Combos), c.combos)
+		}
+	}
+}
+
+// The lenient parser answers an unknown range with every hand in the deck,
+// which is a reasonable default for a guessed opponent range and a dangerous
+// one for a chart: a typo would turn "raise these hands" into "raise anything".
+func TestParseRangeStrict_RefusesNonsense(t *testing.T) {
+	for _, bad := range []string{"ZZ", "K2s-Q8s", "hello", ""} {
+		if _, err := ParseRangeStrict(bad); err == nil {
+			t.Errorf("%q was accepted as a range", bad)
+		}
+	}
+}

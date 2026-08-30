@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"poker-game-analyzer/pkg/advisor"
+	"poker-game-analyzer/pkg/audit"
 	"poker-game-analyzer/pkg/capture"
 	"poker-game-analyzer/pkg/equity"
 	"poker-game-analyzer/pkg/profiler"
@@ -35,9 +36,9 @@ type TableInitRequest struct {
 
 // EventIngestResponse is the HTTP response for ingested vision/game events.
 type EventIngestResponse struct {
-	Status         string                    `json:"status"`
+	Status         string                   `json:"status"`
 	Recommendation *advisor.AdvisorResponse `json:"recommendation,omitempty"`
-	Event          *vision.VisionEvent       `json:"event,omitempty"`
+	Event          *vision.VisionEvent      `json:"event,omitempty"`
 }
 
 // PlayerProfileResponse encapsulates player statistics and LLM behavioral analysis.
@@ -58,6 +59,7 @@ type Server struct {
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
 	stabilizer *table.StateStabilizer
+	auditLog   *audit.Logger
 	mu         sync.Mutex
 
 	roiConfig       vision.ROIConfig
@@ -73,14 +75,14 @@ type Server struct {
 func NewServer(cache *storage.MemoryCache, db *storage.SQLiteDB, prof *profiler.Profiler) *Server {
 	hub := NewWSHub()
 	s := &Server{
-		cache:      cache,
-		db:         db,
-		prof:       prof,
-		hub:        hub,
-		mux:        http.NewServeMux(),
-		roiConfig:  vision.DefaultCoinPoker6MaxROI(),
+		cache:           cache,
+		db:              db,
+		prof:            prof,
+		hub:             hub,
+		mux:             http.NewServeMux(),
+		roiConfig:       vision.DefaultCoinPoker6MaxROI(),
 		windowsProvider: capture.ListAllWindows,
-		stabilizer: table.NewStateStabilizer(),
+		stabilizer:      table.NewStateStabilizer(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -116,6 +118,21 @@ func (s *Server) Router() http.Handler {
 // MountStatic serves static assets from the specified local directory.
 func (s *Server) MountStatic(dir string) {
 	s.mux.Handle("GET /", http.FileServer(http.Dir(dir)))
+}
+
+// SetAuditLogger attaches a decision audit log. Every recommendation, and
+// every state that failed to produce one, is recorded with the inputs that
+// were missing at the time.
+func (s *Server) SetAuditLogger(l *audit.Logger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditLog = l
+}
+
+func (s *Server) auditLogger() *audit.Logger {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auditLog
 }
 
 // Hub returns the underlying WebSocket hub.
@@ -160,9 +177,27 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 		return nil, errors.New("missing table id in event")
 	}
 
+	// Whether a hand has ended is decided from the incoming event, before any
+	// smoothing. The stabilizer works on vision noise and must not get a vote
+	// on the terminal state, or a showdown frame can be smoothed back into a
+	// river frame and the hand is never persisted or profiled.
+	isHandEnd := event.Type == vision.EventHandEnd || (event.HandState != nil && event.HandState.Street == table.StreetShowdown)
+
 	// 0. State Stabilization (filter frame glitches, dropouts & maintain monotonic card/pot state)
+	//
+	// Showdown states go through it too. Skipping them left the stabiliser's
+	// showdown branch dead: a hand that actually reached a showdown was saved
+	// under the vision placeholder id instead of a minted one, so every such
+	// hand overwrote the same row, and the seats and board it had accumulated
+	// over the hand were dropped in favour of whatever the final frame happened
+	// to read. Whether the hand has ended is still decided from the raw event
+	// above, before any smoothing.
+	var completed *table.HandState
 	if event.HandState != nil && s.stabilizer != nil {
 		event.HandState = s.stabilizer.Stabilize(event.HandState)
+		// A hand is otherwise recognised as finished when the next one starts:
+		// most hands end with everyone folding, and no showdown is shown at all.
+		completed = s.stabilizer.TakeCompletedHand()
 	}
 
 	// 1. Cache update
@@ -176,50 +211,131 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	}
 
 	// 2. Hand end persistence & profiler updates
-	isHandEnd := event.Type == vision.EventHandEnd || (event.HandState != nil && event.HandState.Street == table.StreetShowdown)
+	finished := completed
 	if isHandEnd && event.HandState != nil {
+		finished = event.HandState
+	}
+	if finished != nil {
+		if finished.TableID == "" {
+			finished.TableID = tableID
+		}
 		if s.prof != nil {
-			s.prof.ProcessHandEnd(*event.HandState)
+			s.prof.ProcessHandEnd(*finished)
 		}
 		if s.db != nil {
-			_ = s.db.SaveHandHistory(*event.HandState)
+			_ = s.db.SaveHandHistory(*finished)
 		}
 	}
 
 	// 3. Real-time Equity and Advisor Recommendation calculation
 	var rec *advisor.AdvisorResponse
+	var auditReads map[string]map[string]float64
 	if event.HandState != nil && !isHandEnd {
 		h := event.HandState
 		hasHeroCards := h.HeroCards[0].Rank > 0 && h.HeroCards[1].Rank > 0
 
-		if hasHeroCards {
-			var oppTendencies map[string]float64
-			var oppRanges []equity.Range
+		// A player who has folded has no decision left. The fold badge on the
+		// nameplate is read, but nothing consulted it before advising: live,
+		// hero had folded and the HUD went on recommending an all-in, sized off
+		// another player's stack.
+		heroFolded := false
+		for _, seat := range h.Seats {
+			if seat.PlayerID == h.HeroID && h.HeroID != "" && seat.IsFolded {
+				heroFolded = true
+				break
+			}
+		}
 
+		if hasHeroCards && !heroFolded {
+			var oppTendencies map[string]float64
+			seatReads := make(map[string]map[string]float64)
+
+			// One range per live opponent, always. Previously a range was only
+			// added for players with recorded stats, so with no history the
+			// list came out empty and equity was simulated against a single
+			// random hand -- no matter how many players were actually in the
+			// pot. Range width is a percentage of all hands: 100 means unknown.
+			var rangeWidths []float64
 			for _, seat := range h.Seats {
-				if seat.PlayerID != "" && seat.PlayerID != h.HeroID && seat.IsActive && !seat.IsFolded {
-					if s.prof != nil {
-						t := s.prof.GetPlayerTendencies(seat.PlayerID)
-						if oppTendencies == nil && len(t) > 0 {
-							oppTendencies = t
-						}
-						stats := s.prof.GetStats(seat.PlayerID)
-						if stats != nil && stats.VPIP > 0 {
-							oppRanges = append(oppRanges, equity.ParseRange(fmt.Sprintf("top%.0f%%", stats.VPIP)))
-						}
+				if seat.PlayerID == "" || seat.PlayerID == h.HeroID || !seat.IsActive || seat.IsFolded {
+					continue
+				}
+				width := 100.0
+				if s.prof != nil {
+					t := s.prof.GetPlayerTendencies(seat.PlayerID)
+					if len(t) > 0 {
+						seatReads[seat.PlayerID] = t
+					}
+					if oppTendencies == nil && len(t) > 0 {
+						oppTendencies = t
+					}
+					if stats := s.prof.GetStats(seat.PlayerID); stats != nil && stats.VPIP > 0 {
+						width = stats.VPIP
 					}
 				}
+				rangeWidths = append(rangeWidths, width)
+			}
+			if len(rangeWidths) == 0 {
+				rangeWidths = []float64{100.0}
 			}
 
-			if len(oppRanges) == 0 {
-				oppRanges = []equity.Range{equity.ParseRange("random")}
+			rangesAt := func(frac float64) []equity.Range {
+				out := make([]equity.Range, 0, len(rangeWidths))
+				for _, w := range rangeWidths {
+					narrowed := w * frac
+					if narrowed >= 100 {
+						out = append(out, equity.ParseRange("random"))
+						continue
+					}
+					if narrowed < 1 {
+						narrowed = 1
+					}
+					out = append(out, equity.ParseRange(fmt.Sprintf("top%.0f%%", narrowed)))
+				}
+				return out
 			}
 
 			// Sub-5ms fast Monte Carlo simulation
-			eqResult := equity.SimulateEquity(h.HeroCards, h.CommunityCards, oppRanges, 3000)
-			advice := advisor.CalculateAdvice(*h, eqResult, oppTendencies)
+			// The call decision is a threshold comparison against pot odds, and
+			// live it sat 0.4% from the line: at 3,000 iterations the sampling
+			// noise alone flipped the same state between call and fold from one
+			// frame to the next. More samples cost a few milliseconds.
+			eqResult := equity.SimulateEquity(h.HeroCards, h.CommunityCards, rangesAt(1.0), 12000)
+
+			// Equity against the part of the range that would call a given
+			// size, simulated rather than approximated. Cached per width because
+			// the advisor asks once per sizing option.
+			cache := make(map[int]float64, 8)
+			equityVsTop := func(frac float64) float64 {
+				if frac <= 0 {
+					return 0
+				}
+				if frac > 1 {
+					frac = 1
+				}
+				key := int(frac * 100)
+				if v, ok := cache[key]; ok {
+					return v
+				}
+				r := equity.SimulateEquity(h.HeroCards, h.CommunityCards, rangesAt(frac), 8000)
+				v := r.WinRate + r.TieRate*0.5
+				cache[key] = v
+				return v
+			}
+
+			advice := advisor.Calculate(advisor.Inputs{
+				State:         *h,
+				Equity:        eqResult,
+				OppTendencies: oppTendencies,
+				EquityVsTop:   equityVsTop,
+			})
 			rec = &advice
+			auditReads = seatReads
 		}
+	}
+
+	if lg := s.auditLogger(); lg != nil {
+		_ = lg.Log(audit.Build(event.HandState, rec, auditReads))
 	}
 
 	// 4. WebSocket broadcast
@@ -241,14 +357,18 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 		})
 	}
 
-	if rec != nil {
-		s.hub.BroadcastToTable(tableID, WSMessage{
-			Type:      WSMsgRecommendation,
-			TableID:   tableID,
-			Payload:   rec,
-			Timestamp: now,
-		})
-	}
+	// A recommendation is broadcast on every processed state, including the
+	// ones that produced none. Sending only when advice exists leaves the HUD
+	// holding the previous hand's recommendation with nothing to tell it the
+	// advice has expired -- live, that showed a confident CHECK, computed for a
+	// pot of 4,280, while the table sat at 61,680 and hero was facing a raise.
+	// A null payload is the signal that there is currently no advice.
+	s.hub.BroadcastToTable(tableID, WSMessage{
+		Type:      WSMsgRecommendation,
+		TableID:   tableID,
+		Payload:   rec,
+		Timestamp: now,
+	})
 
 	return rec, nil
 }

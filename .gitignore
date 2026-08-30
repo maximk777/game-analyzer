@@ -16,3 +16,6 @@ bin/
 
 # Superpowers scratch
 .superpowers/sdd/
+
+# Diagnostic capture corpus (large PNG frames)
+testdata/diag/

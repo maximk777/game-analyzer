@@ -1,6 +1,7 @@
 package equity
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -253,6 +254,67 @@ func parseSingleToken(tok string) [][2]table.Card {
 		}
 	}
 
+	// Kicker range under a fixed top rank: e.g. "K2s-K8s", "A2o-A8o". The two
+	// ends share their high card and differ only in the kicker.
+	if strings.Contains(tok, "-") {
+		parts := strings.SplitN(tok, "-", 2)
+		lo := strings.TrimSpace(parts[0])
+		hi := strings.TrimSpace(parts[1])
+		if len(lo) == 3 && len(hi) == 3 &&
+			strings.EqualFold(string(lo[0]), string(hi[0])) &&
+			strings.EqualFold(string(lo[2]), string(hi[2])) {
+			modifier := strings.ToLower(string(lo[2]))
+			top, ok1 := parseRankChar(lo[0])
+			k1, ok2 := parseRankChar(lo[1])
+			k2, ok3 := parseRankChar(hi[1])
+			if ok1 && ok2 && ok3 && (modifier == "s" || modifier == "o") {
+				lowK, highK := k1, k2
+				if lowK > highK {
+					lowK, highK = highK, lowK
+				}
+				if highK < top {
+					var res [][2]table.Card
+					for k := lowK; k <= highK; k++ {
+						if modifier == "s" {
+							res = append(res, makeSuitedCombos(top, k)...)
+						} else {
+							res = append(res, makeOffsuitCombos(top, k)...)
+						}
+					}
+					return res
+				}
+			}
+		}
+	}
+
+	// Same-gap range walking down: e.g. "T9s-54s", "AQo-JTo". Both ends must
+	// share the gap between their ranks, and the walk goes one rank at a time.
+	if strings.Contains(tok, "-") {
+		parts := strings.SplitN(tok, "-", 2)
+		hi := strings.TrimSpace(parts[0])
+		lo := strings.TrimSpace(parts[1])
+		if len(hi) == 3 && len(lo) == 3 &&
+			strings.EqualFold(string(hi[2]), string(lo[2])) {
+			modifier := strings.ToLower(string(hi[2]))
+			h1, ok1 := parseRankChar(hi[0])
+			h2, ok2 := parseRankChar(hi[1])
+			l1, ok3 := parseRankChar(lo[0])
+			l2, ok4 := parseRankChar(lo[1])
+			if ok1 && ok2 && ok3 && ok4 && h1 > h2 && l1 > l2 &&
+				h1-h2 == l1-l2 && h1 >= l1 && (modifier == "s" || modifier == "o") {
+				var res [][2]table.Card
+				for top, bottom := h1, h2; top >= l1; top, bottom = top-1, bottom-1 {
+					if modifier == "s" {
+						res = append(res, makeSuitedCombos(top, bottom)...)
+					} else {
+						res = append(res, makeOffsuitCombos(top, bottom)...)
+					}
+				}
+				return res
+			}
+		}
+	}
+
 	// Pair plus: e.g. "TT+", "88+", "22+"
 	if len(tok) == 3 && tok[0] == tok[1] && tok[2] == '+' {
 		r, ok := parseRankChar(tok[0])
@@ -337,6 +399,39 @@ func parseSingleToken(tok string) [][2]table.Card {
 	}
 
 	return nil
+}
+
+// ParseRangeStrict is ParseRange with the silent widening removed. ParseRange
+// answers an unrecognised range with every hand in the deck, which is a
+// reasonable default for a guessed opponent range and a dangerous one for a
+// chart: a typo would turn "raise these hands" into "raise everything".
+func ParseRangeStrict(s string) (Range, error) {
+	tokens := strings.FieldsFunc(s, func(c rune) bool {
+		return c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n'
+	})
+	for _, tok := range tokens {
+		if len(parseSingleToken(tok)) == 0 {
+			return Range{}, fmt.Errorf("unrecognised range token %q in %q", tok, s)
+		}
+	}
+	if len(tokens) == 0 {
+		return Range{}, fmt.Errorf("empty range %q", s)
+	}
+	return ParseRange(s), nil
+}
+
+// Contains reports whether a specific holding is in the range.
+func (r Range) Contains(hole [2]table.Card) bool {
+	if hole[0].Rank == 0 || hole[1].Rank == 0 {
+		return false
+	}
+	want := ComboToMask(hole)
+	for _, c := range r.Combos {
+		if ComboToMask(c) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func ParseRange(s string) Range {

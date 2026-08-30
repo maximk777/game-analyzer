@@ -156,7 +156,10 @@
                 if (msg.payload) renderHandState(msg.payload);
                 break;
             case "recommendation":
-                if (msg.payload) renderAdvisorRecommendation(msg.payload);
+                // A null payload means "no advice for this state". It must be
+                // rendered, not ignored: dropping it left the previous hand's
+                // recommendation on screen looking current.
+                renderAdvisorRecommendation(msg.payload || null);
                 break;
             case "event":
                 if (msg.payload && msg.payload.hand_state) {
@@ -237,9 +240,27 @@
         renderPlayers(handState.seats || []);
     }
 
+    function clearAdvisorRecommendation() {
+        elements.hudActionType.textContent = "—";
+        elements.hudActionAmount.textContent = "";
+        elements.hudRecCard.className = "hud-recommendation-card rec-idle";
+        elements.hudEvBadge.textContent = "EV: —";
+        elements.hudEquityVal.textContent = "—";
+        elements.hudEquityBar.style.width = "0%";
+        elements.hudPotOddsVal.textContent = "—";
+        elements.hudPotOddsBar.style.width = "0%";
+        elements.hudEdgeText.textContent = "Нет карт героя — совет не считается";
+        elements.hudEdgeCallout.style.color = "var(--text-muted)";
+        elements.hudReasoningText.textContent =
+            "Ожидание раздачи с видимыми карманными картами.";
+    }
+
     function renderAdvisorRecommendation(rec) {
         state.currentAdvice = rec;
-        if (!rec) return;
+        if (!rec) {
+            clearAdvisorRecommendation();
+            return;
+        }
 
         const act = (rec.primary_action || "check").toLowerCase();
         elements.hudActionType.textContent = (rec.primary_action || "CHECK").toUpperCase();
@@ -290,6 +311,12 @@
         // Reasoning Text
         if (rec.reasoning) {
             elements.hudReasoningText.textContent = rec.reasoning;
+        }
+
+        // Advice built on the equilibrium baseline rather than on observed
+        // tendencies must say so, or a guess reads like a measurement.
+        if (rec.has_reads === false) {
+            elements.hudRecCard.classList.add("rec-no-reads");
         }
     }
 

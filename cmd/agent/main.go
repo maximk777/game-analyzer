@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -17,6 +18,10 @@ import (
 	"poker-game-analyzer/pkg/llm"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/server"
+	"sort"
+	"strings"
+
+	"poker-game-analyzer/pkg/audit"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/vision"
 )
@@ -34,6 +39,7 @@ type Config struct {
 	OpenAIKey   string
 	OpenAIModel string
 	WebDir      string
+	AuditPath   string
 }
 
 // AgentApp encapsulates the entire runtime environment for the live assistant.
@@ -47,6 +53,7 @@ type AgentApp struct {
 	liveAgent    *capture.LiveAgent
 	grabber      capture.FrameGrabber
 	macVisionCmd *exec.Cmd
+	auditLog     *audit.Logger
 
 	errCh chan error
 }
@@ -128,6 +135,20 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 	}
 	liveAgent := capture.NewLiveAgent(grabber, srv, liveCfg)
 
+	// The decision audit is what makes a live session diagnosable afterwards:
+	// each recommendation is stored with the inputs it had and the ones it was
+	// missing. A failure to open it must not stop the assistant.
+	var auditLog *audit.Logger
+	if cfg.AuditPath != "" {
+		lg, err := audit.NewLogger(cfg.AuditPath)
+		if err != nil {
+			log.Printf("[AGENT] Warning: decision audit disabled: %v", err)
+		} else {
+			auditLog = lg
+			srv.SetAuditLogger(lg)
+		}
+	}
+
 	return &AgentApp{
 		cfg:       cfg,
 		db:        db,
@@ -137,6 +158,7 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 		srv:       srv,
 		liveAgent: liveAgent,
 		grabber:   grabber,
+		auditLog:  auditLog,
 		errCh:     make(chan error, 1),
 	}, nil
 }
@@ -169,10 +191,24 @@ func (app *AgentApp) Start(ctx context.Context) error {
 	// On macOS, launch ScreenCaptureKit Vision Helper if available
 	if runtime.GOOS == "darwin" {
 		binPath := "./bin/mac_vision_agent"
+		if info, err := os.Stat(binPath); err == nil {
+			// `go run` rebuilds the Go half and nothing else, so a stale Swift
+			// helper keeps running old card recognition while the logs look
+			// fresh. Saying so out loud costs a stat call and saves a long
+			// evening of debugging behaviour that was already fixed.
+			if newer := swiftSourcesNewerThan(info.ModTime()); len(newer) > 0 {
+				log.Printf("[AGENT] WARNING: %s is older than %s -- run `make` to rebuild the vision helper",
+					binPath, strings.Join(newer, ", "))
+			}
+		}
 		if _, err := os.Stat(binPath); err == nil {
 			cmd := exec.Command(binPath)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
+			// Without this the helper posts to port 8080 regardless of -port.
+			cmd.Env = append(os.Environ(), fmt.Sprintf(
+				"POKER_RTA_ENDPOINT=http://127.0.0.1:%d/api/v1/tables/%s/events",
+				app.cfg.Port, app.cfg.TableID))
 			if err := cmd.Start(); err == nil {
 				app.macVisionCmd = cmd
 				log.Printf("[AGENT] Native macOS ScreenCaptureKit Vision helper started (PID %d)", cmd.Process.Pid)
@@ -199,6 +235,24 @@ func (app *AgentApp) Stop(ctx context.Context) error {
 		if err := app.srv.Stop(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+
+	if app.auditLog != nil {
+		summary := app.auditLog.GapSummary()
+		log.Printf("[AUDIT] %d distinct decisions recorded to %s", app.auditLog.Written(), app.cfg.AuditPath)
+		if len(summary) == 0 {
+			log.Printf("[AUDIT] No missing inputs recorded.")
+		} else {
+			keys := make([]string, 0, len(summary))
+			for k := range summary {
+				keys = append(keys, string(k))
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				log.Printf("[AUDIT]   missing %-20s in %d decisions", k, summary[audit.Gap(k)])
+			}
+		}
+		_ = app.auditLog.Close()
 	}
 
 	if app.prof != nil {
@@ -235,13 +289,61 @@ func (app *AgentApp) Config() Config { return app.cfg }
 // Errors returns a channel receiving asynchronous server fatal errors.
 func (app *AgentApp) Errors() <-chan error { return app.errCh }
 
+// swiftSourcesNewerThan lists the vision sources modified after the helper was
+// built. Empty means the running helper matches the code on disk.
+func swiftSourcesNewerThan(builtAt time.Time) []string {
+	entries, err := os.ReadDir("pkg/capture")
+	if err != nil {
+		return nil
+	}
+	var stale []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".swift") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(builtAt) {
+			stale = append(stale, e.Name())
+		}
+	}
+	sort.Strings(stale)
+	return stale
+}
+
 // LaunchBrowserHUD opens the floating HUD window in browser compact app mode or default browser.
+// hudWindowSize is the compact footprint the HUD is designed for: wide enough
+// for the recommendation line and the sizing matrix, tall enough for the seated
+// players, and no larger.
+const hudWindowSize = "400,780"
+
+// hudChromeArgs builds the flags that actually produce a small window.
+//
+// --window-size alone is not enough: Chrome remembers the last bounds per app
+// per profile, so once the window has been resized (or opened before this size
+// was set) it reopens at the old size and the flag is ignored. Pointing the HUD
+// at its own profile directory gives it bounds nothing else shares, so the
+// requested size applies and stays applied.
+func hudChromeArgs(hudURL string) []string {
+	profile := filepath.Join(os.TempDir(), "poker-rta-hud-profile")
+	return []string{
+		fmt.Sprintf("--app=%s", hudURL),
+		fmt.Sprintf("--window-size=%s", hudWindowSize),
+		"--window-position=40,40",
+		fmt.Sprintf("--user-data-dir=%s", profile),
+		"--no-first-run",
+		"--no-default-browser-check",
+	}
+}
+
 func LaunchBrowserHUD(hudURL string) error {
 	// 1. On macOS, try Google Chrome in compact app mode
 	if runtime.GOOS == "darwin" {
 		chromeMac := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 		if _, err := os.Stat(chromeMac); err == nil {
-			cmd := exec.Command(chromeMac, fmt.Sprintf("--app=%s", hudURL), "--window-size=360,260")
+			cmd := exec.Command(chromeMac, hudChromeArgs(hudURL)...)
 			if err := cmd.Start(); err == nil {
 				return nil
 			}
@@ -251,7 +353,7 @@ func LaunchBrowserHUD(hudURL string) error {
 	// 2. Try Chrome on PATH (e.g. google-chrome, chromium, chrome)
 	for _, name := range []string{"google-chrome", "chromium", "google-chrome-stable", "chrome"} {
 		if path, err := exec.LookPath(name); err == nil {
-			cmd := exec.Command(path, fmt.Sprintf("--app=%s", hudURL), "--window-size=360,260")
+			cmd := exec.Command(path, hudChromeArgs(hudURL)...)
 			if err := cmd.Start(); err == nil {
 				return nil
 			}
@@ -285,6 +387,7 @@ func main() {
 		openAIKeyFlag   = flag.String("openai-key", "", "OpenAI API key (falls back to OPENAI_API_KEY env)")
 		openAIModelFlag = flag.String("openai-model", "gpt-4o-mini", "OpenAI model name")
 		webDirFlag      = flag.String("web-dir", "web", "Web assets directory")
+		auditPathFlag   = flag.String("audit", "./bin/logs/decisions.jsonl", "Decision audit log (JSONL); empty to disable")
 	)
 	flag.Parse()
 
@@ -307,6 +410,7 @@ func main() {
 		OpenAIKey:   apiKey,
 		OpenAIModel: *openAIModelFlag,
 		WebDir:      *webDirFlag,
+		AuditPath:   *auditPathFlag,
 	}
 
 	log.Printf("[AGENT] ===================================================")

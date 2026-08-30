@@ -35,12 +35,21 @@
     user-select: none;
 }
 
+/* The page must paint its own dark ground. Left transparent, the browser's
+   white default showed through wherever the widget did not reach, which in a
+   window taller than the content meant a large white block below the HUD. */
+html {
+    height: 100%;
+    background: var(--bg-dark);
+}
+
 body.hud-body {
-    background: transparent;
+    background: var(--bg-dark);
     font-family: var(--font-sans);
     color: var(--text-main);
-    overflow: hidden;
-    height: 100vh;
+    overflow-x: hidden;
+    overflow-y: auto;
+    min-height: 100%;
     display: flex;
     justify-content: center;
     align-items: flex-start;
@@ -525,4 +534,19 @@ body.hud-body {
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
+}
+
+/* Advice states.
+   rec-idle: no hole cards, so no recommendation exists. Shown greyed rather
+   than left holding the previous hand's advice.
+   rec-no-reads: advice computed with no observed opponent tendencies, so fold
+   equity came from theory. Marked so it does not read as a measurement. */
+.hud-recommendation-card.rec-idle {
+    background: rgba(80, 97, 118, 0.12);
+    border-color: rgba(138, 153, 173, 0.25);
+    opacity: 0.75;
+}
+
+.hud-recommendation-card.rec-no-reads {
+    border-style: dashed;
 }

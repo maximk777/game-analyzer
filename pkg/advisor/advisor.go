@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"poker-game-analyzer/pkg/equity"
+	"poker-game-analyzer/pkg/preflop"
 	"poker-game-analyzer/pkg/table"
 )
 
@@ -14,6 +15,9 @@ type ActionRecommendation struct {
 	EV          float64          `json:"ev"`
 	IsPrimary   bool             `json:"is_primary"`
 	SizingLabel string           `json:"sizing_label,omitempty"`
+	// FoldEquity is the modelled probability that every live opponent folds to
+	// this size. Exposed so the UI can show why one size beats another.
+	FoldEquity float64 `json:"fold_equity"`
 }
 
 type AdvisorResponse struct {
@@ -25,13 +29,298 @@ type AdvisorResponse struct {
 	PrimaryAction     table.ActionType       `json:"primary_action"`
 	RecommendedAmount float64                `json:"recommended_amount"`
 	Reasoning         string                 `json:"reasoning"`
+
+	// EffectiveStack is the most money that can actually go in: no more than
+	// hero has, and no more than the deepest live opponent can call.
+	EffectiveStack float64 `json:"effective_stack"`
+	// Opponents still live in the hand. EV depends on it, so it is reported.
+	Opponents int `json:"opponents"`
+	// HasReads is false when no opponent tendency data was available and fold
+	// equity had to come from theory rather than observation. The UI must not
+	// present a no-reads recommendation as though it were informed.
+	HasReads bool `json:"has_reads"`
+	// CallRangeFraction is the share of the opponents' range the call was
+	// priced against: 1.0 means their whole range. Anything less means the
+	// size of their bet was used to narrow it.
+	CallRangeFraction float64 `json:"call_range_fraction"`
+	// CallEquity is hero's equity against that narrowed range, which is what
+	// the call decision actually rests on -- not the headline equity.
+	CallEquity float64 `json:"call_equity"`
 }
 
 func roundToTwoDecimals(val float64) float64 {
 	return math.Round(val*100) / 100
 }
 
+// foldFrequency models how often a single opponent folds to a bet of size
+// `bet` into `pot`.
+//
+// With no read, the anchor is the complement of minimum defence frequency:
+// facing a bet of b into p, an opponent must continue with p/(p+b) of their
+// range to stop a bluff being automatically profitable, so b/(p+b) folds. It is
+// an equilibrium reference rather than a prediction of this particular player,
+// but unlike a fixed constant it rises with the size -- which is what makes bet
+// sizing a real decision instead of a step at 50% equity.
+//
+// With a read, the observed rate is anchored as that player's fold frequency
+// against a pot-sized bet and carried across sizes by scaling how often they
+// *continue* rather than how often they fold. Scaling the fold side saturates:
+// a read of 0.55 against a large overbet clamps to 1.0, and once every opponent
+// folds with certainty the number of opponents stops mattering at all. Scaling
+// the continue side approaches zero without reaching it, so a six-way pot stays
+// harder to take down than a heads-up one.
+//
+// The read never replaces the baseline outright. It is blended in with weight
+// `readWeight`, so a confident-sounding tendency can move the estimate but
+// cannot become the estimate -- see readWeight for why that matters.
+func foldFrequency(bet, pot, observed float64, weight float64) float64 {
+	if bet <= 0 || pot <= 0 {
+		return 0
+	}
+	mdfContinue := pot / (pot + bet)
+	baseline := 1 - mdfContinue
+	if weight <= 0 {
+		return baseline
+	}
+
+	// At a pot-sized bet mdfContinue is 0.5, so this returns `observed` exactly.
+	continueFreq := mdfContinue * (1 - observed) / 0.5
+	fromRead := math.Min(math.Max(1-continueFreq, 0), 1)
+
+	blended := baseline*(1-weight) + fromRead*weight
+	return math.Min(math.Max(blended, 0), 1)
+}
+
+// Weight limits for opponent reads.
+const (
+	// priorHands is the sample size at which a counted tendency earns half of
+	// the maximum weight. Shrinking towards the equilibrium baseline stops a
+	// tendency computed from three hands being treated as a fact.
+	priorHands = 25.0
+	// maxMeasuredWeight caps even a large counted sample. The baseline always
+	// keeps a say, because a player's frequency in the spots we happened to
+	// observe is not their frequency in this spot.
+	maxMeasuredWeight = 0.60
+	// maxModelledWeight caps a tendency that came from the language model
+	// rather than from counted events. It is an opinion formed from summary
+	// statistics, and it must never be able to carry a decision on its own --
+	// "he is definitely bluffing, shove" is exactly the failure being designed
+	// out here.
+	maxModelledWeight = 0.25
+)
+
+// readWeight converts sample size and provenance into how far the model is
+// allowed to move from the equilibrium baseline towards a read.
+func readWeight(hands int, modelled bool) float64 {
+	if hands <= 0 && !modelled {
+		return 0
+	}
+	cap := maxMeasuredWeight
+	if modelled {
+		cap = maxModelledWeight
+	}
+	// A modelled read carries some weight even with no counted hands behind it,
+	// because it is derived from the statistics that do exist; a counted read
+	// with no hands carries none.
+	n := float64(hands)
+	confidence := n / (n + priorHands)
+	if modelled && confidence < 0.5 {
+		confidence = 0.5
+	}
+	return cap * confidence
+}
+
+// equityWhenCalled approximates equity against the part of the range that
+// continues, for use when no real range simulation is available.
+//
+// It models opponent hand strength as uniform over their range: we beat the
+// bottom `winEq` of it, and they fold the bottom `f` of it, so what calls is the
+// top (1-f), of which we beat (winEq - f). Some such adjustment is essential --
+// without it, being called was as good as being called by a weak hand, so a
+// bigger bet was always better and the model would shove 97bb off 70% raw
+// equity.
+//
+// This pure rank model is deliberately conservative and known to be harsh: real
+// equity does not collapse that sharply against a tighter range, because hands
+// keep backdoor and draw equity against holdings that beat them right now.
+// Inputs.EquityVsTop supersedes it whenever the caller can run the simulation
+// for real.
+func equityWhenCalled(winEq, f float64) float64 {
+	continueFreq := 1 - f
+	if continueFreq <= 1e-9 {
+		return 0
+	}
+	adjusted := (winEq - f) / continueFreq
+	return math.Min(math.Max(adjusted, 0), 1)
+}
+
+// fallbackEquityWhenCalled is what the advisor actually uses when no range
+// simulator is supplied.
+//
+// Both available extremes are demonstrably wrong. Leaving equity unconditional
+// made every larger bet better than the last, so the model shoved 97bb off 70%
+// raw equity. Taking the rank model literally makes equity vanish whenever the
+// fold frequency exceeds it, so a flop bluff with two overcards and a backdoor
+// draw scores zero when called and is never bet -- but equity is not a rank:
+// a hand that is behind still wins some of the time.
+//
+// The midpoint is a stated interpolation, not a measurement. It exists so the
+// fallback fails in neither direction; Inputs.EquityVsTop replaces it with a
+// real simulation, and the live path always supplies one.
+func fallbackEquityWhenCalled(winEq, f float64) float64 {
+	rank := equityWhenCalled(winEq, f)
+	return 0.5*rank + 0.5*winEq
+}
+
+// equityRealisation is the share of raw equity a hand actually captures when
+// streets remain to be played.
+//
+// All-in equity assumes every card gets dealt. With money behind that is not
+// what happens: hands get folded on later streets, position decides who has to
+// commit first, and extra opponents make it likelier someone else improves. A
+// one-street model that ignores this treats the flop and the river as the same
+// decision -- measured, it scored an identical EV at any stack depth on either
+// street, which is the clearest sign that the streets to come were invisible
+// to it.
+//
+// The magnitudes are the standard approximations: in position a hand realises
+// somewhat more than its raw equity, out of position somewhat less, and every
+// additional opponent costs a little more. They are stated rather than derived,
+// and are deliberately mild -- the point is that depth and position enter the
+// decision at all, not that these particular numbers are exact.
+func equityRealisation(street table.Street, position table.Position, opponents int, allIn bool) float64 {
+	// On the river, or when the money is already in, there is nothing left to
+	// realise: the raw equity is the equity.
+	if allIn || street == table.StreetRiver || street == table.StreetShowdown {
+		return 1.0
+	}
+
+	r := 1.0
+	switch position {
+	case table.PosBTN, table.PosCO:
+		r += 0.08
+	case table.PosSB, table.PosBB, table.PosUTG:
+		r -= 0.08
+	}
+
+	if opponents > 1 {
+		r -= 0.04 * float64(opponents-1)
+	}
+
+	return math.Min(math.Max(r, 0.70), 1.15)
+}
+
+// heroPosition returns hero's seat position, empty when it was not read.
+func heroPosition(state table.HandState) table.Position {
+	for _, seat := range state.Seats {
+		if seat.PlayerID == state.HeroID && state.HeroID != "" {
+			return seat.Position
+		}
+	}
+	return ""
+}
+
+// bettorRangeFraction is the share of an opponent's range that a bet of the
+// given size represents.
+//
+// A player who bets is not holding a random hand, and treating them as though
+// they were produced the worst advice this tool has given: hero held queen-high
+// on a board whose only pair was on the felt, faced a half-pot river bet, and
+// was told to call because "equity" against a random hand came to 33.7% against
+// 33.3% pot odds.
+//
+// The anchor is the equilibrium bluff-to-value ratio. A bet of b into a pot of
+// p (before the bet) is priced so a caller needs b/(p+2b) equity, and the
+// bettor's range is concentrated in roughly that top share: a pot-sized bet
+// implies about the top third, a half-pot bet about the top half. Bigger bets
+// mean tighter ranges, which is the direction that matters.
+func bettorRangeFraction(bet, potIncludingBet float64) float64 {
+	potBefore := potIncludingBet - bet
+	if potBefore <= 0 || bet <= 0 {
+		return 1
+	}
+	frac := potBefore / (potBefore + 2*bet)
+	return math.Min(math.Max(frac, 0.05), 1)
+}
+
+// observedFoldRate returns the opponent fold tendency relevant to the street,
+// and whether one was actually available. It never invents a default: a bluff
+// recommended on fabricated fold equity is worse than no recommendation.
+func observedFoldRate(street table.Street, t map[string]float64) (float64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	var keys []string
+	switch street {
+	case table.StreetPreflop:
+		keys = []string{"fold_to_3bet", "fold_to_raise", "fold_to_cbet"}
+	case table.StreetFlop:
+		keys = []string{"fold_to_cbet", "fold_to_bet", "fold_to_raise"}
+	default:
+		keys = []string{"fold_to_bet", "fold_to_cbet", "fold_to_raise"}
+	}
+	for _, k := range keys {
+		if v, ok := t[k]; ok && v >= 0 && v <= 1 {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+// liveOpponents counts opponents still in the hand and returns the largest
+// stack among them, which bounds how much of a bet can ever be called.
+func liveOpponents(state table.HandState) (count int, deepest float64) {
+	for _, seat := range state.Seats {
+		if seat.PlayerID == "" || seat.PlayerID == state.HeroID {
+			continue
+		}
+		if !seat.IsActive || seat.IsFolded {
+			continue
+		}
+		count++
+		if seat.Stack > deepest {
+			deepest = seat.Stack
+		}
+	}
+	return count, deepest
+}
+
+// Inputs bundles everything the advisor reasons over. It exists so that
+// conditional equity can be computed for real rather than approximated: see
+// EquityVsTop.
+type Inputs struct {
+	State         table.HandState
+	Equity        equity.EquityResult
+	OppTendencies map[string]float64
+
+	// EquityVsTop returns hero equity against the strongest `frac` (0..1) of
+	// the opponents' current ranges -- that is, against the part that would
+	// actually call a bet of the corresponding size. Optional: when nil, the
+	// rank approximation in equityWhenCalled is used instead. Supplying it is
+	// what turns "roughly how equity behaves against a tighter range" into a
+	// real Monte Carlo answer.
+	EquityVsTop func(frac float64) float64
+
+	// ReadHands is how many hands the tendencies in OppTendencies were counted
+	// over. Zero means they were not counted at all.
+	ReadHands int
+	// ReadModelled marks tendencies produced by the language model from summary
+	// statistics rather than counted from observed actions. Modelled reads are
+	// capped far below counted ones: they inform the estimate, never carry it.
+	ReadModelled bool
+}
+
+// CalculateAdvice is the compatibility entry point for callers that have no
+// range simulator to offer.
 func CalculateAdvice(state table.HandState, eq equity.EquityResult, oppTendencies map[string]float64) AdvisorResponse {
+	return Calculate(Inputs{State: state, Equity: eq, OppTendencies: oppTendencies})
+}
+
+func Calculate(in Inputs) AdvisorResponse {
+	state := in.State
+	eq := in.Equity
+	oppTendencies := in.OppTendencies
+
 	pot := state.Pot
 	if pot <= 0 {
 		pot = 1.0
@@ -39,10 +328,12 @@ func CalculateAdvice(state table.HandState, eq equity.EquityResult, oppTendencie
 
 	heroCurrentBet := 0.0
 	heroStack := 0.0
+	heroSeated := false
 	for _, seat := range state.Seats {
 		if seat.PlayerID == state.HeroID && state.HeroID != "" {
 			heroCurrentBet = seat.CurrentBet
 			heroStack = seat.Stack
+			heroSeated = true
 			break
 		}
 	}
@@ -62,59 +353,150 @@ func CalculateAdvice(state table.HandState, eq equity.EquityResult, oppTendencie
 
 	winEq := eq.WinRate + eq.TieRate*0.5
 
-	pFold := 0.35
-	if oppTendencies != nil {
-		if state.Street == table.StreetPreflop {
-			if val, ok := oppTendencies["fold_to_3bet"]; ok && val >= 0 {
-				pFold = val
-			} else if val, ok := oppTendencies["fold_to_raise"]; ok && val >= 0 {
-				pFold = val
-			} else if val, ok := oppTendencies["fold_to_cbet"]; ok && val >= 0 {
-				pFold = val
-			} else {
-				pFold = 0.40
-			}
-		} else if state.Street == table.StreetFlop {
-			if val, ok := oppTendencies["fold_to_cbet"]; ok && val >= 0 {
-				pFold = val
-			} else if val, ok := oppTendencies["fold_to_bet"]; ok && val >= 0 {
-				pFold = val
-			} else if val, ok := oppTendencies["fold_to_raise"]; ok && val >= 0 {
-				pFold = val
-			}
-		} else { // Turn or River
-			if val, ok := oppTendencies["fold_to_cbet"]; ok && val >= 0 {
-				pFold = val
-			} else if val, ok := oppTendencies["fold_to_bet"]; ok && val >= 0 {
-				pFold = val
-			} else if val, ok := oppTendencies["fold_to_raise"]; ok && val >= 0 {
-				pFold = val
-			} else {
-				pFold = 0.30
-			}
-		}
+	opponents, deepestOpponent := liveOpponents(state)
+	if opponents < 1 {
+		opponents = 1
 	}
-	if pFold < 0.0 {
-		pFold = 0.0
-	} else if pFold > 1.0 {
-		pFold = 1.0
+
+	// Money above the effective stack can never be called, so no sizing may
+	// exceed it. Previously only hero's stack was consulted -- and hero's stack
+	// was itself invented when hero could not be found among the seats.
+	// Zero means "not observed". Nothing is invented here: without stack data
+	// there is no cap and no all-in option, rather than a fabricated ceiling
+	// that would silently collapse every sizing onto one number.
+	effectiveStack := heroStack
+	if !heroSeated || heroStack <= 0 {
+		effectiveStack = deepestOpponent
+	} else if deepestOpponent > 0 && deepestOpponent < effectiveStack {
+		effectiveStack = deepestOpponent
+	}
+
+	stacksKnown := effectiveStack > 0
+	heroPos := heroPosition(state)
+	observedFold, hasReads := observedFoldRate(state.Street, oppTendencies)
+	weight := 0.0
+	if hasReads {
+		weight = readWeight(in.ReadHands, in.ReadModelled)
+	}
+	// A read too weak to move the estimate is not a read.
+	if weight <= 0 {
+		hasReads = false
+	}
+
+	// evRaise is the EV of putting in `raiseTo` total, with `opponents` players
+	// each independently folding at the modelled rate for that size.
+	//
+	// Every live opponent must fold for the pot to be won uncontested; if any
+	// call, each caller adds (raiseTo - toCall) since their existing bet is
+	// already counted in pot. Modelling the callers is what the previous
+	// formula omitted: it assumed exactly one, so a 5-way pot and a heads-up
+	// pot produced byte-identical advice.
+	evRaise := func(raiseTo float64) (ev float64, allFold float64) {
+		if raiseTo <= 0 {
+			return 0, 0
+		}
+		f := foldFrequency(raiseTo-toCall, pot, observedFold, weight)
+		allFold = math.Pow(f, float64(opponents))
+
+		expectedCallers := float64(opponents) * (1 - f)
+		contested := 1 - allFold
+		if contested <= 1e-9 {
+			return allFold * pot, allFold
+		}
+		callersGivenContested := expectedCallers / contested
+
+		callEq := 0.0
+		if in.EquityVsTop != nil {
+			// The callers are the strongest (1-f) of the range.
+			callEq = math.Min(math.Max(in.EquityVsTop(1-f), 0), 1)
+		} else {
+			callEq = fallbackEquityWhenCalled(winEq, f)
+		}
+
+		// Realisation is deliberately not applied here. It would give an all-in
+		// the full value of its equity while discounting every smaller size,
+		// and so make shoving look better the less the model understands about
+		// the streets it skips -- the opposite of the correction intended.
+		// Choosing a size needs a multi-street model; continuing does not.
+		added := raiseTo - toCall
+		finalPot := pot + raiseTo + callersGivenContested*added
+		evCalled := callEq*finalPot - raiseTo
+
+		return allFold*pot + contested*evCalled, allFold
 	}
 
 	evFold := 0.0
 
+	// Equity for the call decision is measured against the range that actually
+	// bet, not against every hand the opponent could hold.
+	// Narrowing is applied only where a real simulation can measure it. The
+	// rank approximation is far too crude to fold on: it scores equity as the
+	// share of the range beaten, which collapses a flush draw to nothing
+	// against a tight range when in truth a draw barely cares what it is
+	// against. The live path always supplies a simulator, which is where this
+	// has to be right.
+	// Narrowing applies only after the flop. Preflop the money owed is largely
+	// forced -- blinds and straddles are posted with whatever the dealer gave
+	// out -- so treating it as a chosen bet priced hero's ace-king against a
+	// top-39% range and folded it getting better than 3 to 1.
+	callEquity := winEq
+	callRangeFraction := 1.0
+	if toCall > 0 && state.Street != table.StreetPreflop && in.EquityVsTop != nil {
+		callRangeFraction = bettorRangeFraction(toCall, pot)
+		callEquity = math.Min(math.Max(in.EquityVsTop(callRangeFraction), 0), 1)
+	}
+
+	// Continuing without committing the stack does not realise the whole of a
+	// hand's all-in equity: cards get folded on later streets, position decides
+	// who acts first, and every extra opponent is another player who might
+	// improve. Calling all-in realises it in full, because every card is dealt.
+	callCommits := stacksKnown && toCall >= effectiveStack-1e-9
+	callRealisation := equityRealisation(state.Street, heroPos, opponents, callCommits)
+
 	var evCall float64
 	if toCall == 0 {
-		evCall = winEq * pot
+		// Checking sees the next card; how much of the equity survives to be
+		// shown down depends on position and on how many players are still in.
+		evCall = winEq * callRealisation * pot
 	} else {
-		evCall = winEq*(pot+toCall) - toCall
+		evCall = callEquity*callRealisation*(pot+toCall) - toCall
 	}
 
-	calcRaiseEV := func(raiseAmount float64) float64 {
-		return pFold*pot + (1.0-pFold)*(winEq*(pot+2.0*raiseAmount)-raiseAmount)
+	cap := func(v float64) float64 {
+		if stacksKnown && v > effectiveStack {
+			return effectiveStack
+		}
+		return v
 	}
 
-	if heroStack <= 0 {
-		heroStack = math.Max(pot*3.0, math.Max(toCall*5.0, 100.0))
+	addSizing := func(actions []ActionRecommendation, act table.ActionType, amount float64, label string) []ActionRecommendation {
+		amount = roundToTwoDecimals(cap(amount))
+		if amount <= 0 {
+			return actions
+		}
+		// A sizing the effective stack has clipped is an all-in, and must be
+		// named one -- otherwise the same amount appears twice under different
+		// labels and the plain bet wins the tie, so an all-in can never be
+		// recommended even when it is the whole strategy.
+		if stacksKnown && amount >= effectiveStack {
+			act = table.ActionAllIn
+			label = "All-In"
+		}
+		// Do not offer two sizes that the effective stack has collapsed onto
+		// the same number.
+		for _, existing := range actions {
+			if existing.Amount == amount && existing.Action == act {
+				return actions
+			}
+		}
+		ev, fe := evRaise(amount)
+		return append(actions, ActionRecommendation{
+			Action:      act,
+			Amount:      amount,
+			EV:          ev,
+			SizingLabel: label,
+			FoldEquity:  fe,
+		})
 	}
 
 	var actions []ActionRecommendation
@@ -139,163 +521,69 @@ func CalculateAdvice(state table.HandState, eq equity.EquityResult, oppTendencie
 			betAction = table.ActionRaise
 		}
 
-		s33 := roundToTwoDecimals(pot * 0.33)
-		if s33 <= 0 {
-			s33 = 1.0
+		actions = addSizing(actions, betAction, pot*0.33, "33% Pot")
+		actions = addSizing(actions, betAction, pot*0.66, "66% Pot")
+		actions = addSizing(actions, betAction, pot*1.0, "Pot")
+		if stacksKnown {
+			actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
 		}
-
-		s66 := roundToTwoDecimals(pot * 0.66)
-		if s66 <= 0 {
-			s66 = 2.0
-		}
-
-		s100 := roundToTwoDecimals(pot * 1.0)
-		if s100 <= 0 {
-			s100 = 3.0
-		}
-
-		allInAmt := roundToTwoDecimals(heroStack)
-
-		actions = append(actions, ActionRecommendation{
-			Action:      betAction,
-			Amount:      s33,
-			EV:          calcRaiseEV(s33),
-			SizingLabel: "33% Pot",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      betAction,
-			Amount:      s66,
-			EV:          calcRaiseEV(s66),
-			SizingLabel: "66% Pot",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      betAction,
-			Amount:      s100,
-			EV:          calcRaiseEV(s100),
-			SizingLabel: "Pot",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      table.ActionAllIn,
-			Amount:      allInAmt,
-			EV:          calcRaiseEV(allInAmt),
-			SizingLabel: "All-In",
-		})
 	} else {
 		actions = append(actions, ActionRecommendation{
 			Action:      table.ActionCall,
-			Amount:      toCall,
+			Amount:      roundToTwoDecimals(cap(toCall)),
 			EV:          evCall,
 			SizingLabel: "Call",
 		})
 
 		minRaise := state.MinRaise
 		if minRaise < toCall*2.0 {
-			minRaise = roundToTwoDecimals(toCall * 2.0)
+			minRaise = toCall * 2.0
 		}
 
-		s25x := roundToTwoDecimals(toCall * 2.5)
-		if s25x < minRaise {
-			s25x = minRaise
+		actions = addSizing(actions, table.ActionRaise, minRaise, "Min-Raise")
+		actions = addSizing(actions, table.ActionRaise, math.Max(toCall*2.5, minRaise), "2.5x")
+		actions = addSizing(actions, table.ActionRaise, math.Max(toCall+pot*0.66, minRaise), "66% Pot")
+		actions = addSizing(actions, table.ActionRaise, math.Max(pot+2.0*toCall, minRaise), "Pot")
+		if stacksKnown {
+			actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
 		}
-
-		s66 := roundToTwoDecimals(toCall + pot*0.66)
-		if s66 < minRaise {
-			s66 = minRaise
-		}
-
-		sPot := roundToTwoDecimals(pot + 2.0*toCall)
-		if sPot < minRaise {
-			sPot = minRaise
-		}
-
-		allInAmt := roundToTwoDecimals(heroStack)
-		if allInAmt < minRaise {
-			allInAmt = minRaise
-		}
-
-		actions = append(actions, ActionRecommendation{
-			Action:      table.ActionRaise,
-			Amount:      minRaise,
-			EV:          calcRaiseEV(minRaise),
-			SizingLabel: "Min-Raise",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      table.ActionRaise,
-			Amount:      s25x,
-			EV:          calcRaiseEV(s25x),
-			SizingLabel: "2.5x",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      table.ActionRaise,
-			Amount:      s66,
-			EV:          calcRaiseEV(s66),
-			SizingLabel: "66% Pot",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      table.ActionRaise,
-			Amount:      sPot,
-			EV:          calcRaiseEV(sPot),
-			SizingLabel: "Pot",
-		})
-
-		actions = append(actions, ActionRecommendation{
-			Action:      table.ActionAllIn,
-			Amount:      allInAmt,
-			EV:          calcRaiseEV(allInAmt),
-			SizingLabel: "All-In",
-		})
 	}
 
-	// Determine the primary action:
+	// Pick the highest-EV action. Aggressive lines are only eligible when they
+	// are backed by value or by fold equity we have actually counted -- a bluff
+	// priced off a theoretical fold frequency, against an opponent we know
+	// nothing about, is a guess dressed as a calculation. A modelled tendency
+	// does not open the bluff branch either: it may size a value bet, but it
+	// may not be the reason to put money in with a losing hand.
+	countedReads := hasReads && !in.ReadModelled && in.ReadHands > 0
+	aggressionAllowed := winEq >= 0.50 || countedReads
+
 	bestIdx := 0
-	if toCall == 0 {
-		// Check is default (index 1)
-		bestIdx = 1
-		bestEV := actions[1].EV
-
-		// Consider betting if value (winEq >= 0.50) or high fold equity bluff (pFold >= 0.35)
-		canBet := (winEq >= 0.50) || (pFold >= 0.35)
-		if canBet {
-			for i := 2; i < len(actions); i++ {
-				act := actions[i]
-				if act.Action != table.ActionAllIn && act.EV > bestEV {
-					bestEV = act.EV
-					bestIdx = i
-				}
-			}
+	bestEV := evFold
+	for i, act := range actions {
+		isAggressive := act.Action == table.ActionBet ||
+			act.Action == table.ActionRaise ||
+			act.Action == table.ActionAllIn
+		if isAggressive && !aggressionAllowed {
+			continue
 		}
-	} else {
-		// Facing a bet:
-		// Check if Raise is viable:
-		// 1) Value raise: winEq >= 0.50
-		// 2) Semi-bluff raise: winEq < 0.50 and pFold >= 0.35
-		canRaise := (winEq >= 0.50) || (pFold >= 0.35)
-		if state.Street == table.StreetRiver && winEq < 0.55 && pFold < 0.35 {
-			canRaise = false
+		if act.EV > bestEV {
+			bestEV = act.EV
+			bestIdx = i
 		}
+	}
 
-		bestIdx = 0
-		bestEV := evFold // 0.0
-
-		if evCall > bestEV {
-			bestEV = evCall
-			bestIdx = 1 // Call
-		}
-
-		if canRaise {
-			for i := 2; i < len(actions); i++ {
-				act := actions[i]
-				if act.Action != table.ActionAllIn && act.EV > bestEV {
-					bestEV = act.EV
-					bestIdx = i
-				}
-			}
+	// Preflop, the charts override the EV comparison entirely where they have an
+	// opinion. The comparison prices a call as though the hand were about to be
+	// shown down, which is blind to position, to the streets left to play and
+	// to implied odds -- it folded pocket threes getting better than 2 to 1 with
+	// thirty-seven calls behind, and folded ace-king in the blinds. The EV
+	// numbers are still computed and still reported per option; only the choice
+	// is taken from the chart.
+	chartAction, charted := chartedAction(state)
+	if charted {
+		if idx, ok := matchChartAction(actions, chartAction, toCall); ok {
+			bestIdx = idx
 		}
 	}
 
@@ -309,26 +597,21 @@ func CalculateAdvice(state table.HandState, eq equity.EquityResult, oppTendencie
 		}
 	}
 
-	var reasoning string
-	if primaryAct.Action == table.ActionRaise || primaryAct.Action == table.ActionBet || primaryAct.Action == table.ActionAllIn {
-		if winEq >= 0.50 {
-			reasoning = fmt.Sprintf("High equity (%.1f%%) > PotOdds (%.1f%%). Value %s to %.2f (%s) to extract value and exploit.", winEq*100, potOdds*100, primaryAct.Action, primaryAct.Amount, primaryAct.SizingLabel)
-		} else if pFold >= 0.35 {
-			reasoning = fmt.Sprintf("Profitable bluff/semi-bluff with %.1f%% fold equity and %.1f%% equity. %s to %.2f (%s).", pFold*100, winEq*100, primaryAct.Action, primaryAct.Amount, primaryAct.SizingLabel)
-		} else {
-			reasoning = fmt.Sprintf("Positive EV (+%.2f) %s to %.2f (%s) with %.1f%% equity against opponent range.", primaryAct.EV, primaryAct.Action, primaryAct.Amount, primaryAct.SizingLabel, winEq*100)
-		}
-	} else if primaryAct.Action == table.ActionCall {
-		if bluffFreq >= 0.30 {
-			reasoning = fmt.Sprintf("Profitable bluff catcher: Equity (%.1f%%) exceeds PotOdds (%.1f%%) against aggressive opponent (bluff freq %.0f%%). Call %.2f.", winEq*100, potOdds*100, bluffFreq*100, toCall)
-		} else {
-			reasoning = fmt.Sprintf("Sufficient equity (%.1f%%) for profitable call against PotOdds (%.1f%%). Call %.2f (EV: +%.2f).", winEq*100, potOdds*100, toCall, primaryAct.EV)
-		}
-	} else if primaryAct.Action == table.ActionCheck {
-		reasoning = fmt.Sprintf("Free check with %.1f%% equity. Pot: %.2f.", winEq*100, pot)
-	} else {
-		reasoning = fmt.Sprintf("Equity (%.1f%%) insufficient for PotOdds (%.1f%%). Fold is optimal (EV: 0.00 vs Call EV: %.2f).", winEq*100, potOdds*100, evCall)
-	}
+	reasoning := buildReasoning(reasoningInput{
+		action:         primaryAct,
+		winEq:          winEq,
+		callEquity:     callEquity,
+		callRangeFrac:  callRangeFraction,
+		potOdds:        potOdds,
+		toCall:         toCall,
+		pot:            pot,
+		evCall:         evCall,
+		opponents:      opponents,
+		effectiveStack: effectiveStack,
+		hasReads:       hasReads,
+		bluffFreq:      bluffFreq,
+		fromChart:      charted,
+	})
 
 	return AdvisorResponse{
 		HandID:            state.HandID,
@@ -339,5 +622,144 @@ func CalculateAdvice(state table.HandState, eq equity.EquityResult, oppTendencie
 		PrimaryAction:     primaryAct.Action,
 		RecommendedAmount: primaryAct.Amount,
 		Reasoning:         reasoning,
+		EffectiveStack:    roundToTwoDecimals(effectiveStack),
+		Opponents:         opponents,
+		HasReads:          hasReads,
+		CallRangeFraction: callRangeFraction,
+		CallEquity:        callEquity,
 	}
+}
+
+// chartedAction consults the preflop charts. They answer only when the street
+// is preflop, hero's seat and position were read, and hero's cards are known.
+func chartedAction(state table.HandState) (preflop.Action, bool) {
+	if state.Street != table.StreetPreflop {
+		return "", false
+	}
+	if state.HeroCards[0].Rank == 0 || state.HeroCards[1].Rank == 0 {
+		return "", false
+	}
+	position, ok := preflop.HeroPosition(state)
+	if !ok {
+		return "", false
+	}
+	return preflop.Recommend(position, preflop.SituationOf(state), state.HeroCards)
+}
+
+// matchChartAction finds the option that carries out the chart's instruction.
+// A chart says raise, call or fold; which sizing to raise is still an EV
+// question, so the highest-EV aggressive option is taken.
+func matchChartAction(actions []ActionRecommendation, want preflop.Action, toCall float64) (int, bool) {
+	switch want {
+	case preflop.Fold:
+		if toCall <= 0 {
+			// Nothing is owed, so folding is not on offer; check instead.
+			for i, a := range actions {
+				if a.Action == table.ActionCheck {
+					return i, true
+				}
+			}
+			return 0, false
+		}
+		for i, a := range actions {
+			if a.Action == table.ActionFold {
+				return i, true
+			}
+		}
+	case preflop.Call:
+		if toCall <= 0 {
+			for i, a := range actions {
+				if a.Action == table.ActionCheck {
+					return i, true
+				}
+			}
+			return 0, false
+		}
+		for i, a := range actions {
+			if a.Action == table.ActionCall {
+				return i, true
+			}
+		}
+	case preflop.Raise:
+		best := -1
+		for i, a := range actions {
+			switch a.Action {
+			case table.ActionRaise, table.ActionBet, table.ActionAllIn:
+				if best < 0 || a.EV > actions[best].EV {
+					best = i
+				}
+			}
+		}
+		if best >= 0 {
+			return best, true
+		}
+	}
+	return 0, false
+}
+
+type reasoningInput struct {
+	action         ActionRecommendation
+	winEq          float64
+	callEquity     float64
+	callRangeFrac  float64
+	potOdds        float64
+	toCall         float64
+	pot            float64
+	evCall         float64
+	opponents      int
+	effectiveStack float64
+	hasReads       bool
+	bluffFreq      float64
+	fromChart      bool
+}
+
+// buildReasoning writes the explanation shown in the HUD. It is in Russian
+// because that is the language the operator reads it in under time pressure;
+// everything else in this package stays in English.
+func buildReasoning(in reasoningInput) string {
+	way := "хедз-ап"
+	if in.opponents > 1 {
+		way = fmt.Sprintf("%d-вей", in.opponents+1)
+	}
+
+	actionRU := map[table.ActionType]string{
+		table.ActionBet:   "ставка",
+		table.ActionRaise: "рейз",
+		table.ActionAllIn: "олл-ин",
+	}
+
+	var body string
+	switch in.action.Action {
+	case table.ActionBet, table.ActionRaise, table.ActionAllIn:
+		name := actionRU[in.action.Action]
+		if in.winEq >= 0.50 {
+			body = fmt.Sprintf("Вэлью-%s %.0f (%s), %s: эквити %.1f%%, фолд-эквити на этом размере %.0f%%, EV %+.0f.",
+				name, in.action.Amount, in.action.SizingLabel, way,
+				in.winEq*100, in.action.FoldEquity*100, in.action.EV)
+		} else {
+			body = fmt.Sprintf("Полублеф-%s %.0f (%s), %s: фолд-эквити %.0f%% при эквити руки %.1f%%, EV %+.0f.",
+				name, in.action.Amount, in.action.SizingLabel, way,
+				in.action.FoldEquity*100, in.winEq*100, in.action.EV)
+		}
+	case table.ActionCall:
+		body = fmt.Sprintf("Колл %.0f, %s: эквити против ставящего диапазона (верхние %.0f%%) — %.1f%%, требуется по пот-оддсам %.1f%%. EV %+.0f.",
+			in.toCall, way, in.callRangeFrac*100, in.callEquity*100, in.potOdds*100, in.action.EV)
+		if in.bluffFreq >= 0.30 {
+			body += fmt.Sprintf(" Оппонент блефует в %.0f%% случаев.", in.bluffFreq*100)
+		}
+	case table.ActionCheck:
+		body = fmt.Sprintf("Чек, %s: эквити %.1f%% в банк %.0f.", way, in.winEq*100, in.pot)
+	default:
+		body = fmt.Sprintf("Фолд, %s: эквити против ставящего диапазона (верхние %.0f%%) — %.1f%%, а пот-оддсы требуют %.1f%%. Колл дал бы EV %+.0f.",
+			way, in.callRangeFrac*100, in.callEquity*100, in.potOdds*100, in.evCall)
+	}
+
+	if in.fromChart {
+		return body + " Решение с префлоп-чарта по позиции, а не из сравнения эквити с пот-оддсами."
+	}
+
+	if !in.hasReads {
+		body += " Статистики по этим оппонентам нет — фолд-эквити взята из равновесия, а не из наблюдений."
+	}
+	return body
 }

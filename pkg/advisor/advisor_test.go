@@ -109,13 +109,29 @@ func TestEVFormulas(t *testing.T) {
 		t.Errorf("expected EV(Call) == %.2f, got %.2f", expectedCallEV, callAction.EV)
 	}
 
-	// EV(Raise) = P_fold * Pot + (1 - P_fold) * (Equity * (Pot + 2*Raise) - Raise)
-	pFold := 0.40
+	// Raise EV is no longer a closed form over a constant fold probability, so
+	// the properties that must hold are asserted instead of re-deriving the
+	// model: a bigger raise must never buy less fold equity, and every EV must
+	// be finite. Note the options are ordered by label, not by amount, so the
+	// comparison is pairwise on the amounts themselves.
+	var raises []ActionRecommendation
 	for _, act := range resp.Actions {
-		if act.Action == table.ActionRaise {
-			expectedRaiseEV := pFold*100.0 + (1.0-pFold)*(0.60*(100.0+2*act.Amount)-act.Amount)
-			if !almostEqual(act.EV, expectedRaiseEV, 0.05) {
-				t.Errorf("action %s amount %.2f: expected EV %.2f, got %.2f", act.SizingLabel, act.Amount, expectedRaiseEV, act.EV)
+		if act.Action != table.ActionRaise {
+			continue
+		}
+		if math.IsNaN(act.EV) || math.IsInf(act.EV, 0) {
+			t.Errorf("action %s: EV is not finite (%v)", act.SizingLabel, act.EV)
+		}
+		raises = append(raises, act)
+	}
+	if len(raises) < 2 {
+		t.Fatalf("expected several raise sizings, got %d", len(raises))
+	}
+	for _, a := range raises {
+		for _, b := range raises {
+			if a.Amount > b.Amount && a.FoldEquity < b.FoldEquity-1e-9 {
+				t.Errorf("bigger raise bought less fold equity: %s (%.2f -> %.3f) vs %s (%.2f -> %.3f)",
+					a.SizingLabel, a.Amount, a.FoldEquity, b.SizingLabel, b.Amount, b.FoldEquity)
 			}
 		}
 	}
@@ -219,9 +235,22 @@ func TestFlopCBetValueAndBluff(t *testing.T) {
 	eqB := equity.EquityResult{WinRate: 0.25, TieRate: 0.0, LoseRate: 0.75}
 	oppTendenciesB := map[string]float64{"fold_to_cbet": 0.70}
 
-	adviceB := CalculateAdvice(stateB, eqB, oppTendenciesB)
+	// Bluffing requires fold equity that was actually counted. A tendency with
+	// no sample behind it does not open the bluff branch, so the sample size is
+	// supplied here -- that is the point of the branch, not an inconvenience.
+	adviceB := Calculate(Inputs{
+		State: stateB, Equity: eqB, OppTendencies: oppTendenciesB, ReadHands: 120,
+	})
 	if adviceB.PrimaryAction != table.ActionBet && adviceB.PrimaryAction != table.ActionRaise {
-		t.Errorf("expected primary action Bet/Raise for high fold-equity bluff, got %v", adviceB.PrimaryAction)
+		t.Errorf("expected primary action Bet/Raise for a counted high fold-equity read, got %v", adviceB.PrimaryAction)
+	}
+
+	// The same tendency with no hands behind it must not produce a bluff.
+	adviceNoSample := CalculateAdvice(stateB, eqB, oppTendenciesB)
+	switch adviceNoSample.PrimaryAction {
+	case table.ActionBet, table.ActionRaise, table.ActionAllIn:
+		t.Errorf("bluffed on an uncounted tendency: %v %.2f",
+			adviceNoSample.PrimaryAction, adviceNoSample.RecommendedAmount)
 	}
 }
 
@@ -452,7 +481,12 @@ func TestCalculateAdviceFacingBetSizingLabels(t *testing.T) {
 		Pot:        20.0,
 		CurrentBet: 10.0,
 		MinRaise:   20.0,
+		HeroID:     "hero-1",
 		HeroCards:  heroCards,
+		Seats: []table.SeatState{
+			{PlayerID: "hero-1", Stack: 400.0, IsActive: true},
+			{PlayerID: "villain-1", Stack: 400.0, IsActive: true},
+		},
 	}
 
 	eq := equity.EquityResult{WinRate: 0.55, TieRate: 0.0, LoseRate: 0.45}

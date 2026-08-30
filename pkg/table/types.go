@@ -41,6 +41,15 @@ type SeatState struct {
 	IsActive   bool     `json:"is_active"`
 	IsFolded   bool     `json:"is_folded"`
 	Position   Position `json:"position"`
+	// LastAction is the action badge currently shown on this player's
+	// nameplate. It is the only observable record of what a player just did,
+	// and changes to it are what the action stream is derived from.
+	LastAction string `json:"last_action,omitempty"`
+	// Cards are this player's holdings once they have been turned face up.
+	// Only a showdown reveals them, and they are the only ground truth about
+	// what someone actually held for a line: frequencies say how often a player
+	// bets, showdowns say with what.
+	Cards []Card `json:"cards,omitempty"`
 }
 
 type ActionRecord struct {
