@@ -164,8 +164,10 @@ struct DiagRecorder {
                     try? handle.close()
                 }
 
-                print("[DIAG] kept \(kept)/\(maxFrames) (seen \(seen)) \(reason) "
-                    + "board=\(state.community_cards) hero=\(state.hero_cards) pot=\(Int(state.pot))")
+                var line = "[DIAG] kept \(kept)/\(maxFrames) (seen \(seen)) \(reason)"
+                line += " board=\(state.community_cards) hero=\(state.hero_cards)"
+                line += " pot=\(Int(state.pot))"
+                print(line)
             }
 
             try? await Task.sleep(nanoseconds: UInt64(1_000_000_000 / fps))
@@ -175,8 +177,10 @@ struct DiagRecorder {
         if failuresBySlot.isEmpty {
             print("[DIAG] No unresolved card slots.")
         } else {
-            print("[DIAG] Unresolved slots: "
-                + failuresBySlot.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))
+            let slots: [String] = failuresBySlot.sorted { $0.key < $1.key }.map { entry in
+                "\(entry.key)=\(entry.value)"
+            }
+            print("[DIAG] Unresolved slots: " + slots.joined(separator: " "))
         }
     }
 

@@ -1032,16 +1032,37 @@ func readIndexRect(cgImg: CGImage, indexRect: CGRect, whiteRatio: Double,
 
     let indexMask = makeInkMask(indexBmp)
     let rows = splitIndexRows(indexMask)
-    var dbg = "index=\(indexBmp.width)x\(indexBmp.height) \(note) "
-        + "allBlobs=" + findBlobs(indexMask).map { "\($0.width)x\($0.height)@\($0.minX),\($0.minY)#\($0.size)" }.joined(separator: ",")
-        + " rows=" + rows.map { r in "[" + r.map { "\($0.width)x\($0.height)" }.joined(separator: "+") + "]" }.joined(separator: " ")
+
+    // Built a statement at a time rather than as one concatenation. Swift's
+    // type checker gives up on a long chain of `+` over interpolated strings
+    // and closures -- "unable to type-check this expression in reasonable
+    // time" -- and whether it gives up depends on the toolchain, so the same
+    // source built here and failed on another machine.
+    let blobDescriptions: [String] = findBlobs(indexMask).map { blob in
+        let size = "\(blob.width)x\(blob.height)"
+        let at = "@\(blob.minX),\(blob.minY)"
+        return size + at + "#\(blob.size)"
+    }
+    let rowDescriptions: [String] = rows.map { row in
+        let parts: [String] = row.map { "\($0.width)x\($0.height)" }
+        return "[" + parts.joined(separator: "+") + "]"
+    }
+
+    var dbg = "index=\(indexBmp.width)x\(indexBmp.height) \(note)"
+    dbg += " allBlobs=" + blobDescriptions.joined(separator: ",")
+    dbg += " rows=" + rowDescriptions.joined(separator: " ")
+
     guard rows.count >= 2 else {
-        let all = findBlobs(indexMask).map {
-            "\($0.width)x\($0.height)@\($0.minX),\($0.minY)#\($0.size)\($0.touchesBorder ? "B" : "")"
-        }.joined(separator: " ")
+        let all: [String] = findBlobs(indexMask).map { blob in
+            let border = blob.touchesBorder ? "B" : ""
+            return "\(blob.width)x\(blob.height)@\(blob.minX),\(blob.minY)#\(blob.size)" + border
+        }
+        let white = String(format: "%.2f", whiteRatio)
+        var why = "white=\(white) \(note)"
+        why += " index=\(indexBmp.width)x\(indexBmp.height) rows=\(rows.count)"
+        why += " blobs=[" + all.joined(separator: " ") + "]"
         return CardReading(card: nil, rank: nil, suit: nil, whiteRatio: whiteRatio,
-                           profile: [], suitDistance: .infinity,
-                           debug: "white=\(String(format: "%.2f", whiteRatio)) \(note) index=\(indexBmp.width)x\(indexBmp.height) rows=\(rows.count) blobs=[\(all)]")
+                           profile: [], suitDistance: .infinity, debug: why)
     }
 
     // Row 0: rank glyph.
@@ -1071,9 +1092,13 @@ func readIndexRect(cgImg: CGImage, indexRect: CGRect, whiteRatio: Double,
         // shape as unknown text.
         let metrics = holeMetrics(rankMask)
         let scores = CardTemplates.shared.rankScores(rankMask)
-        rankEvidence = "holes=\(metrics.count) aspect=" + String(format: "%.2f", groupAspect)
-            + " parts=\(rows[0].count) top=" + scores.prefix(3)
-                .map { $0.0 + String(format: ":%.3f", $0.1) }.joined(separator: ",")
+        let topScores: [String] = scores.prefix(3).map { entry in
+            entry.0 + String(format: ":%.3f", entry.1)
+        }
+        rankEvidence = "holes=\(metrics.count)"
+        rankEvidence += " aspect=" + String(format: "%.2f", groupAspect)
+        rankEvidence += " parts=\(rows[0].count)"
+        rankEvidence += " top=" + topScores.joined(separator: ",")
         // With the client's own shapes in hand, a low score means the crop is
         // not a rank -- not that a weaker reader should be asked. Both weaker
         // readers below exist for the case where the assets could not be
