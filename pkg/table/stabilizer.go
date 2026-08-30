@@ -37,11 +37,79 @@ type StateStabilizer struct {
 	// survives into the next frame.
 	pendingHero     [2]Card
 	pendingHeroSeen int
+
+	// Events observed but not yet taken. The stabiliser is where the action
+	// stream is derived, so it is the only place that knows an action is new
+	// rather than the same badge seen again; anything downstream would have to
+	// re-derive it and would get it wrong the same way the profiler did.
+	//
+	// Drained with TakeEvents, the same way a finished hand is drained with
+	// TakeCompletedHand: this stays a pure function of the frames it is given,
+	// and the caller decides what to do with what it produced.
+	events []HandEvent
+	// seq counts events within the hand in progress, so a re-emitted event is
+	// a no-op in the store rather than a duplicate.
+	seq int
 }
 
 // NewStateStabilizer creates a new StateStabilizer instance.
 func NewStateStabilizer() *StateStabilizer {
 	return &StateStabilizer{sessionID: time.Now().UTC().Format("20060102-150405")}
+}
+
+// TakeEvents drains what has been observed since the last call.
+//
+// Returned rather than written: the stabiliser has no database and should not
+// grow one. What it has is the only view in the system of what changed between
+// two frames, which is exactly what an event is.
+func (s *StateStabilizer) TakeEvents() []HandEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.events
+	s.events = nil
+	return out
+}
+
+// SetSessionID fixes the session identity instead of taking it from the clock.
+//
+// For the live agent the clock is right: two runs are two observations and
+// should not be confused. For anything replaying a recording it is wrong --
+// replaying the same file twice would mint two sets of hands and count
+// everything in it twice. A replay that names its session after its input
+// re-derives rather than accumulates, which is what makes a cursor safe to
+// reset and run again.
+func (s *StateStabilizer) SetSessionID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id != "" {
+		s.sessionID = id
+	}
+}
+
+// SessionID identifies this run of the agent. It goes on every event because
+// data has to say what read it: a recorded session in this repository holds
+// frames from an older build whose vision could not read action badges, and a
+// measurement across the two was quietly wrong.
+func (s *StateStabilizer) SessionID() string { return s.sessionID }
+
+// record appends an event for the hand in progress, numbering it.
+//
+// The card slices are copied. An event is a statement about a moment, and it
+// has to keep saying the same thing after the moment has passed: handed the
+// caller's slice, it was still pointing at the live state when the stabiliser
+// blanked a card it had decided was impossible, and a showdown already recorded
+// turned into two unread cards between being written and being drained.
+func (s *StateStabilizer) record(e HandEvent) {
+	e.SessionID = s.sessionID
+	e.TableKey = TableKeyOf(e.TableID)
+	e.Seq = s.seq
+	s.seq++
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	e.Cards = append([]Card(nil), e.Cards...)
+	e.Board = append([]Card(nil), e.Board...)
+	s.events = append(s.events, e)
 }
 
 // mintHandID assigns a hand a durable identity. Without one every hand arrived
@@ -171,6 +239,10 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		st := cloneHandState(raw)
 		rejectImpossibleCards(st)
 		s.mintHandID(st)
+		// Badges on screen at the first frame are actions already taken, the
+		// same as at any other hand boundary. Only the recognised-hand path
+		// seeded them, so the first hand of every session began blind.
+		st.ActionHistory = newActions(&HandState{}, st.Seats, st.Street)
 		s.currentHand = st
 		s.lastUpdateAt = now
 		return s.currentHand
@@ -304,7 +376,22 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		// recognition recovers 5 of them. It does not recover a missing preflop
 		// raise -- the action stream keeps 38 of the 42 it is given -- so the
 		// remaining gap is upstream, in how often a raise badge is read at all.
-		st.ActionHistory = newActions(&HandState{}, st.Seats, st.Street)
+		seeded := newActions(&HandState{}, st.Seats, st.Street)
+		st.ActionHistory = seeded
+
+		// Those same badges also produced a tail on the hand that just ended:
+		// they were on screen for the two or three frames before this hand was
+		// recognised, and were read there as actions in the old one. So the
+		// tail is trimmed off before it is recorded.
+		//
+		// Trimming can cost a real final action when the last thing to happen
+		// in one hand looks exactly like the first thing in the next. That is
+		// the better error of the two: an action under-counted is a smaller lie
+		// than an action invented in a hand where nobody made it.
+		if s.completed != nil {
+			s.completed.ActionHistory = trimSeededTail(s.completed.ActionHistory, seeded)
+			s.recordHand(s.completed)
+		}
 
 		s.currentHand = st
 		s.lastUpdateAt = now
@@ -424,11 +511,17 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		HeroCards:      mergedHero,
 		Seats:          mergedSeats,
 		ActionHistory:  mergedHistory,
+		// Straight through from the frame. What the client is offering is a
+		// fact about right now, not something to smooth: carrying last frame's
+		// buttons forward would be carrying forward permission to check.
+		HeroButtons: raw.HeroButtons,
+		IsHeroTurn:  raw.IsHeroTurn,
 	}
 
 	if mergedState.TableID == "" {
 		mergedState.TableID = prev.TableID
 	}
+
 	if mergedState.HeroID == "" {
 		mergedState.HeroID = prev.HeroID
 	}
@@ -631,4 +724,128 @@ func cloneHandState(h *HandState) *HandState {
 	c.ActionHistory = make([]ActionRecord, len(h.ActionHistory))
 	copy(c.ActionHistory, h.ActionHistory)
 	return &c
+}
+
+// recordHand writes everything the stabiliser concluded about a finished hand.
+//
+// Emitted at the end rather than as it happens, and that is the whole design.
+// A hand is recognised two or three frames after it is dealt -- the pot drop
+// has to be confirmed, and so do the hole cards -- and whatever players did
+// inside that window is on screen before the hand it belongs to exists. Written
+// as it happened, those actions went into the previous hand and then again into
+// this one: the same open recorded twice, against two different hands, one of
+// them wrong.
+//
+// Written at the end, an event says what the stabiliser finally concluded, and
+// says it once. The cost is that the log lags by a hand, which matters to
+// nothing: statistics do not care, and a hand is over in a minute.
+func (s *StateStabilizer) recordHand(h *HandState) {
+	if h == nil {
+		return
+	}
+	s.seq = 0
+
+	s.record(HandEvent{
+		TableID: h.TableID, HandID: h.HandID,
+		Kind: EventHandStart, Street: h.Street, Board: h.CommunityCards,
+		PotBefore: FromFloat(h.Pot),
+	})
+	for _, seat := range h.Seats {
+		if seat.PlayerID == "" {
+			continue
+		}
+		s.record(HandEvent{
+			TableID: h.TableID, HandID: h.HandID,
+			Kind: EventHandStart, Street: h.Street,
+			PlayerID: seat.PlayerID, PlayerName: seat.PlayerName,
+			Position: seat.Position, Amount: FromFloat(seat.Stack),
+		})
+	}
+
+	// Amounts come across as exact money. What a player wagered is the whole
+	// difference between a minimum raise and a shove, and a statistic built on
+	// "raise" without "how much" cannot tell them apart.
+	for _, a := range h.ActionHistory {
+		if a.PlayerID == "" {
+			continue
+		}
+		var position Position
+		var name string
+		for _, seat := range h.Seats {
+			if seat.PlayerID == a.PlayerID {
+				position, name = seat.Position, seat.PlayerName
+				break
+			}
+		}
+		s.record(HandEvent{
+			TableID: h.TableID, HandID: h.HandID,
+			Kind: EventAction, Street: a.Street,
+			PlayerID: a.PlayerID, PlayerName: name, Position: position,
+			Action: a.Action, Amount: FromFloat(a.Amount),
+			PotBefore: FromFloat(h.Pot), Board: h.CommunityCards,
+		})
+	}
+
+	// A showdown has a board. Cards attributed to a seat with no board are not
+	// a reveal -- nobody has shown anything -- and recording one puts a holding
+	// in the log that was never on display.
+	//
+	// Showdowns are the most valuable thing here: frequencies say how often
+	// someone bets, a showdown says what they were betting with. A quarter of
+	// an hour of watching yields three or four, and each is worth more than the
+	// frequencies gathered beside it.
+	if len(h.CommunityCards) < 3 {
+		return
+	}
+	for _, seat := range h.Seats {
+		if seat.PlayerID == "" || len(seat.Cards) == 0 {
+			continue
+		}
+		known := 0
+		for _, c := range seat.Cards {
+			if c.Known() {
+				known++
+			}
+		}
+		if known == 0 {
+			continue
+		}
+		s.record(HandEvent{
+			TableID: h.TableID, HandID: h.HandID,
+			Kind: EventReveal, Street: h.Street,
+			PlayerID: seat.PlayerID, PlayerName: seat.PlayerName,
+			Position: seat.Position, Cards: seat.Cards, Board: h.CommunityCards,
+			PotBefore: FromFloat(h.Pot),
+		})
+	}
+}
+
+// trimSeededTail removes from a finished hand the trailing actions that belong
+// to the hand which has just been recognised.
+//
+// A hand is recognised two or three frames after it is dealt, and the badges of
+// the new hand are on the nameplates throughout that window. Read there, they
+// went into the hand that was still current -- so the same open appears at the
+// end of one hand and the start of the next, and the first of the two never
+// happened.
+func trimSeededTail(history, seeded []ActionRecord) []ActionRecord {
+	if len(history) == 0 || len(seeded) == 0 {
+		return history
+	}
+	wanted := map[string]int{}
+	for _, a := range seeded {
+		wanted[string(a.Action)+"|"+a.PlayerID]++
+	}
+
+	cut := len(history)
+	for cut > 0 && len(history)-cut < len(seeded) {
+		a := history[cut-1]
+		key := string(a.Action) + "|" + a.PlayerID
+		if wanted[key] == 0 {
+			break
+		}
+		wanted[key]--
+		cut--
+	}
+	return history[:cut]
 }

@@ -80,6 +80,10 @@ func NewSQLiteDB(filepath string) (*SQLiteDB, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
+	if err := s.MigrateEvents(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to run event migrations: %w", err)
+	}
 
 	return s, nil
 }

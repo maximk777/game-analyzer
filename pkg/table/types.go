@@ -1,5 +1,7 @@
 package table
 
+import "strings"
+
 type Street string
 
 const (
@@ -71,4 +73,68 @@ type HandState struct {
 	HeroCards      [2]Card        `json:"hero_cards"`
 	Seats          []SeatState    `json:"seats"`
 	ActionHistory  []ActionRecord `json:"action_history"`
+
+	// HeroButtons is what the client is offering hero, lowercased, as read off
+	// the screen. Empty means it was not read -- from a replay, a test, or a
+	// frame where the buttons were not visible -- and nothing may be concluded
+	// from that.
+	//
+	// It exists because the amount owed and the *option* to check are separate
+	// facts, and the second one is the reliable half. A frame where the call
+	// amount failed to come out used to be indistinguishable from a frame where
+	// nothing was owed.
+	HeroButtons []string `json:"hero_buttons,omitempty"`
+
+	// IsHeroTurn is whether the client is waiting on hero.
+	//
+	// The screen reader has always reported this and nothing in Go ever read
+	// it. A recommendation is an answer to "what do I do now", and that
+	// question only exists while it is hero's turn -- so without it the tool
+	// went on advising a hand hero had already folded, and did it with the hole
+	// cards the stabiliser was still holding. On screen the nameplate said FOLD
+	// and the assistant said BET 46,400.
+	IsHeroTurn bool `json:"is_hero_turn"`
+}
+
+// HeroCanAct reports whether hero has a decision in front of them.
+//
+// Either signal will do: the client waiting on hero, or action buttons on
+// screen. A frame that carries neither is one where nothing said hero could
+// act, and advice on it is advice about somebody else's turn.
+func (h *HandState) HeroCanAct() bool {
+	if h == nil {
+		return false
+	}
+	return h.IsHeroTurn || len(h.HeroButtons) > 0
+}
+
+// HeroMayCheck reports whether checking is on offer.
+//
+// Three answers, not two: yes, no, and not read. A caller that cannot tell the
+// third from the first will eventually offer a free check to a player facing an
+// all-in, which is what happened.
+func (h *HandState) HeroMayCheck() (mayCheck bool, known bool) {
+	if h == nil || len(h.HeroButtons) == 0 {
+		return false, false
+	}
+	for _, b := range h.HeroButtons {
+		if b == "check" {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// HeroFacesABet reports whether the client is offering a call, which means
+// there is something to pay whatever the amount came out as.
+func (h *HandState) HeroFacesABet() bool {
+	if h == nil {
+		return false
+	}
+	for _, b := range h.HeroButtons {
+		if strings.Contains(b, "call") {
+			return true
+		}
+	}
+	return false
 }

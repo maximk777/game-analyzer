@@ -13,12 +13,16 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 
+	"poker-game-analyzer/pkg/profiler"
+	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
 )
 
@@ -28,10 +32,31 @@ func main() {
 		os.Exit(2)
 	}
 	detail := false
-	for _, a := range os.Args[2:] {
+	dbPath := ""
+	for i, a := range os.Args[2:] {
 		if a == "--hands" {
 			detail = true
 		}
+		if a == "--db" && i+3 <= len(os.Args)-1 {
+			dbPath = os.Args[i+3]
+		}
+	}
+
+	// Writing the replay into a database is how the event log is checked
+	// against something real: the same frames, through the same stabiliser,
+	// into the same schema the live agent uses.
+	var writer *storage.EventWriter
+	var store *storage.SQLiteDB
+	if dbPath != "" {
+		var err error
+		store, err = storage.NewSQLiteDB(dbPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "opening %s: %v\n", dbPath, err)
+			os.Exit(1)
+		}
+		defer store.Close()
+		writer = storage.NewEventWriter(store)
+		defer writer.Close()
 	}
 
 	f, err := os.Open(os.Args[1])
@@ -42,6 +67,12 @@ func main() {
 	defer f.Close()
 
 	stab := table.NewStateStabilizer()
+	// Named after the recording, not the clock: replaying the same file twice
+	// has to re-derive the same hands rather than mint a second set of them.
+	if info, err := os.Stat(os.Args[1]); err == nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%d", info.Name(), info.Size(), info.ModTime().UnixNano())))
+		stab.SetSessionID("replay-" + hex.EncodeToString(sum[:6]))
+	}
 	var completed []table.HandState
 	// Frames observed since the last completed hand, so a hand with no actions
 	// can be told apart from a hand that was simply never seen.
@@ -52,6 +83,12 @@ func main() {
 	// it and the action stream dropped it".
 	rawBadges := map[string]int{}
 	var badgesPerHand []map[string]int
+	// Distinct complete hole-card readings seen in the raw frames of one
+	// stabilised hand. More than one means two real hands were merged into it:
+	// the transition between them was not recognised, which is what losing the
+	// frames at the start of a hand would look like from here.
+	rawHero := map[string]int{}
+	var heroPerHand []map[string]int
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<22)
@@ -68,6 +105,13 @@ func main() {
 		}
 		frames++
 		framesThisHand++
+		if st.HeroCards[0].Known() && st.HeroCards[1].Known() {
+			a, b := st.HeroCards[0].String(), st.HeroCards[1].String()
+			if a > b {
+				a, b = b, a
+			}
+			rawHero[a+" "+b]++
+		}
 		for _, seat := range st.Seats {
 			if seat.PlayerID != "" && seat.LastAction != "" {
 				// Keyed by the street the raw frame reported, because a "bet"
@@ -78,16 +122,52 @@ func main() {
 			}
 		}
 		stab.Stabilize(&st)
+		if writer != nil {
+			writer.Append(stab.TakeEvents()...)
+		} else {
+			_ = stab.TakeEvents()
+		}
 		if done := stab.TakeCompletedHand(); done != nil {
 			completed = append(completed, *done)
 			framesPerHand = append(framesPerHand, framesThisHand)
 			badgesPerHand = append(badgesPerHand, rawBadges)
+			heroPerHand = append(heroPerHand, rawHero)
 			framesThisHand = 0
 			rawBadges = map[string]int{}
+			rawHero = map[string]int{}
 		}
 	}
 
 	fmt.Printf("frames %d (undecodable %d)  hands completed %d\n\n", frames, bad, len(completed))
+
+	if writer != nil {
+		writer.Close()
+
+		// Fold the events into counters the same way the agent will, so the
+		// pipeline is exercised end to end rather than in halves.
+		cursor := profiler.NewStatsCursor(store)
+		counted := 0
+		for {
+			n, err := cursor.Run(2000)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "stats cursor: %v\n", err)
+				break
+			}
+			if n == 0 {
+				break
+			}
+			counted += n
+		}
+		fmt.Printf("stats cursor folded %d hands\n", counted)
+
+		n, err := store.EventCount()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "counting events: %v\n", err)
+		} else {
+			fmt.Printf("events written %d (queued %d, dropped %d) -> %s\n\n",
+				n, writer.Written(), writer.Dropped(), dbPath)
+		}
+	}
 
 	// The same reading of the action stream the profiler makes, reported rather
 	// than accumulated: preflop raises in order, and who made the second one.
@@ -221,6 +301,67 @@ func main() {
 	fmt.Printf("hands recording no action at all: %d\n", silentShort+silentLong)
 	fmt.Printf("  seen for fewer than 10 frames : %d\n", silentShort)
 	fmt.Printf("  seen for 10 frames or more    : %d\n\n", silentLong)
+
+	// Health of each completed hand. If losing the frames at the start of a
+	// hand leaves it unparseable for the rest of its life, it shows up here as
+	// a hand that lived for many frames and never resolved.
+	var noHero, noBoard, shortLived int
+	var brokenLong []string
+	for i, h := range completed {
+		frames := 0
+		if i < len(framesPerHand) {
+			frames = framesPerHand[i]
+		}
+		heroKnown := h.HeroCards[0].Known() && h.HeroCards[1].Known()
+		if !heroKnown {
+			noHero++
+		}
+		if len(h.CommunityCards) == 0 {
+			noBoard++
+		}
+		if frames < 5 {
+			shortLived++
+		}
+		// Lived long enough to be read, and was not.
+		if frames >= 15 && !heroKnown {
+			brokenLong = append(brokenLong, fmt.Sprintf("%s frames=%d board=%d actions=%d street=%s",
+				h.HandID, frames, len(h.CommunityCards), len(h.ActionHistory), h.Street))
+		}
+	}
+	// Two real hands inside one stabilised hand, and hole cards that the raw
+	// frames carried but the merged state did not.
+	var merged, heroLost int
+	for i, h := range completed {
+		if i >= len(heroPerHand) {
+			break
+		}
+		seen := heroPerHand[i]
+		if len(seen) > 1 {
+			merged++
+			var list []string
+			for k, n := range seen {
+				list = append(list, fmt.Sprintf("%s x%d", k, n))
+			}
+			sort.Strings(list)
+			fmt.Printf("  merged hand %s: raw frames carried %d different holdings -- %s\n",
+				h.HandID, len(seen), strings.Join(list, ", "))
+		}
+		if len(seen) > 0 && !(h.HeroCards[0].Known() && h.HeroCards[1].Known()) {
+			heroLost++
+		}
+	}
+	fmt.Printf("\nhands holding two real hands   : %d / %d\n", merged, len(completed))
+	fmt.Printf("hands where raw had hero cards and the merged state did not: %d\n", heroLost)
+	fmt.Printf("hands with no hero cards       : %d / %d\n", noHero, len(completed))
+	fmt.Printf("hands with no board at all     : %d\n", noBoard)
+	fmt.Printf("hands seen for under 5 frames  : %d\n", shortLived)
+	fmt.Printf("hands seen 15+ frames, hero unread: %d\n", len(brokenLong))
+	for _, b := range brokenLong {
+		if len(b) > 0 {
+			fmt.Printf("    %s\n", b)
+		}
+	}
+	fmt.Println()
 
 	fmt.Println("actions by street:")
 	var streets []string
