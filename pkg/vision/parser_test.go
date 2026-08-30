@@ -206,12 +206,12 @@ func TestFrameParser_ParseFrame(t *testing.T) {
 	// Draw Hero cards at cfg.HeroCards
 	heroCard0 := table.Card{Rank: table.RankAce, Suit: table.Spades}
 	heroCard1 := table.Card{Rank: table.RankKing, Suit: table.Hearts}
-	matcher.RegisterTemplate(heroCard0, generateSyntheticCard(heroCard0, 32, 48))
-	matcher.RegisterTemplate(heroCard1, generateSyntheticCard(heroCard1, 32, 48))
+	matcher.RegisterTemplate(heroCard0, GenerateSyntheticCard(heroCard0, 32, 48))
+	matcher.RegisterTemplate(heroCard1, GenerateSyntheticCard(heroCard1, 32, 48))
 
 	// Paste Hero cards into tableImg at ROI
 	pasteCard := func(r RectF, card table.Card) {
-		cardImg := generateSyntheticCard(card, int(r.Width*1000), int(r.Height*800))
+		cardImg := GenerateSyntheticCard(card, int(r.Width*1000), int(r.Height*800))
 		minX := int(r.X * 1000)
 		minY := int(r.Y * 800)
 		targetRect := image.Rect(minX, minY, minX+int(r.Width*1000), minY+int(r.Height*800))
@@ -225,9 +225,9 @@ func TestFrameParser_ParseFrame(t *testing.T) {
 	cCard0 := table.Card{Rank: table.RankTen, Suit: table.Diamonds}
 	cCard1 := table.Card{Rank: table.RankNine, Suit: table.Clubs}
 	cCard2 := table.Card{Rank: table.RankTwo, Suit: table.Hearts}
-	matcher.RegisterTemplate(cCard0, generateSyntheticCard(cCard0, 32, 48))
-	matcher.RegisterTemplate(cCard1, generateSyntheticCard(cCard1, 32, 48))
-	matcher.RegisterTemplate(cCard2, generateSyntheticCard(cCard2, 32, 48))
+	matcher.RegisterTemplate(cCard0, GenerateSyntheticCard(cCard0, 32, 48))
+	matcher.RegisterTemplate(cCard1, GenerateSyntheticCard(cCard1, 32, 48))
+	matcher.RegisterTemplate(cCard2, GenerateSyntheticCard(cCard2, 32, 48))
 
 	pasteCard(cfg.CommunityCards[0], cCard0)
 	pasteCard(cfg.CommunityCards[1], cCard1)

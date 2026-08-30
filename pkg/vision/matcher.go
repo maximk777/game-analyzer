@@ -48,7 +48,7 @@ func NewDefaultCardMatcher() *CardMatcher {
 	for r := table.RankTwo; r <= table.RankAce; r++ {
 		for _, s := range []table.Suit{table.Spades, table.Hearts, table.Diamonds, table.Clubs} {
 			c := table.Card{Rank: r, Suit: s}
-			synthImg := generateSyntheticCard(c, tmplWidth, tmplHeight)
+			synthImg := GenerateSyntheticCard(c, tmplWidth, tmplHeight)
 			m.RegisterTemplate(c, synthImg)
 		}
 	}
@@ -195,8 +195,8 @@ func hasCardFeatures(img image.Image) bool {
 	return avgLum > 0.20
 }
 
-// generateSyntheticCard renders a synthetic card for default templates.
-func generateSyntheticCard(c table.Card, width, height int) image.Image {
+// GenerateSyntheticCard renders a synthetic card for default templates and testing.
+func GenerateSyntheticCard(c table.Card, width, height int) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	// Card white background
 	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 250, G: 250, B: 250, A: 255}}, image.Point{}, draw.Src)

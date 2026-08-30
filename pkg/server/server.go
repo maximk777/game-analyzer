@@ -225,6 +225,24 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	return rec, nil
 }
 
+// IngestLiveState updates the table state in cache, runs Monte Carlo equity and Advisor recommendation calculations, and broadcasts the state update over WebSocket.
+func (s *Server) IngestLiveState(state *table.HandState) (*advisor.AdvisorResponse, error) {
+	if state == nil {
+		return nil, errors.New("nil hand state provided")
+	}
+	event := vision.VisionEvent{
+		Type:      vision.EventHeroTurn,
+		TableID:   state.TableID,
+		HandState: state,
+	}
+	return s.ProcessEvent(event)
+}
+
+// IngestEvent processes an incoming game/vision event, updating cache, profiler, and broadcasting over WebSocket.
+func (s *Server) IngestEvent(event vision.VisionEvent) (*advisor.AdvisorResponse, error) {
+	return s.ProcessEvent(event)
+}
+
 func (s *Server) handleInitTable(w http.ResponseWriter, r *http.Request) {
 	var req TableInitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

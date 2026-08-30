@@ -11,7 +11,7 @@ import (
 
 // Helper to draw a synthetic card image for testing.
 func createTestCardImage(card table.Card, width, height int) image.Image {
-	return generateSyntheticCard(card, width, height)
+	return GenerateSyntheticCard(card, width, height)
 }
 
 func TestCardMatcher_MatchCard(t *testing.T) {
