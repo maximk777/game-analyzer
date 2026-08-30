@@ -1,6 +1,7 @@
 package table
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -628,5 +629,68 @@ func TestCard_UnreadCardIsNotASpade(t *testing.T) {
 	}
 	if c.Known() {
 		t.Errorf("legacy %q decoded to a known card %v", "?s", c)
+	}
+}
+
+// A hand is recognised two or three frames after it is dealt -- a pot drop has
+// to be seen twice, hole cards likewise -- and at the capture rate that is most
+// of a second. Whatever players did inside that window is already on their
+// nameplates when the hand is recognised, and it used to become the baseline
+// that later badges were measured against, so those actions were never
+// recorded at all.
+//
+// Replaying a recorded session showed 18 of 107 hands with no action recorded
+// whatever; seeding recovers 5 of them.
+func TestStateStabilizer_ActionsAlreadyOnScreenWhenTheHandStarts(t *testing.T) {
+	st := NewStateStabilizer()
+
+	seats := func(badges ...string) []SeatState {
+		out := make([]SeatState, 0, len(badges))
+		for i, b := range badges {
+			out = append(out, SeatState{
+				PlayerID:   fmt.Sprintf("p%d", i),
+				PlayerName: fmt.Sprintf("p%d", i),
+				Stack:      100000,
+				LastAction: b,
+				IsActive:   true,
+			})
+		}
+		return out
+	}
+
+	// A hand in progress, so the next one has to be recognised rather than
+	// simply adopted as the first state seen.
+	prior := &HandState{TableID: "coinpoker-live", Pot: 40000, Seats: seats("call", "call")}
+	st.Stabilize(prior)
+
+	// The next hand. The pot has collapsed, and by the time that is confirmed
+	// the under-the-gun player has already opened.
+	dealt := func() *HandState {
+		return &HandState{TableID: "coinpoker-live", Pot: 5000, Seats: seats("raise", "fold")}
+	}
+	st.Stabilize(dealt())
+	got := st.Stabilize(dealt())
+
+	var raises, folds int
+	for _, a := range got.ActionHistory {
+		switch a.Action {
+		case ActionRaise:
+			raises++
+		case ActionFold:
+			folds++
+		}
+	}
+	if raises != 1 {
+		t.Errorf("the open on screen when the hand was recognised was not recorded: %d raises in %v",
+			raises, got.ActionHistory)
+	}
+	if folds != 1 {
+		t.Errorf("the fold on screen when the hand was recognised was not recorded: %d folds in %v",
+			folds, got.ActionHistory)
+	}
+	// And it is recorded once, not once per frame for as long as the badge sits
+	// on the nameplate.
+	if len(got.ActionHistory) != 2 {
+		t.Errorf("badges were recorded more than once: %v", got.ActionHistory)
 	}
 }

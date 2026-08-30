@@ -1171,13 +1171,25 @@ func writePNG(_ img: CGImage, to url: URL) {
 // MARK: - Amount parsing
 
 func parseAmount(_ str: String) -> Double {
-    let clean = str.replacingOccurrences(of: "Pot", with: "")
+    var clean = str.replacingOccurrences(of: "Pot", with: "")
                    .replacingOccurrences(of: "pot", with: "")
                    .replacingOccurrences(of: "POT", with: "")
                    .replacingOccurrences(of: ":", with: "")
-                   .replacingOccurrences(of: ",", with: "")
                    .replacingOccurrences(of: "$", with: "")
                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // A comma is a thousands separator here and a decimal point elsewhere, and
+    // reading "0,10" as ten is a hundredfold error in the direction that
+    // matters. The two are separable without knowing the locale: a thousands
+    // group is always three digits, so a comma followed by fewer than three is
+    // a decimal point. "70,560" stays seventy thousand; "0,10" becomes a tenth.
+    if !clean.contains("."), let comma = clean.lastIndex(of: ",") {
+        let after = clean[clean.index(after: comma)...]
+        if after.count < 3 && after.allSatisfy({ $0.isNumber }) {
+            clean.replaceSubrange(comma...comma, with: ".")
+        }
+    }
+    clean = clean.replacingOccurrences(of: ",", with: "")
 
     var multiplier = 1.0
     var numStr = clean
@@ -1210,9 +1222,22 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     let handler = VNImageRequestHandler(cgImage: cgImg, options: [:])
     try? handler.perform([request])
 
+    // The window title, which the system hands over exactly, is a better source
+    // for both the table's identity and its blinds than a text recognition pass
+    // over the title bar. It was being passed in and thrown away: blinds came
+    // only from whatever OCR happened to read, and OCR reads a title bar badly
+    // -- the recorded session carries the same table as "NLH 1229111 - 1K/2K
+    // (320)", "NLH 1229111- 1K/2K (320)", "@ NLH 1229111 - 1K/2K (320)" and
+    // "© NLH 1228078 - 1K/2K (320)".
+    //
+    // Measured over that session: blinds were resolved in 1028 frames out of
+    // 9788. Nine frames in ten ran with no idea of the stake.
+    let titleBlinds = parseBlinds(title)
+    let titleIsTable = title.lowercased().contains("nlh") || title.lowercased().contains("plo")
+
     var state = ParsedTableState(
         hand_id: "live-hand",
-        table_id: "coinpoker-live",
+        table_id: titleIsTable ? title : "coinpoker-live",
         street: "preflop",
         pot: 0.0,
         current_bet: 0.0,
@@ -1223,8 +1248,8 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
         seats: [],
         hero_made_hand: "",
         is_hero_turn: false,
-        small_blind: 0,
-        big_blind: 0,
+        small_blind: titleBlinds.small,
+        big_blind: titleBlinds.big,
         second_board: []
     )
 
@@ -1239,10 +1264,19 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
         let lower = t.lowercased()
 
         if lower.contains("nlh") || lower.contains("plo") {
-            state.table_id = t
+            // Recognised text is the fallback, not the authority, and it may
+            // only fill a gap -- never overwrite. Several text items on a frame
+            // match this, and the last one won: a truncated fragment with no
+            // slash in it parsed to nothing and wiped blinds that an earlier,
+            // complete item had already resolved correctly.
+            if !titleIsTable {
+                state.table_id = t
+            }
             let blinds = parseBlinds(t)
-            state.small_blind = blinds.small
-            state.big_blind = blinds.big
+            if state.big_blind <= 0 && blinds.big > 0 {
+                state.small_blind = blinds.small
+                state.big_blind = blinds.big
+            }
         }
 
         if lower.contains("pot") {
@@ -1487,8 +1521,14 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     // A wager is a number that is not a stack, sits between its owner and the
     // middle of the table, and is at least a small blind. The last condition is
     // what keeps the action timer counting down from fifteen out of the data.
-    if !players.isEmpty {
-        let minBet = state.small_blind > 0 ? state.small_blind : 1
+    //
+    // With no blinds there is no scale, and no floor can be invented. The floor
+    // used to fall back to 1, which is harmless at 1K/2K and destroys a micro
+    // table outright: at a big blind of 0.1 every real wager is below 1 and was
+    // discarded, so pot odds were computed against a pot with no bets in it.
+    // Reading no wagers is the honest outcome; inventing a scale is not.
+    if !players.isEmpty && state.small_blind > 0 {
+        let minBet = state.small_blind
         for numItem in numberItems {
             if usedAsStack.contains(stackKey(numItem.box)) { continue }
             if isActionButtonRegion(numItem.box) { continue }
@@ -2134,14 +2174,29 @@ func parseBlinds(_ title: String) -> (small: Double, big: Double) {
     let before = title[title.startIndex..<slash]
     let after = title[title.index(after: slash)...]
 
+    // Anything that is neither a letter nor a digit is skipped while looking for
+    // the number to start: spaces, and the currency symbol a micro table puts in
+    // front of its stake. "$0.05/$0.10" used to parse to nothing at all, because
+    // the "$" ended the scan before a digit was reached, and a stake of nothing
+    // takes the whole table down with it -- with no blinds there is no floor on
+    // what counts as a wager, and at a big blind of 0.1 every wager was thrown
+    // away. Letters still stop it, so the table number in "NLH 4410" cannot be
+    // mistaken for a stake.
+    func isAmountChar(_ ch: Character) -> Bool {
+        return ch.isNumber || ch == "." || ch == "," || ch == "K" || ch == "k" || ch == "M" || ch == "m"
+    }
+    func isSkippable(_ ch: Character) -> Bool {
+        return !ch.isLetter && !ch.isNumber
+    }
+
     func trailingAmount(_ s: Substring) -> Double {
         var digits = ""
         for ch in s.reversed() {
-            if ch.isNumber || ch == "." || ch == "," || ch == "K" || ch == "k" || ch == "M" || ch == "m" {
+            if isAmountChar(ch) {
                 digits.append(ch)
             } else if !digits.isEmpty {
                 break
-            } else if ch == " " {
+            } else if isSkippable(ch) {
                 continue
             } else {
                 break
@@ -2153,11 +2208,11 @@ func parseBlinds(_ title: String) -> (small: Double, big: Double) {
     func leadingAmount(_ s: Substring) -> Double {
         var digits = ""
         for ch in s {
-            if ch.isNumber || ch == "." || ch == "," || ch == "K" || ch == "k" || ch == "M" || ch == "m" {
+            if isAmountChar(ch) {
                 digits.append(ch)
             } else if !digits.isEmpty {
                 break
-            } else if ch == " " {
+            } else if isSkippable(ch) {
                 continue
             } else {
                 break

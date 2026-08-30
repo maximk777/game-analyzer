@@ -1,7 +1,9 @@
 package advisor
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"poker-game-analyzer/pkg/equity"
@@ -551,5 +553,112 @@ func BenchmarkCalculateAdvice(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = CalculateAdvice(state, eq, oppTendencies)
+	}
+}
+
+// A preflop chart decision must be explained by the chart, and a multiway raise
+// must not be called a semi-bluff.
+//
+// Both faults were in one live line: a chart raise with KQo six-way came back
+// as "Полублеф-рейз 4000 (Min-Raise), 6-вей: фолд-эквити 0% при эквити руки
+// 11.9%, EV -2355", with a note about the chart appended afterwards. The raise
+// is right and the account of it was wrong twice over. The EV and fold equity
+// quoted are the EV model's, and the EV model did not make this decision --
+// preflop it is known to be wrong, which is why the charts exist. And the
+// "semi-bluff" heading came from comparing equity to a flat 0.50, which no hand
+// clears six-way: all-in equity against five opponents is around 12% for
+// anything and about 35% for aces.
+func TestChartDecisionIsExplainedByTheChart(t *testing.T) {
+	heroCards := parseHeroCards(t, "Kh Qc")
+
+	state := table.HandState{
+		HandID:     "h-chart-reasoning",
+		Street:     table.StreetPreflop,
+		Pot:        4920,
+		CurrentBet: 2000,
+		MinRaise:   4000,
+		HeroCards:  heroCards,
+		HeroID:     "hero",
+		Seats: []table.SeatState{
+			{PlayerID: "hero", Stack: 69120, CurrentBet: 0, IsActive: true, Position: table.PosCO},
+			{PlayerID: "v1", Stack: 69120, CurrentBet: 2000, IsActive: true, Position: table.PosBTN},
+			{PlayerID: "v2", Stack: 80000, CurrentBet: 0, IsActive: true, Position: table.PosSB},
+			{PlayerID: "v3", Stack: 80000, CurrentBet: 0, IsActive: true, Position: table.PosBB},
+			{PlayerID: "v4", Stack: 80000, CurrentBet: 0, IsActive: true, Position: table.PosUTG},
+			{PlayerID: "v5", Stack: 80000, CurrentBet: 0, IsActive: true, Position: table.PosMP},
+		},
+	}
+
+	// Six-way, so equity to showdown is small for every hand. That is the input
+	// that used to decide the wording.
+	eq := equity.EquityResult{WinRate: 0.119, TieRate: 0.01, LoseRate: 0.871}
+	advice := CalculateAdvice(state, eq, nil)
+
+	if !strings.Contains(advice.Reasoning, "чарт") {
+		t.Fatalf("a chart decision is not explained by the chart: %q", advice.Reasoning)
+	}
+	if strings.Contains(advice.Reasoning, "Полублеф") {
+		t.Errorf("a chart raise was called a semi-bluff: %q", advice.Reasoning)
+	}
+	// The EV model's numbers must not be offered as the reason, because they
+	// are not the reason and they say the recommended action loses money.
+	for _, forbidden := range []string{"EV ", "фолд-эквити"} {
+		if strings.Contains(advice.Reasoning, forbidden) {
+			t.Errorf("chart reasoning quotes the EV model (%q): %q", forbidden, advice.Reasoning)
+		}
+	}
+}
+
+// Away from the charts the value / semi-bluff split still has to mean something,
+// and heads-up it must be unchanged: an even-money hand is value, a hand behind
+// is a semi-bluff. The generalisation to a field is the fair share of the pot,
+// which is exactly 0.50 when there is one opponent.
+func TestValueAndSemiBluffAreSplitByFairShare(t *testing.T) {
+	heroCards := parseHeroCards(t, "Ah Kh")
+	board := parseBoardCards(t, "Kc 7d 2s")
+
+	build := func(villains int) table.HandState {
+		seats := []table.SeatState{
+			{PlayerID: "hero", Stack: 5000, CurrentBet: 0, IsActive: true, Position: table.PosBTN},
+		}
+		for i := 0; i < villains; i++ {
+			seats = append(seats, table.SeatState{
+				PlayerID: fmt.Sprintf("v%d", i), Stack: 5000, IsActive: true, Position: table.PosBB,
+			})
+		}
+		return table.HandState{
+			HandID:         "h-split",
+			Street:         table.StreetFlop,
+			Pot:            600,
+			HeroCards:      heroCards,
+			CommunityCards: board,
+			HeroID:         "hero",
+			Seats:          seats,
+		}
+	}
+
+	// Heads-up at 60%: ahead, so value.
+	headsUp := CalculateAdvice(build(1), equity.EquityResult{WinRate: 0.60, LoseRate: 0.40}, nil)
+	if headsUp.PrimaryAction == table.ActionBet || headsUp.PrimaryAction == table.ActionRaise {
+		if strings.Contains(headsUp.Reasoning, "Полублеф") {
+			t.Errorf("60%% heads-up was called a semi-bluff: %q", headsUp.Reasoning)
+		}
+	}
+
+	// Heads-up at 30%: behind, so a semi-bluff if it bets at all.
+	behind := CalculateAdvice(build(1), equity.EquityResult{WinRate: 0.30, LoseRate: 0.70}, nil)
+	if behind.PrimaryAction == table.ActionBet || behind.PrimaryAction == table.ActionRaise {
+		if strings.Contains(behind.Reasoning, "Вэлью") {
+			t.Errorf("30%% heads-up was called a value bet: %q", behind.Reasoning)
+		}
+	}
+
+	// Five-way at 30%: the fair share is 20%, so this hand is ahead of the
+	// field and is a value bet. Under the old flat 0.50 it was a semi-bluff.
+	fiveWay := CalculateAdvice(build(4), equity.EquityResult{WinRate: 0.30, LoseRate: 0.70}, nil)
+	if fiveWay.PrimaryAction == table.ActionBet || fiveWay.PrimaryAction == table.ActionRaise {
+		if strings.Contains(fiveWay.Reasoning, "Полублеф") {
+			t.Errorf("30%% five-way is ahead of its share and is not a semi-bluff: %q", fiveWay.Reasoning)
+		}
 	}
 }

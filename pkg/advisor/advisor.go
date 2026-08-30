@@ -3,6 +3,7 @@ package advisor
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"poker-game-analyzer/pkg/equity"
 	"poker-game-analyzer/pkg/preflop"
@@ -47,6 +48,25 @@ type AdvisorResponse struct {
 	// the call decision actually rests on -- not the headline equity.
 	CallEquity float64 `json:"call_equity"`
 }
+
+// committedCallNarrowing is how much narrower a calling range is against a bet
+// that risks the caller's whole stack than minimum defence frequency describes.
+// At full commitment three quarters of what MDF would defend with is gone, and
+// it scales down with the share of the stack at risk, so a small bet in a deep
+// pot is left alone.
+//
+// Stated, not derived. It was set by measuring what the slice actually does to
+// a hand's equity, on the boards where the tool was shoving live:
+//
+//	QQ on Tc Ad 5d As   top100% 0.872  top20% 0.641  top10% 0.537
+//	32 on 2s 2h 4c      top100% 0.935  top20% 0.946  top10% 0.961
+//
+// Which is the property that makes this worth doing at all. Trip deuces beat a
+// narrow range as comfortably as a wide one, so nothing is taken from them and
+// their shove still stands. The queens hold up only while the range is wide,
+// and that is exactly the value that is not really there. A blanket cap on
+// sizing would have cost both hands equally.
+const committedCallNarrowing = 0.75
 
 func roundToTwoDecimals(val float64) float64 {
 	return math.Round(val*100) / 100
@@ -396,6 +416,56 @@ func Calculate(in Inputs) AdvisorResponse {
 			return 0, 0
 		}
 		f := foldFrequency(raiseTo-toCall, pot, observedFold, weight)
+
+		// Minimum defence frequency is a bluff-catching rule, and it describes
+		// a defender who still has something to defend with: streets left to
+		// play, implied odds, and fold equity of their own on the next one.
+		// A bet that puts their whole stack in takes all three away. What is
+		// left has to have showdown value now, and that is a much smaller part
+		// of a range than MDF allows.
+		//
+		// This is the one place the model was losing money. Live, queens on
+		// Tc Ad 5d As shoved 32,766 into 62,947 -- the equity behind that was
+		// measured against the strongest two thirds of a *preflop* hand
+		// ranking, which on that board is mostly hands that missed it. Anyone
+		// calling an all-in there holds an ace far more often than a preflop
+		// ranking suggests, and against an ace the queens have two outs. Tens,
+		// treys and trip-deuce hands shoved for the same reason.
+		//
+		// The proper repair is opponent ranges that know what board they are
+		// on; ours are preflop rankings with no board awareness at all. Until
+		// that exists, narrowing what calls a committing bet moves the estimate
+		// in the direction the missing knowledge points. The factor is stated,
+		// not derived, and it scales with how much of the stack is at risk, so
+		// a small bet in a deep pot is untouched and only a shove is fully
+		// discounted.
+		// How often they continue and what they continue with are separate
+		// questions, and only the second one is answered badly here. MDF
+		// answers the first correctly: it is the frequency a competent
+		// opponent must defend at, whatever they hold. The second is answered
+		// by a preflop hand ranking that has never looked at the board, and
+		// facing an all-in that is where it fails -- a caller with no streets
+		// left keeps showdown value and folds the rest, so the part of their
+		// range that calls is stronger than its size suggests.
+		//
+		// So the frequency is left alone and only the slice equity is measured
+		// against is narrowed. Making the two consistent was tried first and is
+		// worse: hands that stop calling have to fold instead, fold equity on
+		// the queens above went from 34% to 67%, and the shove came out better
+		// than before. Folding the field out is not a cost the model should be
+		// paid for.
+		// Only where a simulator can measure the narrower slice. The fallback
+		// below has no board and no ranges: it derives equity-when-called from
+		// the fold frequency itself, so narrowing the slice as well counts the
+		// same discount twice. It did, and a river hand with 97% equity and a
+		// four-big-blind stack stopped shoving -- which is the whole strategy
+		// with that hand. The same rule already governs bettorRangeFraction on
+		// the call side, for the same reason.
+		callShare := 1 - f
+		if in.EquityVsTop != nil && effectiveStack > 0 {
+			commitment := math.Min(raiseTo/effectiveStack, 1)
+			callShare *= 1 - committedCallNarrowing*commitment
+		}
 		allFold = math.Pow(f, float64(opponents))
 
 		expectedCallers := float64(opponents) * (1 - f)
@@ -407,8 +477,8 @@ func Calculate(in Inputs) AdvisorResponse {
 
 		callEq := 0.0
 		if in.EquityVsTop != nil {
-			// The callers are the strongest (1-f) of the range.
-			callEq = math.Min(math.Max(in.EquityVsTop(1-f), 0), 1)
+			// The callers are the strongest `callShare` of the range.
+			callEq = math.Min(math.Max(in.EquityVsTop(callShare), 0), 1)
 		} else {
 			callEq = fallbackEquityWhenCalled(winEq, f)
 		}
@@ -560,7 +630,30 @@ func Calculate(in Inputs) AdvisorResponse {
 
 	bestIdx := 0
 	bestEV := evFold
+
+	// With nothing owed, folding is strictly worse than checking -- it costs
+	// whatever the hand would have won and saves nothing, because checking is
+	// free. It stays in the list so the interface still shows what every option
+	// is worth, but it can never be the recommendation.
+	//
+	// The comparison below is a strict greater-than, so a tie leaves whatever
+	// was seeded. Seeded with fold at zero, a hand with no equity at all tied
+	// with checking and the tool advised folding a free card. Found by the
+	// strategy sweep, on air at showdown against three players.
+	freeToCheck := toCall == 0
+	if freeToCheck {
+		for i, act := range actions {
+			if act.Action == table.ActionCheck {
+				bestIdx, bestEV = i, act.EV
+				break
+			}
+		}
+	}
+
 	for i, act := range actions {
+		if freeToCheck && act.Action == table.ActionFold {
+			continue
+		}
 		isAggressive := act.Action == table.ActionBet ||
 			act.Action == table.ActionRaise ||
 			act.Action == table.ActionAllIn
@@ -713,6 +806,37 @@ type reasoningInput struct {
 	fromChart      bool
 }
 
+// chartReasoning explains a preflop decision in the terms that actually made
+// it: the chart for hero's position and the situation in front of them.
+//
+// It deliberately reports no EV and no equity figure. Preflop, equity to
+// showdown is not what the decision rests on -- comparing it with pot odds
+// prices a call as though hero were about to turn their cards over, which is
+// what folded 3h3c getting 37 to 1 and AcKc from the blinds. Quoting those
+// numbers beside a chart decision invites exactly the mistake the chart exists
+// to prevent.
+func chartReasoning(in reasoningInput, way string, actionRU map[table.ActionType]string) string {
+	switch in.action.Action {
+	case table.ActionFold:
+		return fmt.Sprintf("Фолд по чарту: рука не входит в диапазон этой позиции. %s, цена входа %.0f в банк %.0f.",
+			way, in.toCall, in.pot)
+	case table.ActionCall:
+		return fmt.Sprintf("Колл %.0f по чарту: рука в колл-диапазоне этой позиции. %s, банк %.0f.",
+			in.toCall, way, in.pot)
+	case table.ActionCheck:
+		return fmt.Sprintf("Чек по чарту: рука не в диапазоне повышения, а платить нечего. %s, банк %.0f.",
+			way, in.pot)
+	default:
+		name := actionRU[in.action.Action]
+		if name == "" {
+			name = string(in.action.Action)
+		}
+		return fmt.Sprintf("%s %.0f (%s) по чарту: рука в диапазоне повышения для этой позиции. %s, банк %.0f, эффективный стек %.0f.",
+			strings.ToUpper(name[:1])+name[1:], in.action.Amount, in.action.SizingLabel,
+			way, in.pot, in.effectiveStack)
+	}
+}
+
 // buildReasoning writes the explanation shown in the HUD. It is in Russian
 // because that is the language the operator reads it in under time pressure;
 // everything else in this package stays in English.
@@ -728,11 +852,33 @@ func buildReasoning(in reasoningInput) string {
 		table.ActionAllIn: "олл-ин",
 	}
 
+	// A decision the chart made has to be explained by the chart.
+	//
+	// Live, a chart raise with KQo six-way was reported as "Полублеф-рейз 4000,
+	// фолд-эквити 0% при эквити руки 11.9%, EV -2355", with a line about the
+	// chart appended after it. Every number in that sentence comes from the EV
+	// model, which did not make the decision and is known to be wrong preflop --
+	// being wrong preflop is why the charts exist. So the explanation told the
+	// operator that the recommended action loses money, and did it under a
+	// heading that was itself wrong. The raise is correct; only the account of
+	// it was broken.
+	if in.fromChart {
+		return chartReasoning(in, way, actionRU)
+	}
+
+	// Value or semi-bluff is a question about whether the hand is ahead, and
+	// ahead of a field of five is not the same as ahead of one. Measured
+	// against a flat 0.50 every multiway preflop raise came out a semi-bluff,
+	// because six-way all-in equity is around 12% for anything -- aces are
+	// about 35%. The fair share of the pot is the honest comparison, and it is
+	// exactly 0.50 heads-up, which is where the constant came from.
+	fairShare := 1.0 / float64(in.opponents+1)
+
 	var body string
 	switch in.action.Action {
 	case table.ActionBet, table.ActionRaise, table.ActionAllIn:
 		name := actionRU[in.action.Action]
-		if in.winEq >= 0.50 {
+		if in.winEq >= fairShare {
 			body = fmt.Sprintf("Вэлью-%s %.0f (%s), %s: эквити %.1f%%, фолд-эквити на этом размере %.0f%%, EV %+.0f.",
 				name, in.action.Amount, in.action.SizingLabel, way,
 				in.winEq*100, in.action.FoldEquity*100, in.action.EV)
@@ -752,10 +898,6 @@ func buildReasoning(in reasoningInput) string {
 	default:
 		body = fmt.Sprintf("Фолд, %s: эквити против ставящего диапазона (верхние %.0f%%) — %.1f%%, а пот-оддсы требуют %.1f%%. Колл дал бы EV %+.0f.",
 			way, in.callRangeFrac*100, in.callEquity*100, in.potOdds*100, in.evCall)
-	}
-
-	if in.fromChart {
-		return body + " Решение с префлоп-чарта по позиции, а не из сравнения эквити с пот-оддсами."
 	}
 
 	if !in.hasReads {

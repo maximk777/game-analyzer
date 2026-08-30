@@ -348,3 +348,96 @@ func TestVisionSample_FourColourDeckSuits(t *testing.T) {
 		}
 	}
 }
+
+// The blinds set the scale of everything on the table, and they come from the
+// window title, which the system hands over exactly. They were being read by
+// text recognition off the title bar instead, and the loop that did it
+// overwrote what it had already found -- including with nothing, when a later
+// fragment of the same title happened to lack the slash.
+//
+// Measured over a recorded session: the blinds resolved in 1028 frames of 9788,
+// with the same table appearing as "NLH 1229111 - 1K/2K (320)", "NLH 1229111-
+// 1K/2K (320)", "@ NLH 1229111 - 1K/2K (320)" and "© NLH 1228078 - 1K/2K (320)".
+//
+// A missing stake is not a cosmetic loss. Without it there is no floor on what
+// counts as a wager, and the floor used to fall back to 1 -- harmless at 1K/2K
+// and fatal at a big blind of 0.1, where every real wager is below 1 and was
+// discarded, so pot odds were computed against a pot with no bets in it.
+func TestVisionSample_BlindsComeFromTheWindowTitle(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Vision/ScreenCaptureKit table analyser is macOS only")
+	}
+	if _, err := exec.LookPath("swiftc"); err != nil {
+		t.Skip("swiftc not available")
+	}
+
+	pkgDir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolving package dir: %v", err)
+	}
+	root := filepath.Dir(filepath.Dir(pkgDir))
+
+	sample := filepath.Join(root, "testdata", "coinpoker_live_sample.png")
+	if _, err := os.Stat(sample); err != nil {
+		t.Skip("testdata/coinpoker_live_sample.png not present")
+	}
+
+	bin := filepath.Join(t.TempDir(), "parse_image")
+	build := exec.Command("swiftc", "-parse-as-library",
+		filepath.Join(pkgDir, "table_vision.swift"),
+		filepath.Join(pkgDir, "card_templates.swift"),
+		filepath.Join(pkgDir, "parse_image_tool.swift"),
+		"-o", bin)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building the Swift table analyser failed: %v\n%s", err, out)
+	}
+
+	cases := []struct {
+		title       string
+		wantSmall   float64
+		wantBig     float64
+		wantFromOCR bool
+	}{
+		{title: "NLH 1229111 - 1K/2K (320)", wantSmall: 1000, wantBig: 2000},
+		// A micro table. Nothing in the repository was ever captured at this
+		// stake, which is exactly why the title has to be supplied rather than
+		// recognised.
+		{title: "NLH 4410 - 0.05/0.1 (0.01)", wantSmall: 0.05, wantBig: 0.1},
+		// A currency symbol used to end the scan before the first digit, so the
+		// whole stake parsed as nothing.
+		{title: "NLH 4410 - $0.05/$0.10", wantSmall: 0.05, wantBig: 0.10},
+		// A comma is a decimal point in most of the world. Reading "0,10" as
+		// ten is a hundredfold error; a thousands group is always three digits,
+		// which is what separates the two cases.
+		{title: "NLH 4410 - 0,05/0,10", wantSmall: 0.05, wantBig: 0.10},
+		{title: "PLO 77 - 0.5/1", wantSmall: 0.5, wantBig: 1},
+		// Not a table title at all, so recognition still gets its turn and
+		// reads the stake off this frame, which is a 1K/2K table.
+		{title: "Lobby", wantSmall: 1000, wantBig: 2000, wantFromOCR: true},
+	}
+
+	for _, tc := range cases {
+		run := exec.Command(bin, sample, "--title", tc.title)
+		run.Env = append(os.Environ(),
+			"POKER_RTA_ASSETS="+filepath.Join(root, "bin", "assets", "coinpoker"))
+		out, err := run.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: parse_image failed: %v\n%s", tc.title, err, out)
+		}
+		start := slices.Index(out, '{')
+		if start < 0 {
+			t.Fatalf("%s: no JSON in output:\n%s", tc.title, out)
+		}
+		var got struct {
+			SmallBlind float64 `json:"small_blind"`
+			BigBlind   float64 `json:"big_blind"`
+		}
+		if err := json.Unmarshal(out[start:], &got); err != nil {
+			t.Fatalf("%s: decoding output: %v\n%s", tc.title, err, out)
+		}
+		if got.SmallBlind != tc.wantSmall || got.BigBlind != tc.wantBig {
+			t.Errorf("title %q: blinds %v/%v, want %v/%v",
+				tc.title, got.SmallBlind, got.BigBlind, tc.wantSmall, tc.wantBig)
+		}
+	}
+}

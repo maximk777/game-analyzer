@@ -16,13 +16,14 @@ struct ParseImageTool {
     static func main() {
         let args = CommandLine.arguments
         guard args.count >= 2 else {
-            FileHandle.standardError.write("usage: parse_image <image.png> [--dump <dir>] [--verbose]\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: parse_image <image.png> [--dump <dir>] [--verbose] [--title <window title>]\n".data(using: .utf8)!)
             exit(2)
         }
 
         let path = args[1]
         var dumpDir: URL?
         var verbose = false
+        var title: String? = nil
 
         var i = 2
         while i < args.count {
@@ -38,6 +39,13 @@ struct ParseImageTool {
                 i += 2
             case "--verbose":
                 verbose = true
+            case "--title":
+                // Live, the window title comes from the system and is where the
+                // blinds are read from. Offline there is no window, so it can be
+                // supplied -- which is the only way to exercise a stake this
+                // repository has no capture of.
+                i += 1
+                if i < args.count { title = args[i] }
                 i += 1
             default:
                 i += 1
@@ -100,7 +108,8 @@ struct ParseImageTool {
             }
         }
 
-        let state = analyzeTable(cgImg: img, title: url.lastPathComponent, debugDir: verbose ? nil : dumpDir)
+        let state = analyzeTable(cgImg: img, title: title ?? url.lastPathComponent,
+                                 debugDir: verbose ? nil : dumpDir)
 
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]

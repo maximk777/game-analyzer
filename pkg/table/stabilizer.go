@@ -287,6 +287,25 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		if st.Street == "" {
 			st.Street = streetForBoard(len(st.CommunityCards))
 		}
+
+		// Badges already on the nameplates when the hand is recognised are
+		// actions that have already happened in it, not the background against
+		// which later ones are measured.
+		//
+		// A hand is only recognised once the evidence is in -- a pot drop has
+		// to be seen twice, hole cards likewise -- so recognition lags the deal
+		// by two or three frames, and at the capture rate that is most of a
+		// second. The opening raise routinely lands inside that window. It was
+		// then baked into the baseline and never emitted, and the player who
+		// made it looked like they had done nothing.
+		//
+		// Measured by replaying a recorded session (cmd/replay): of 107 hands,
+		// 18 recorded no action whatever, and seeding the badges present at
+		// recognition recovers 5 of them. It does not recover a missing preflop
+		// raise -- the action stream keeps 38 of the 42 it is given -- so the
+		// remaining gap is upstream, in how often a raise badge is read at all.
+		st.ActionHistory = newActions(&HandState{}, st.Seats, st.Street)
+
 		s.currentHand = st
 		s.lastUpdateAt = now
 		return s.currentHand
