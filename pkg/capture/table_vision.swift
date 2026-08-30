@@ -44,6 +44,16 @@ struct ParsedTableState: Codable {
     var seats: [ParsedSeat]
     var hero_made_hand: String
     var is_hero_turn: Bool
+    /// The action buttons the client is showing, lowercased.
+    ///
+    /// Which buttons exist says what hero may do, and the client is not coy
+    /// about it: a "Check" button means checking is free, and "Fold" beside
+    /// "Call" means it is not on offer at all. Reading only the *amount* on the
+    /// call button threw that away, so a frame where the amount did not come
+    /// out looked exactly like a frame where nothing was owed -- and the
+    /// assistant recommended CHECK to a player facing an all-in for their whole
+    /// stack, with no check available on screen.
+    var hero_buttons: [String]
     /// Blinds, read from the table title. They set the scale of everything on
     /// the felt: without them a stray "15" from the action timer is
     /// indistinguishable from a bet.
@@ -181,16 +191,26 @@ func makeInkMask(_ bmp: Bitmap) -> InkMask {
             // Green is felt caught along the crop edge, not ink -- with one
             // exception. The client ships two decks, and on the four-colour one
             // a club is printed green: measured from its own sprites, felt is
-            // (9,67,50) and a club is (48,135,0). What separates them is blue.
-            // Felt carries about three quarters as much blue as green; a club
-            // carries none, and only picks any up where it blends into the
-            // white card beneath it. So the felt test keeps its shape and gains
-            // one clause, which leaves the felt margin comfortable (100 against
-            // 67) and costs a club only its outermost blended pixels.
+            // (9,67,50) and a club is (48,135,0).
             //
-            // Without this clause a green club is deleted outright, and the
-            // card comes back with a rank and no suit.
-            if g > r + 18 && g > b + 10 && b * 2 > g { continue }
+            // Two clauses separate them, and both are needed.
+            //
+            // Blue: felt carries about three quarters as much blue as green, a
+            // club carries none and only picks any up where it blends into the
+            // white card beneath. That alone keeps the core of a club and eats
+            // its edge -- which was enough to matter. Live, on the four-colour
+            // deck, a four came back as an ace: both have one enclosed loop, so
+            // topology does not separate them, and a four with its thin strokes
+            // gnawed at the edges is the wrong shape.
+            //
+            // Red: felt is dark in red against its green (9 against 67), and a
+            // club is not (48 against 135) and gets redder the more it blends
+            // into white. So the second clause spares a club at every coverage
+            // while felt still fails it.
+            //
+            // Without either, a green club is deleted outright and the card
+            // comes back with a rank and no suit.
+            if g > r + 18 && g > b + 10 && b * 2 > g && r * 2 < g { continue }
 
             mask[y * bmp.width + x] = true
             ink += 1
@@ -1110,7 +1130,24 @@ func readIndexRect(cgImg: CGImage, indexRect: CGRect, whiteRatio: Double,
         // a crop that had strayed onto a second card, where nothing scored
         // above 0.41.
         let templatesReady = CardTemplates.shared.isLoaded
-        if let match = CardTemplates.shared.matchRank(rankMask, holes: metrics.count, holeY: metrics.centreY),
+        // The client's own glyphs first, where they have been extracted.
+        //
+        // They are the same rendering that is on the table, compared by
+        // correlation on a letterboxed grid, with the loop count as a penalty
+        // rather than a filter. The filter is what turned a four into an ace
+        // live: both carry one loop, the four's had been trimmed away by the
+        // rule that keeps green felt out of the ink, and with the loop count
+        // gone the four was not allowed to compete.
+        if let bitmap = matchRankBitmap(rankMask, templates: CardTemplates.shared.rankBitmaps) {
+            rankEvidence += String(format: " bitmap=%@:%.3f", bitmap.label, bitmap.score)
+            if bitmap.score >= RankBitmaps.floor {
+                rank = bitmap.label
+                rankEvidence += " picked=" + bitmap.label + ":byBitmap"
+            }
+        }
+        if rank != nil {
+            // Decided.
+        } else if let match = CardTemplates.shared.matchRank(rankMask, holes: metrics.count, holeY: metrics.centreY),
            match.score >= 0.45 {
             rank = match.label
             rankEvidence += " picked=" + match.label + String(format: ":%.3f", match.score)
@@ -1248,6 +1285,7 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
         seats: [],
         hero_made_hand: "",
         is_hero_turn: false,
+        hero_buttons: [],
         small_blind: titleBlinds.small,
         big_blind: titleBlinds.big,
         second_board: []
@@ -1329,6 +1367,8 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     // the word, so both are handled. Hero's own posted bet is not separated out
     // here: the button already states what is left to pay, which is exactly
     // what the engine needs.
+    state.hero_buttons = actionButtons.map { $0.label }
+
     for button in actionButtons {
         if button.label.contains("fold") || button.label == "check" { continue }
 

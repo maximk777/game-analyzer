@@ -122,11 +122,46 @@ struct DiagRecorder {
             var slots: [SlotReport] = []
             var failed: [String] = []
 
-            for (n, slot) in TableGeometry.boardSlots.enumerated() {
-                collect(img, slot, "board\(n + 1)", &slots, &failed)
+            // Read the way the live agent reads.
+            //
+            // This used to probe TableGeometry.boardSlots and heroSlots, which
+            // are measured rectangles the recogniser stopped using: the client
+            // does not put hero's cards at a constant offset, which is why they
+            // are found by their white faces every frame. So the recorder was
+            // reporting failures for rectangles that held no cards, and missing
+            // the failure that matters -- hero's second card going unread --
+            // because that happens on a path it never touched. A diagnostic
+            // that does not exercise the code being diagnosed cannot catch
+            // anything.
+            let frame = Bitmap(cgImage: img, downscale: 4)
+            let boardRects = frame.map { findBoardCardRects(bmp: $0) } ?? []
+            let heroRegions = frame.map { findHeroCardRegions(bmp: $0, excluding: boardRects) } ?? []
+
+            for (n, rect) in boardRects.enumerated() {
+                collectRect(img, rect, "board\(n + 1)", &slots, &failed)
             }
-            for (n, slot) in TableGeometry.heroSlots.enumerated() {
-                collect(img, slot, "hero\(n + 1)", &slots, &failed)
+
+            // Hero is the case this exists for. A white card region is on
+            // screen, so cards are being dealt to hero; anything short of two
+            // readings is the failure that stops play.
+            var heroRead = 0
+            for (i, region) in heroRegions.enumerated() {
+                for (n, found) in readCardsInRegion(cgImg: img, region: region).enumerated() {
+                    slots.append(SlotReport(
+                        slot: "hero\(i + 1)-\(n + 1)",
+                        card: found.reading.card,
+                        rank: found.reading.rank,
+                        suit: found.reading.suit,
+                        white_ratio: found.reading.whiteRatio,
+                        suit_distance: found.reading.suitDistance.isFinite ? found.reading.suitDistance : -1,
+                        profile: found.reading.profile,
+                        debug: found.reading.debug
+                    ))
+                    if found.reading.card != nil { heroRead += 1 }
+                }
+            }
+            if !heroRegions.isEmpty && heroRead < 2 {
+                failed.append("hero(\(heroRead)/2)")
             }
 
             let state = analyzeTable(cgImg: img, title: win.title ?? "CoinPoker Table")
@@ -187,9 +222,9 @@ struct DiagRecorder {
     /// A slot counts as failed only when a card is clearly present -- a high
     /// white ratio -- but rank or suit did not come out. An empty slot is not a
     /// failure, and recording it would bury the real ones.
-    static func collect(_ img: CGImage, _ slot: CGRect, _ name: String,
-                        _ slots: inout [SlotReport], _ failed: inout [String]) {
-        let r = readCardSlot(cgImg: img, slot: slot, label: name)
+    static func collectRect(_ img: CGImage, _ rect: CGRect, _ name: String,
+                            _ slots: inout [SlotReport], _ failed: inout [String]) {
+        let r = readCardRect(cgImg: img, slotRect: rect, label: name)
         slots.append(SlotReport(
             slot: name,
             card: r.card,

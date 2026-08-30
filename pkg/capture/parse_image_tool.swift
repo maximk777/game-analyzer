@@ -16,7 +16,7 @@ struct ParseImageTool {
     static func main() {
         let args = CommandLine.arguments
         guard args.count >= 2 else {
-            FileHandle.standardError.write("usage: parse_image <image.png> [--dump <dir>] [--verbose] [--title <window title>]\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: parse_image <image.png> [--dump <dir>] [--verbose] [--title <window title>] [--amount <text>...]\n".data(using: .utf8)!)
             exit(2)
         }
 
@@ -39,6 +39,18 @@ struct ParseImageTool {
                 i += 2
             case "--verbose":
                 verbose = true
+            case "--amount":
+                // Reads one amount the way a frame's text would be read, so a
+                // stake or a pot that comes back wrong can be checked without a
+                // table in front of you.
+                i += 1
+                while i < args.count {
+                    let raw = args[i]
+                    print(String(format: "  %-24s -> %@", (raw as NSString).utf8String!,
+                                 String(describing: parseAmount(raw))))
+                    i += 1
+                }
+                return
             case "--title":
                 // Live, the window title comes from the system and is where the
                 // blinds are read from. Offline there is no window, so it can be

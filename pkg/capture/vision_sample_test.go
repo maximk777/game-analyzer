@@ -56,6 +56,7 @@ func TestVisionSample_CoinPokerLiveFrame(t *testing.T) {
 	build := exec.Command("swiftc", "-parse-as-library",
 		filepath.Join(pkgDir, "table_vision.swift"),
 		filepath.Join(pkgDir, "card_templates.swift"),
+		filepath.Join(pkgDir, "rank_bitmap_templates.swift"),
 		filepath.Join(pkgDir, "parse_image_tool.swift"),
 		"-o", bin)
 	if out, err := build.CombinedOutput(); err != nil {
@@ -194,6 +195,7 @@ func TestVisionSample_OverlappingHeroCards(t *testing.T) {
 	build := exec.Command("swiftc", "-parse-as-library",
 		filepath.Join(pkgDir, "table_vision.swift"),
 		filepath.Join(pkgDir, "card_templates.swift"),
+		filepath.Join(pkgDir, "rank_bitmap_templates.swift"),
 		filepath.Join(pkgDir, "parse_image_tool.swift"),
 		"-o", bin)
 	if out, err := build.CombinedOutput(); err != nil {

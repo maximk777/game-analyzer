@@ -98,10 +98,21 @@ final class CardTemplates {
     /// false when the assets are absent, in which case the caller keeps using
     /// text recognition: a missing asset directory must degrade the reading,
     /// never stop it.
+    /// Rank glyphs as the client itself draws them, when they are available.
+    ///
+    /// Preferred over the font-rendered references: they are the same rendering
+    /// that appears on screen, so the comparison has one fewer remove in it.
+    /// See rank_bitmap_templates.swift for what that buys and why the loop
+    /// count became a penalty rather than a filter.
+    var rankBitmaps: [BitmapTemplate] = []
+
+    var hasBitmapRanks: Bool { !rankBitmaps.isEmpty }
+
     @discardableResult
     func load(assetsDir: String) -> Bool {
         ranks = loadRanks(assetsDir: assetsDir)
         suits = loadSuits(assetsDir: assetsDir)
+        rankBitmaps = loadRankBitmaps(from: (assetsDir as NSString).appendingPathComponent("ranks"))
         return isLoaded
     }
 

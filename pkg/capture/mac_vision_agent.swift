@@ -57,9 +57,32 @@ struct MacVisionAgent {
         print("[MAC-VISION] ScreenCaptureKit Vision Agent active. Monitoring CoinPoker table...")
         print("[MAC-VISION] Logging live session to: \(logFile.path)")
 
+        // Why the capture loop reports rather than ignores.
+        //
+        // It used to swallow every error into an empty catch and print
+        // "Waiting for CoinPoker table window..." on every frame it found
+        // nothing. So when capture stopped working -- screen recording
+        // permission revoked, the display reconfigured, the window minimised,
+        // the client restarted -- the tool went quiet and stayed quiet, and
+        // from the outside that is indistinguishable from a table where
+        // nothing is happening. "It just loses the screen" is what that looks
+        // like to whoever is playing.
+        //
+        // Nothing here retries harder than before. What is different is that
+        // every change of state is said once, with the reason, and a failure
+        // that persists explains what usually causes it.
+        var haveWindow = false
+        var consecutiveFailures = 0
+        var lastFailure = ""
+        var reportedPermissionHint = false
+
         while true {
             do {
                 if let win = await findTargetWindow() {
+                    if !haveWindow {
+                        print("[MAC-VISION] Table window found: \(win.title ?? "untitled") \(Int(win.frame.width))x\(Int(win.frame.height))")
+                        haveWindow = true
+                    }
                     let filter = SCContentFilter(desktopIndependentWindow: win)
                     let config = SCStreamConfiguration()
                     config.width = Int(win.frame.width * 2)
@@ -89,10 +112,43 @@ struct MacVisionAgent {
                         print("[MAC-VISION] Live Update: Pot=\(Int(parsed.pot)), Street=\(parsed.street), Board=\(parsed.community_cards), Hero=\(parsed.hero_cards), Players=[\(playerSummary)]")
                     }
                 } else {
-                    print("[MAC-VISION] Waiting for CoinPoker table window...")
+                    if haveWindow {
+                        // Said once on the way down, not once a frame: a line
+                        // per frame is not a report, it is noise that hides the
+                        // moment it started.
+                        print("[MAC-VISION] Table window lost. Is the client still open on a table?")
+                        haveWindow = false
+                    }
+                }
+                if consecutiveFailures > 0 {
+                    print("[MAC-VISION] Capture recovered after \(consecutiveFailures) failed frame(s).")
+                    consecutiveFailures = 0
+                    lastFailure = ""
+                    reportedPermissionHint = false
                 }
             } catch {
-                // Ignore transient stream errors
+                consecutiveFailures += 1
+                let text = String(describing: error)
+                // The same error repeating is one event, not many.
+                if text != lastFailure {
+                    print("[MAC-VISION] Capture failed: \(text)")
+                    lastFailure = text
+                }
+                // Long enough to mean something other than a hiccup. At about
+                // three frames a second this is roughly ten seconds.
+                if consecutiveFailures == 30 && !reportedPermissionHint {
+                    reportedPermissionHint = true
+                    print("""
+                    [MAC-VISION] Capture has been failing for 30 frames. The usual causes, in order:
+                      1. Screen Recording permission for this terminal was revoked or never granted
+                         (System Settings -> Privacy & Security -> Screen Recording), which is the
+                         one that produces no error anyone can read.
+                      2. The table window is minimised or on another Space.
+                      3. The client was restarted, so the window this was capturing no longer exists.
+                    Nothing is lost while this lasts: the hand in progress is held, and reading
+                    resumes on the first frame that comes back.
+                    """)
+                }
             }
 
             // The loop is analysis-bound, not sleep-bound: a frame takes about
