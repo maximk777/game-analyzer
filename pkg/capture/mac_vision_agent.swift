@@ -64,6 +64,67 @@ func findTargetWindow() async -> SCWindow? {
     return coinWins.first
 }
 
+func sampleSuitAt(cgImg: CGImage, box: CGRect) -> String {
+    let imgW = CGFloat(cgImg.width)
+    let imgH = CGFloat(cgImg.height)
+    
+    // In Vision coords, box.origin.y is from bottom.
+    // Card extends downwards from the top-left rank label:
+    let pixelX = max(Int(box.origin.x * imgW), 0)
+    let pixelY = max(Int((1.0 - box.origin.y - box.size.height) * imgH), 0)
+    let pixelW = min(Int(imgW * 0.055), cgImg.width - pixelX)
+    let pixelH = min(Int(imgH * 0.110), cgImg.height - pixelY)
+
+    guard let dataProvider = cgImg.dataProvider,
+          let data = dataProvider.data,
+          let ptr = CFDataGetBytePtr(data) else {
+        return "s"
+    }
+
+    let bpr = cgImg.bytesPerRow
+    let bpp = cgImg.bitsPerPixel / 8
+
+    var redPixels = 0
+    var bluePixels = 0
+    var greenPixels = 0
+    var blackPixels = 0
+
+    for dy in 0..<pixelH {
+        for dx in 0..<pixelW {
+            let offset = (pixelY + dy) * bpr + (pixelX + dx) * bpp
+            if offset + 2 >= CFDataGetLength(data) { continue }
+            let r = Double(ptr[offset])
+            let g = Double(ptr[offset + 1])
+            let b = Double(ptr[offset + 2])
+
+            // Ignore white background and green felt
+            if r > 210 && g > 210 && b > 210 { continue }
+            if g > r + 35 && g > b + 35 { continue }
+
+            if r > 150 && r > g + 40 && r > b + 40 {
+                redPixels += 1
+            } else if b > 150 && b > r + 40 && b > g + 40 {
+                bluePixels += 1
+            } else if g > 130 && g > r + 30 && g > b + 30 {
+                greenPixels += 1
+            } else if r < 65 && g < 65 && b < 65 {
+                blackPixels += 1
+            }
+        }
+    }
+
+    if bluePixels > redPixels && bluePixels > 10 {
+        return "d" // 4-color blue diamonds
+    }
+    if greenPixels > redPixels && greenPixels > 10 {
+        return "c" // 4-color green clubs
+    }
+    if redPixels > blackPixels && redPixels > 10 {
+        return "h" // Red hearts / diamonds
+    }
+    return "s" // Black spades / clubs
+}
+
 func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
     var texts: [(text: String, box: CGRect)] = []
 
@@ -98,8 +159,7 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
 
     var nameItems: [(name: String, box: CGRect)] = []
     var numberItems: [(val: Double, box: CGRect)] = []
-    var detectedBoardCards: [(rank: String, suit: String, x: CGFloat)] = []
-    var detectedHeroCards: [(rank: String, suit: String, x: CGFloat)] = []
+    var detectedCards: [(rank: String, suit: String, x: CGFloat, isHero: Bool)] = []
 
     let validRanks = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2"]
 
@@ -113,7 +173,7 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
             state.table_id = t
         }
 
-        // 2. Pot (Ignore strings without numbers)
+        // 2. Pot (Safe parser - ignore strings without numbers)
         if lower.contains("pot") {
             let pVal = parseAmount(t)
             if pVal > 0 {
@@ -135,41 +195,39 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
             }
         }
 
-        // 5. Board & Hero Cards by rank detection
+        // 5. Card Recognition by Rank and Position
         let upper = t.uppercased()
         if validRanks.contains(upper) && b.size.height < 0.08 {
-            // Sample suit color around card box in image
             let suit = sampleSuitAt(cgImg: cgImg, box: b)
             
-            // Community Cards band (Y: 0.45..0.65 in Vision coords)
-            if b.origin.y > 0.45 && b.origin.y < 0.68 && b.origin.x > 0.20 && b.origin.x < 0.80 {
-                detectedBoardCards.append((rank: upper, suit: suit, x: b.origin.x))
+            // Community Cards band (Y: 0.42..0.68 in Vision coords)
+            if b.origin.y > 0.42 && b.origin.y < 0.68 && b.origin.x > 0.20 && b.origin.x < 0.75 {
+                detectedCards.append((rank: upper, suit: suit, x: b.origin.x, isHero: false))
             }
-            // Hero Cards band (Y: 0.15..0.35 in Vision coords)
-            if b.origin.y > 0.15 && b.origin.y < 0.35 && b.origin.x > 0.30 && b.origin.x < 0.60 {
-                detectedHeroCards.append((rank: upper, suit: suit, x: b.origin.x))
+            // Hero Cards band (Y: 0.15..0.38 in Vision coords)
+            if b.origin.y > 0.15 && b.origin.y < 0.38 && b.origin.x > 0.30 && b.origin.x < 0.60 {
+                detectedCards.append((rank: upper, suit: suit, x: b.origin.x, isHero: true))
             }
         }
 
-        // 6. Separate player names vs player stack numbers
+        // 6. Players and Stacks
         let numVal = parseAmount(t)
         let isPureNumber = numVal > 0 && !lower.contains("pot") && !lower.contains("nlh") && !lower.contains("plo")
         if isPureNumber && b.size.height < 0.06 {
             numberItems.append((val: numVal, box: b))
-        } else if t.count >= 4 && !lower.contains("pot") && !lower.contains("fold") && !lower.contains("check") && !lower.contains("call") && !lower.contains("bet") && !lower.contains("raise") && !lower.contains("empty") && !lower.contains("coin") && !lower.contains("nlh") && !lower.contains("plo") && !lower.contains("wait") && !lower.contains("find") && !lower.contains("pair") && !lower.contains("flush") && !lower.contains("straight") {
+        } else if t.count >= 4 && !lower.contains("pot") && !lower.contains("fold") && !lower.contains("check") && !lower.contains("call") && !lower.contains("bet") && !lower.contains("raise") && !lower.contains("empty") && !lower.contains("coin") && !lower.contains("nlh") && !lower.contains("plo") && !lower.contains("wait") && !lower.contains("find") && !lower.contains("pair") && !lower.contains("flush") && !lower.contains("straight") && !lower.contains("house") && !lower.contains("poker") && !lower.contains("sit out") && !lower.contains("sit") {
             nameItems.append((name: t, box: b))
         }
     }
 
-    // Pair player name with the stack number directly below it
+    // Pair player name with stack number
     var players: [ParsedSeat] = []
     for (idx, nameItem) in nameItems.enumerated() {
         var stackVal: Double = 0.0
-        // Find closest number below nameplate (deltaX < 0.06, Y below name)
         var closestDist: CGFloat = 1000.0
         for numItem in numberItems {
             let dx = abs(numItem.box.origin.x - nameItem.box.origin.x)
-            let dy = nameItem.box.origin.y - numItem.box.origin.y // in Vision coords, lower on screen has smaller Y
+            let dy = nameItem.box.origin.y - numItem.box.origin.y
             if dx < 0.08 && dy >= 0 && dy < 0.08 {
                 let dist = dx + dy
                 if dist < closestDist {
@@ -190,27 +248,34 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
         ))
     }
 
-    // Sort detected board cards left-to-right by X and deduplicate
-    detectedBoardCards.sort { $0.x < $1.x }
-    var uniqueBoard: [String] = []
-    for c in detectedBoardCards {
-        let cardStr = "\(c.rank)\(c.suit)"
-        if uniqueBoard.count < 5 && !uniqueBoard.contains(cardStr) {
-            uniqueBoard.append(cardStr)
-        }
-    }
-    state.community_cards = uniqueBoard
+    // Group Board Cards by distinct X slots (threshold 0.03 deltaX)
+    var boardCards = detectedCards.filter { !$0.isHero }
+    boardCards.sort { $0.x < $1.x }
 
-    // Sort detected hero cards left-to-right
-    detectedHeroCards.sort { $0.x < $1.x }
-    var uniqueHero: [String] = []
-    for c in detectedHeroCards {
-        let cardStr = "\(c.rank)\(c.suit)"
-        if uniqueHero.count < 2 && !uniqueHero.contains(cardStr) {
-            uniqueHero.append(cardStr)
+    var finalBoard: [String] = []
+    var lastX: CGFloat = -1.0
+    for c in boardCards {
+        if lastX < 0 || (c.x - lastX) > 0.025 {
+            finalBoard.append("\(c.rank)\(c.suit)")
+            lastX = c.x
+            if finalBoard.count == 5 { break }
         }
     }
-    state.hero_cards = uniqueHero
+    state.community_cards = finalBoard
+
+    // Hero Cards
+    var heroCards = detectedCards.filter { $0.isHero }
+    heroCards.sort { $0.x < $1.x }
+    var finalHero: [String] = []
+    lastX = -1.0
+    for c in heroCards {
+        if lastX < 0 || (c.x - lastX) > 0.025 {
+            finalHero.append("\(c.rank)\(c.suit)")
+            lastX = c.x
+            if finalHero.count == 2 { break }
+        }
+    }
+    state.hero_cards = finalHero
 
     // Determine street
     switch state.community_cards.count {
@@ -223,71 +288,11 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
     case 5:
         state.street = "river"
     default:
-        state.street = state.community_cards.count > 0 ? "flop" : "preflop"
+        state.street = state.community_cards.count > 0 ? (state.community_cards.count >= 4 ? "turn" : "flop") : "preflop"
     }
 
     state.seats = players
     return state
-}
-
-// Sample color in card area to distinguish Red (h/d) vs Black (s/c) suits
-func sampleSuitAt(cgImg: CGImage, box: CGRect) -> String {
-    let imgW = CGFloat(cgImg.width)
-    let imgH = CGFloat(cgImg.height)
-    
-    // Vision box is normalized [0..1] with bottom-left origin
-    let pixelX = Int(box.origin.x * imgW)
-    let pixelY = Int((1.0 - box.origin.y - box.size.height) * imgH)
-    let pixelW = max(Int(box.size.width * imgW), 10)
-    let pixelH = max(Int(box.size.height * imgH * 2.0), 10) // sample rank + suit below it
-
-    guard let dataProvider = cgImg.dataProvider,
-          let data = dataProvider.data,
-          let ptr = CFDataGetBytePtr(data) else {
-        return "s"
-    }
-
-    let bpr = cgImg.bytesPerRow
-    let bpp = cgImg.bitsPerPixel / 8
-
-    var redPixels = 0
-    var bluePixels = 0
-    var greenPixels = 0
-    var blackPixels = 0
-
-    for dy in 0..<min(pixelH, cgImg.height - pixelY) {
-        for dx in 0..<min(pixelW, cgImg.width - pixelX) {
-            let offset = (pixelY + dy) * bpr + (pixelX + dx) * bpp
-            let r = Double(ptr[offset])
-            let g = Double(ptr[offset + 1])
-            let b = Double(ptr[offset + 2])
-
-            // Ignore white card background & green felt
-            if r > 200 && g > 200 && b > 200 { continue }
-            if g > r + 40 && g > b + 40 { continue }
-
-            if r > 160 && r > g + 40 && r > b + 40 {
-                redPixels += 1
-            } else if b > 160 && b > r + 40 && b > g + 40 {
-                bluePixels += 1
-            } else if g > 160 && g > r + 40 && g > b + 40 {
-                greenPixels += 1
-            } else if r < 60 && g < 60 && b < 60 {
-                blackPixels += 1
-            }
-        }
-    }
-
-    if bluePixels > redPixels && bluePixels > blackPixels {
-        return "d" // 4-color blue diamonds
-    }
-    if greenPixels > redPixels && greenPixels > blackPixels {
-        return "c" // 4-color green clubs
-    }
-    if redPixels > blackPixels {
-        return "h" // Red hearts / diamonds
-    }
-    return "s" // Black spades / clubs
 }
 
 @main
@@ -345,7 +350,7 @@ struct MacVisionAgent {
                 // Ignore transient stream errors
             }
 
-            try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+            try? await Task.sleep(nanoseconds: 333_000_000) // 3 FPS
         }
     }
 }
