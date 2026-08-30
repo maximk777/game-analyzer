@@ -132,6 +132,9 @@ func (p *FrameParser) ParseFrame(img image.Image, cfg ROIConfig) (*table.HandSta
 		if nameCrop != nil {
 			if nameStr, err := p.ocr.ParseString(nameCrop); err == nil && len(nameStr) > 0 {
 				seat.PlayerName = nameStr
+				if !seatROI.IsHero {
+					seat.PlayerID = nameStr
+				}
 			}
 		}
 

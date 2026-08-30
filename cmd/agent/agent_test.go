@@ -103,11 +103,20 @@ func TestAgent_EndToEndIntegration(t *testing.T) {
 		t.Fatalf("expected LiveAgent to be running")
 	}
 
-	// 1. Connect WebSocket client
+	// 1. Connect WebSocket client with retry
 	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/ws/tables/%s", port, tableID)
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial websocket at %s: %v", wsURL, err)
+	var wsConn *websocket.Conn
+	dialDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(dialDeadline) {
+		conn, _, dialErr := websocket.DefaultDialer.Dial(wsURL, nil)
+		if dialErr == nil {
+			wsConn = conn
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wsConn == nil {
+		t.Fatalf("failed to dial websocket at %s within deadline", wsURL)
 	}
 	defer wsConn.Close()
 
@@ -330,6 +339,17 @@ func TestAgent_StaticEndpoints(t *testing.T) {
 
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 2 * time.Second}
+
+	// Wait for server ready
+	readyDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(readyDeadline) {
+		r, err := client.Get(baseURL + "/hud.html")
+		if err == nil {
+			r.Body.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	// 1. GET /hud.html
 	resp, err := client.Get(baseURL + "/hud.html")
