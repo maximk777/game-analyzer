@@ -3,195 +3,151 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Poker RTA // Floating HUD</title>
+    <title>Poker RTA // Live Co-Pilot</title>
     <link rel="stylesheet" href="/hud.css">
 </head>
 <body class="hud-body">
-    <!-- Main Compact HUD Container (Target size: ~320-360px wide) -->
     <div class="hud-widget" id="hudWidget">
         
-        <!-- Header Bar: Drag Handle, Status, Street, Controls -->
+        <!-- Header: Live Status, Active Table, Street & Pot -->
         <header class="hud-header">
-            <div class="hud-status-group">
-                <span id="hudStatusDot" class="status-dot dot-searching" title="Connection status"></span>
-                <span id="hudStatusText" class="hud-status-text">○ Searching...</span>
+            <div class="hud-header-left">
+                <span id="hudStatusDot" class="status-dot dot-live" title="Live CoinPoker Stream"></span>
+                <span id="hudStatusText" class="hud-status-text">● Live · CoinPoker</span>
             </div>
             
-            <div class="hud-header-center">
-                <span id="hudStreetBadge" class="hud-street-badge street-preflop">PREFLOP</span>
-                <span id="hudPotBadge" class="hud-pot-badge">Pot: $0.00</span>
-            </div>
-
-            <div class="hud-header-actions">
-                <button id="btnToggleStats" class="hud-icon-btn" title="Toggle Opponent Stats & History">👥</button>
-                <button id="btnToggleSound" class="hud-icon-btn" title="Toggle Hero Turn Chime">🔔</button>
-                <button id="btnHudSettings" class="hud-icon-btn" title="Settings & Simulation">⚙️</button>
+            <div class="hud-header-right">
+                <span id="hudStreetBadge" class="hud-street-badge street-flop">FLOP</span>
+                <span id="hudPotBadge" class="hud-pot-badge">Pot: $0</span>
             </div>
         </header>
 
-        <!-- Main HUD Body -->
+        <!-- Main Content -->
         <main class="hud-main">
-            <!-- Hero Hole Cards & Hand Rank Combination -->
-            <section class="hud-cards-row">
-                <div class="hud-hole-cards" id="hudHoleCards">
-                    <div class="hud-card card-empty" data-slot="0">
-                        <span class="card-rank">?</span>
-                        <span class="card-suit"></span>
+            
+            <!-- Cards Section: Hero Hand + Board Cards -->
+            <section class="hud-cards-section">
+                <!-- Hero Cards & Combo -->
+                <div class="hud-hero-box">
+                    <div class="hud-box-title">HERO HAND</div>
+                    <div class="hud-hole-cards" id="hudHoleCards">
+                        <div class="hud-card card-empty" data-slot="0">
+                            <span class="card-rank">?</span>
+                            <span class="card-suit"></span>
+                        </div>
+                        <div class="hud-card card-empty" data-slot="1">
+                            <span class="card-rank">?</span>
+                            <span class="card-suit"></span>
+                        </div>
                     </div>
-                    <div class="hud-card card-empty" data-slot="1">
-                        <span class="card-rank">?</span>
-                        <span class="card-suit"></span>
-                    </div>
-                </div>
-
-                <div class="hud-hand-info">
                     <div class="hud-hand-rank" id="hudHandRank">Awaiting Cards...</div>
-                    <div class="hud-community-mini" id="hudCommunityMini">
-                        <span class="mini-board-slot empty">_</span>
-                        <span class="mini-board-slot empty">_</span>
-                        <span class="mini-board-slot empty">_</span>
-                        <span class="mini-board-slot empty">_</span>
-                        <span class="mini-board-slot empty">_</span>
+                </div>
+
+                <!-- Board Ribbon -->
+                <div class="hud-board-box">
+                    <div class="hud-box-title">COMMUNITY BOARD</div>
+                    <div class="hud-board-cards" id="hudBoardCards">
+                        <div class="board-card empty">_</div>
+                        <div class="board-card empty">_</div>
+                        <div class="board-card empty">_</div>
+                        <div class="board-card empty">_</div>
+                        <div class="board-card empty">_</div>
                     </div>
+                    <div class="hud-board-info" id="hudBoardInfo">Waiting for Deal...</div>
                 </div>
             </section>
 
-            <!-- Primary Action Highlight Banner -->
-            <section class="hud-primary-action-section">
-                <div class="hud-action-banner" id="hudActionBanner">
-                    <div class="hud-action-badge" id="hudActionBadge">
-                        <span class="action-type" id="hudActionType">CHECK / FOLD</span>
-                        <span class="action-amount" id="hudActionAmount">$0.00</span>
-                    </div>
-                    <div class="hud-ev-badge" id="hudEvBadge">EV: +$0.00</div>
-                </div>
-            </section>
-
-            <!-- Dual Equity & Pot Odds Comparison Bars -->
-            <section class="hud-gauges-section">
-                <div class="hud-gauge">
-                    <div class="gauge-label-row">
-                        <span class="g-name">EQUITY</span>
-                        <span class="g-val text-cyan" id="hudEquityVal">0.0%</span>
-                    </div>
-                    <div class="gauge-bar-bg">
-                        <div class="gauge-bar-fill fill-equity" id="hudEquityBar" style="width: 0%;"></div>
-                    </div>
-                </div>
-
-                <div class="hud-gauge">
-                    <div class="gauge-label-row">
-                        <span class="g-name">POT ODDS</span>
-                        <span class="g-val text-amber" id="hudPotOddsVal">0.0%</span>
-                    </div>
-                    <div class="gauge-bar-bg">
-                        <div class="gauge-bar-fill fill-pot-odds" id="hudPotOddsBar" style="width: 0%;"></div>
-                    </div>
+            <!-- PRIMARY RECOMMENDATION (Centerpiece) -->
+            <section class="hud-recommendation-card" id="hudRecCard">
+                <div class="rec-header">
+                    <span class="rec-tag">RECOMMENDED ACTION</span>
+                    <span class="rec-ev-pill" id="hudEvBadge">EV: +$0.00</span>
                 </div>
                 
-                <div class="hud-verdict-pill" id="hudVerdictPill">
-                    <span id="hudVerdictIcon">⚖</span>
-                    <span id="hudVerdictText">Awaiting Hero decision...</span>
+                <div class="rec-action-row" id="hudActionRow">
+                    <span class="rec-action-name" id="hudActionType">CHECK</span>
+                    <span class="rec-action-amount" id="hudActionAmount">$0</span>
+                </div>
+
+                <div class="rec-edge-callout" id="hudEdgeCallout">
+                    <span id="hudEdgeText">Analyzing table state & pot odds...</span>
                 </div>
             </section>
 
-            <!-- Sizing Matrix Grid (2x3 compact grid) -->
-            <section class="hud-sizing-section">
+            <!-- Math Gauges: Equity vs Pot Odds -->
+            <section class="hud-gauges-card">
+                <div class="gauge-row">
+                    <div class="gauge-header">
+                        <span class="gauge-name">HERO EQUITY</span>
+                        <span class="gauge-val text-cyan" id="hudEquityVal">0.0%</span>
+                    </div>
+                    <div class="gauge-track">
+                        <div class="gauge-fill fill-equity" id="hudEquityBar" style="width: 0%;"></div>
+                    </div>
+                </div>
+
+                <div class="gauge-row">
+                    <div class="gauge-header">
+                        <span class="gauge-name">POT ODDS REQ.</span>
+                        <span class="gauge-val text-amber" id="hudPotOddsVal">0.0%</span>
+                    </div>
+                    <div class="gauge-track">
+                        <div class="gauge-fill fill-pot-odds" id="hudPotOddsBar" style="width: 0%;"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Sizing Matrix (Quick Reference for CoinPoker Bet Sizing) -->
+            <section class="hud-sizing-card">
+                <div class="sizing-card-title">BET SIZING MATRIX</div>
                 <div class="hud-sizing-grid" id="hudSizingGrid">
-                    <button class="sizing-chip-btn" data-type="min">
-                        <span class="s-label">Min</span>
-                        <span class="s-amt" id="sizeAmtMin">$0.00</span>
-                    </button>
-                    <button class="sizing-chip-btn" data-type="2.5x">
-                        <span class="s-label">2.5x</span>
-                        <span class="s-amt" id="sizeAmt25x">$0.00</span>
-                    </button>
-                    <button class="sizing-chip-btn" data-type="33">
-                        <span class="s-label">33%</span>
-                        <span class="s-amt" id="sizeAmt33">$0.00</span>
-                    </button>
-                    <button class="sizing-chip-btn" data-type="66">
-                        <span class="s-label">66%</span>
-                        <span class="s-amt" id="sizeAmt66">$0.00</span>
-                    </button>
-                    <button class="sizing-chip-btn" data-type="pot">
-                        <span class="s-label">Pot</span>
-                        <span class="s-amt" id="sizeAmtPot">$0.00</span>
-                    </button>
-                    <button class="sizing-chip-btn btn-allin" data-type="allin">
-                        <span class="s-label">All-In</span>
-                        <span class="s-amt" id="sizeAmtAllIn">$0.00</span>
-                    </button>
-                </div>
-            </section>
-
-            <!-- Tactical Reasoning Summary -->
-            <section class="hud-reasoning-section">
-                <div class="hud-reasoning-text" id="hudReasoningText">
-                    Waiting for real-time table state or Vision capture...
-                </div>
-            </section>
-
-            <!-- Collapsible Opponent Tendencies & Live Action History Drawer -->
-            <section class="hud-collapsible-drawer collapsed" id="hudOpponentsDrawer">
-                <div class="drawer-tabs">
-                    <button class="drawer-tab active" id="tabOpponents">Opponents</button>
-                    <button class="drawer-tab" id="tabActions">Actions (<span id="actionCount">0</span>)</button>
-                </div>
-
-                <div class="drawer-content">
-                    <!-- Opponents List -->
-                    <div class="drawer-pane active" id="paneOpponents">
-                        <div class="opponents-list" id="hudOpponentsList">
-                            <div class="empty-opponents">No active opponent data yet.</div>
-                        </div>
+                    <div class="sizing-item">
+                        <span class="s-tag">Min</span>
+                        <span class="s-val" id="sizeAmtMin">$0</span>
                     </div>
-
-                    <!-- Action History List -->
-                    <div class="drawer-pane" id="paneActions">
-                        <div class="hud-actions-list" id="hudActionsList">
-                            <div class="empty-actions">No hand actions recorded.</div>
-                        </div>
+                    <div class="sizing-item">
+                        <span class="s-tag">2.5x</span>
+                        <span class="s-val" id="sizeAmt25x">$0</span>
+                    </div>
+                    <div class="sizing-item">
+                        <span class="s-tag">33% Pot</span>
+                        <span class="s-val" id="sizeAmt33">$0</span>
+                    </div>
+                    <div class="sizing-item">
+                        <span class="s-tag">66% Pot</span>
+                        <span class="s-val" id="sizeAmt66">$0</span>
+                    </div>
+                    <div class="sizing-item">
+                        <span class="s-tag">Pot</span>
+                        <span class="s-val" id="sizeAmtPot">$0</span>
+                    </div>
+                    <div class="sizing-item item-allin">
+                        <span class="s-tag">All-In</span>
+                        <span class="s-val" id="sizeAmtAllIn">$0</span>
                     </div>
                 </div>
             </section>
+
+            <!-- AI Tactical Strategy & Reasoning -->
+            <section class="hud-strategy-card">
+                <div class="strategy-title">💡 STRATEGY & REASONING</div>
+                <div class="strategy-text" id="hudReasoningText">
+                    Live capture connected. Waiting for cards or active turn...
+                </div>
+            </section>
+
+            <!-- Seated Opponents Tendency Drawer (Collapsible) -->
+            <section class="hud-opponents-section">
+                <div class="opponents-header" id="btnToggleOpponents">
+                    <span class="opp-title">👥 SEATED PLAYERS (<span id="playerCount">0</span>)</span>
+                    <span class="opp-toggle-icon" id="oppToggleIcon">▼</span>
+                </div>
+                <div class="opponents-list" id="hudOpponentsList">
+                    <div class="empty-opp">No player data yet.</div>
+                </div>
+            </section>
+
         </main>
-
-        <!-- Quick Simulation & Settings Drawer / Flyout -->
-        <div class="hud-settings-modal hidden" id="hudSettingsModal">
-            <div class="settings-modal-header">
-                <h4>Quick Test & Config</h4>
-                <button id="btnCloseSettings" class="btn-close-modal">✕</button>
-            </div>
-            <div class="settings-modal-body">
-                <div class="setting-row">
-                    <label for="inputTableId">Table ID:</label>
-                    <input type="text" id="inputTableId" value="table-1">
-                    <button id="btnReconnect" class="btn-sm">Connect</button>
-                </div>
-
-                <div class="setting-row">
-                    <label for="sliderOpacity">HUD Opacity:</label>
-                    <input type="range" id="sliderOpacity" min="50" max="100" value="95">
-                </div>
-
-                <div class="sim-actions-title">Simulate Hand States:</div>
-                <div class="sim-btn-grid">
-                    <button id="simBtnNewHand" class="sim-btn">1. New Hand</button>
-                    <button id="simBtnFlop" class="sim-btn">2. Flop (A♠ K♦ 2♣)</button>
-                    <button id="simBtnTurn" class="sim-btn">3. Turn (J♥)</button>
-                    <button id="simBtnRiver" class="sim-btn">4. River (8♠)</button>
-                    <button id="simBtnBet" class="sim-btn">5. Villain Bet $20</button>
-                    <button id="simBtnHeroTurn" class="sim-btn">6. Hero Turn</button>
-                    <button id="simBtnEnd" class="sim-btn">7. End Hand</button>
-                </div>
-                <div class="nav-links">
-                    <a href="/" target="_blank">Full Felt View ↗</a>
-                    <a href="/calibrate.html" target="_blank">ROI Calibrator ↗</a>
-                </div>
-            </div>
-        </div>
-
     </div>
 
     <script src="/hud.js"></script>

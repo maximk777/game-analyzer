@@ -213,9 +213,25 @@ func (h *WSHub) BroadcastToTable(tableID string, msg WSMessage) {
 		return
 	}
 
+	sentClients := make(map[*WSClient]bool)
+
+	// 1. Send to clients specifically subscribed to tableID
 	if clients, exists := h.tableClients[tableID]; exists {
 		for c := range clients {
 			c.sendBytes(data)
+			sentClients[c] = true
+		}
+	}
+
+	// 2. Also send to generic live subscribers (coinpoker-live, live, *, table-1)
+	for _, liveKey := range []string{"coinpoker-live", "live", "*", "table-1"} {
+		if clients, exists := h.tableClients[liveKey]; exists {
+			for c := range clients {
+				if !sentClients[c] {
+					c.sendBytes(data)
+					sentClients[c] = true
+				}
+			}
 		}
 	}
 }
