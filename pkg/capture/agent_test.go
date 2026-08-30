@@ -8,32 +8,45 @@ import (
 	"testing"
 	"time"
 
-	"poker-game-analyzer/pkg/profiler"
-	"poker-game-analyzer/pkg/server"
+	"poker-game-analyzer/pkg/advisor"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
 	"poker-game-analyzer/pkg/vision"
 )
 
-func setupTestServer(t *testing.T) (*server.Server, *storage.MemoryCache, *storage.SQLiteDB, *profiler.Profiler) {
-	t.Helper()
+type MockEventIngester struct {
+	cache       *storage.MemoryCache
+	events      []vision.VisionEvent
+	states      []*table.HandState
+	snapshotImg image.Image
+}
 
-	cache := storage.NewMemoryCache()
-	db, err := storage.NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatalf("failed to create in-memory sqlite db: %v", err)
+func (m *MockEventIngester) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorResponse, error) {
+	m.events = append(m.events, event)
+	if event.HandState != nil && m.cache != nil {
+		m.cache.SetTableState(event.TableID, event.HandState)
 	}
-	t.Cleanup(func() {
-		_ = db.Close()
-	})
+	return nil, nil
+}
 
-	prof := profiler.NewProfiler(cache, db, nil)
-	t.Cleanup(func() {
-		prof.Close()
-	})
+func (m *MockEventIngester) IngestLiveState(state *table.HandState) (*advisor.AdvisorResponse, error) {
+	m.states = append(m.states, state)
+	if state != nil && m.cache != nil {
+		m.cache.SetTableState(state.TableID, state)
+	}
+	return nil, nil
+}
 
-	srv := server.NewServer(cache, db, prof)
-	return srv, cache, db, prof
+func (m *MockEventIngester) SetSnapshot(img image.Image) {
+	m.snapshotImg = img
+}
+
+func setupTestIngester() (*MockEventIngester, *storage.MemoryCache) {
+	cache := storage.NewMemoryCache()
+	ingester := &MockEventIngester{
+		cache: cache,
+	}
+	return ingester, cache
 }
 
 // createSyntheticTableImage renders a 1000x800 synthetic poker table image with cards and pot.
@@ -67,14 +80,14 @@ func createSyntheticTableImage(heroCards [2]table.Card, board []table.Card, potV
 }
 
 func TestLiveAgent_NewAndDefaults(t *testing.T) {
-	srv, _, _, _ := setupTestServer(t)
+	ingester, _ := setupTestIngester()
 	grabber := NewMockGrabber(image.NewRGBA(image.Rect(0, 0, 800, 600)))
 
 	cfg := LiveAgentConfig{
 		WindowQuery: "CoinPoker",
 	}
 
-	agent := NewLiveAgent(grabber, srv, cfg)
+	agent := NewLiveAgent(grabber, ingester, cfg)
 	if agent == nil {
 		t.Fatal("expected non-nil LiveAgent")
 	}
@@ -105,10 +118,10 @@ func TestLiveAgent_NewAndDefaults(t *testing.T) {
 }
 
 func TestLiveAgent_SettersAndGetters(t *testing.T) {
-	srv, _, _, _ := setupTestServer(t)
+	ingester, _ := setupTestIngester()
 	grabber := NewMockGrabber(image.NewRGBA(image.Rect(0, 0, 800, 600)))
 
-	agent := NewLiveAgent(grabber, srv, LiveAgentConfig{
+	agent := NewLiveAgent(grabber, ingester, LiveAgentConfig{
 		FPS:         5,
 		TableID:     "custom-table",
 		HeroID:      "hero-custom",
@@ -158,7 +171,7 @@ func TestLiveAgent_SettersAndGetters(t *testing.T) {
 }
 
 func TestLiveAgent_Step_FrameIngestionAndDiffer(t *testing.T) {
-	srv, cache, _, _ := setupTestServer(t)
+	ingester, cache := setupTestIngester()
 	roiCfg := vision.DefaultCoinPoker6MaxROI()
 
 	c1 := table.Card{Rank: table.RankAce, Suit: table.Spades}
@@ -170,7 +183,7 @@ func TestLiveAgent_Step_FrameIngestionAndDiffer(t *testing.T) {
 	frameImg := createSyntheticTableImage([2]table.Card{c1, c2}, []table.Card{b1, b2, b3}, 50.0, roiCfg)
 	grabber := NewMockGrabber(frameImg)
 
-	agent := NewLiveAgent(grabber, srv, LiveAgentConfig{
+	agent := NewLiveAgent(grabber, ingester, LiveAgentConfig{
 		TableID:     "live-table-123",
 		HeroID:      "player-0",
 		ROIConfig:   roiCfg,
@@ -213,7 +226,7 @@ func TestLiveAgent_Step_FrameIngestionAndDiffer(t *testing.T) {
 }
 
 func TestLiveAgent_ContinuousLoop_StartStop(t *testing.T) {
-	srv, cache, _, _ := setupTestServer(t)
+	ingester, cache := setupTestIngester()
 	roiCfg := vision.DefaultCoinPoker6MaxROI()
 
 	c1 := table.Card{Rank: table.RankQueen, Suit: table.Spades}
@@ -222,7 +235,7 @@ func TestLiveAgent_ContinuousLoop_StartStop(t *testing.T) {
 
 	grabber := NewMockGrabber(frame1)
 
-	agent := NewLiveAgent(grabber, srv, LiveAgentConfig{
+	agent := NewLiveAgent(grabber, ingester, LiveAgentConfig{
 		FPS:         20, // Fast ticker for test
 		TableID:     "loop-table-999",
 		HeroID:      "player-0",
@@ -283,7 +296,7 @@ func TestLiveAgent_ContinuousLoop_StartStop(t *testing.T) {
 }
 
 func TestLiveAgent_HandLifecycleSequence(t *testing.T) {
-	srv, _, db, prof := setupTestServer(t)
+	ingester, cache := setupTestIngester()
 	roiCfg := vision.DefaultCoinPoker6MaxROI()
 
 	c1 := table.Card{Rank: table.RankAce, Suit: table.Spades}
@@ -296,7 +309,7 @@ func TestLiveAgent_HandLifecycleSequence(t *testing.T) {
 
 	grabber := NewMockGrabber(createSyntheticTableImage([2]table.Card{c1, c2}, []table.Card{}, 10.0, roiCfg))
 
-	agent := NewLiveAgent(grabber, srv, LiveAgentConfig{
+	agent := NewLiveAgent(grabber, ingester, LiveAgentConfig{
 		TableID:     "lifecycle-table",
 		HeroID:      "player-0",
 		ROIConfig:   roiCfg,
@@ -348,32 +361,31 @@ func TestLiveAgent_HandLifecycleSequence(t *testing.T) {
 		TableID:   "lifecycle-table",
 		HandState: &endState,
 	}
-	_, err := srv.ProcessEvent(endEv)
+	_, err := ingester.ProcessEvent(endEv)
 	if err != nil {
 		t.Fatalf("ProcessEvent HandEnd failed: %v", err)
 	}
 
-	saved, err := db.GetHandHistory(endState.HandID)
-	if err != nil || saved == nil {
-		t.Fatalf("expected hand history saved in DB for %s: %v", endState.HandID, err)
+	if len(ingester.events) == 0 {
+		t.Fatalf("expected events recorded in mock ingester")
 	}
-	if stats := prof.GetStats("player-0"); stats == nil || stats.HandsCount != 1 {
-		t.Errorf("expected profiler stats recorded for player-0: %+v", stats)
+	if cache.GetTableState("lifecycle-table") == nil {
+		t.Fatalf("expected state in cache")
 	}
 }
 
 func TestLiveAgent_ErrorHandling(t *testing.T) {
-	srv, _, _, _ := setupTestServer(t)
+	ingester, _ := setupTestIngester()
 
 	// 1. Nil grabber Step
-	agentNilGrabber := NewLiveAgent(nil, srv, LiveAgentConfig{})
+	agentNilGrabber := NewLiveAgent(nil, ingester, LiveAgentConfig{})
 	if err := agentNilGrabber.Step(context.Background()); err == nil {
 		t.Errorf("expected error on Step with nil grabber")
 	}
 
 	// 2. Mock grabber with nil frame
 	grabber := NewMockGrabber(nil)
-	agent := NewLiveAgent(grabber, srv, LiveAgentConfig{})
+	agent := NewLiveAgent(grabber, ingester, LiveAgentConfig{})
 	if err := agent.Step(context.Background()); err == nil {
 		t.Errorf("expected error on Step when grabber returns error / nil frame")
 	}

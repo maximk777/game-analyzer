@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"net/http"
 	"sync"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"poker-game-analyzer/pkg/advisor"
+	"poker-game-analyzer/pkg/capture"
 	"poker-game-analyzer/pkg/equity"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/storage"
@@ -53,17 +57,27 @@ type Server struct {
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
 	mu         sync.Mutex
+
+	roiConfig       vision.ROIConfig
+	roiMu           sync.RWMutex
+	snapshotData    []byte
+	snapshotType    string
+	snapshotMu      sync.RWMutex
+	windowsProvider func() ([]capture.WindowInfo, error)
+	windowsMu       sync.RWMutex
 }
 
 // NewServer initializes and configures a new Server instance.
 func NewServer(cache *storage.MemoryCache, db *storage.SQLiteDB, prof *profiler.Profiler) *Server {
 	hub := NewWSHub()
 	s := &Server{
-		cache: cache,
-		db:    db,
-		prof:  prof,
-		hub:   hub,
-		mux:   http.NewServeMux(),
+		cache:     cache,
+		db:        db,
+		prof:      prof,
+		hub:       hub,
+		mux:       http.NewServeMux(),
+		roiConfig: vision.DefaultCoinPoker6MaxROI(),
+		windowsProvider: capture.ListAllWindows,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -83,6 +97,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/tables/{id}/events", s.handleIngestEvent)
 	s.mux.HandleFunc("GET /api/v1/players/{id}/profile", s.handleGetPlayerProfile)
 	s.mux.HandleFunc("GET /ws/tables/{id}", s.handleWebSocket)
+
+	// Live capture, ROI calibration & Window discovery endpoints
+	s.mux.HandleFunc("GET /api/v1/snapshot", s.handleGetSnapshot)
+	s.mux.HandleFunc("GET /api/v1/roi", s.handleGetROI)
+	s.mux.HandleFunc("POST /api/v1/roi", s.handleSetROI)
+	s.mux.HandleFunc("GET /api/v1/windows", s.handleGetWindows)
 }
 
 // Router returns the configured http.Handler for the server.
@@ -413,4 +433,128 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	go client.writePump()
 	go client.readPump()
+}
+
+// SetSnapshot encodes the provided image to JPEG format and updates the server's live snapshot frame.
+func (s *Server) SetSnapshot(img image.Image) {
+	if img == nil {
+		s.snapshotMu.Lock()
+		s.snapshotData = nil
+		s.snapshotType = ""
+		s.snapshotMu.Unlock()
+		return
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
+		return
+	}
+
+	s.snapshotMu.Lock()
+	s.snapshotData = buf.Bytes()
+	s.snapshotType = "image/jpeg"
+	s.snapshotMu.Unlock()
+}
+
+// SetSnapshotBytes sets the raw snapshot image payload and content type.
+func (s *Server) SetSnapshotBytes(data []byte, contentType string) {
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	s.snapshotData = data
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	s.snapshotType = contentType
+}
+
+// GetSnapshot retrieves a copy of the current snapshot bytes and its content type.
+func (s *Server) GetSnapshot() ([]byte, string) {
+	s.snapshotMu.RLock()
+	defer s.snapshotMu.RUnlock()
+	if len(s.snapshotData) == 0 {
+		return nil, ""
+	}
+	out := make([]byte, len(s.snapshotData))
+	copy(out, s.snapshotData)
+	return out, s.snapshotType
+}
+
+// SetROIConfig updates the active table Region of Interest layout.
+func (s *Server) SetROIConfig(cfg vision.ROIConfig) {
+	s.roiMu.Lock()
+	defer s.roiMu.Unlock()
+	s.roiConfig = cfg
+}
+
+// GetROIConfig returns the active table Region of Interest layout.
+func (s *Server) GetROIConfig() vision.ROIConfig {
+	s.roiMu.RLock()
+	defer s.roiMu.RUnlock()
+	return s.roiConfig
+}
+
+// SetWindowsProvider sets a custom window enumeration provider (useful for testing).
+func (s *Server) SetWindowsProvider(provider func() ([]capture.WindowInfo, error)) {
+	s.windowsMu.Lock()
+	defer s.windowsMu.Unlock()
+	s.windowsProvider = provider
+}
+
+// GetWindows discovers and returns on-screen windows.
+func (s *Server) GetWindows() ([]capture.WindowInfo, error) {
+	s.windowsMu.RLock()
+	provider := s.windowsProvider
+	s.windowsMu.RUnlock()
+
+	if provider != nil {
+		return provider()
+	}
+	return capture.ListAllWindows()
+}
+
+func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
+	data, contentType := s.GetSnapshot()
+	if len(data) == 0 {
+		http.Error(w, "no snapshot available", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleGetROI(w http.ResponseWriter, r *http.Request) {
+	cfg := s.GetROIConfig()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(cfg)
+}
+
+func (s *Server) handleSetROI(w http.ResponseWriter, r *http.Request) {
+	var cfg vision.ROIConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, "invalid roi json payload", http.StatusBadRequest)
+		return
+	}
+
+	s.SetROIConfig(cfg)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(cfg)
+}
+
+func (s *Server) handleGetWindows(w http.ResponseWriter, r *http.Request) {
+	windows, err := s.GetWindows()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to list windows: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if windows == nil {
+		windows = []capture.WindowInfo{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(windows)
 }

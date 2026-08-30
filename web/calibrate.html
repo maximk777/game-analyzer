@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poker RTA // ROI Calibrator & Visualizer</title>
+    <link rel="stylesheet" href="/calibrate.css">
+</head>
+<body class="cal-body">
+    <!-- Top Header Navigation -->
+    <header class="cal-header">
+        <div class="header-brand">
+            <span class="brand-logo">📐</span>
+            <div class="brand-text">
+                <h1>ROI Calibrator & Vision Visualizer</h1>
+                <span class="brand-sub">Region-of-Interest Tuning for CoinPoker & Custom Tables</span>
+            </div>
+        </div>
+
+        <!-- Window Picker & Live Stream Controls -->
+        <div class="header-actions">
+            <div class="window-picker-group">
+                <label for="windowSelect">Target Window:</label>
+                <select id="windowSelect">
+                    <option value="">Searching for windows...</option>
+                </select>
+                <button id="btnRefreshWindows" class="btn btn-sm btn-outline" title="Refresh Detected Windows">🔄</button>
+            </div>
+
+            <div class="stream-controls">
+                <button id="btnToggleLiveStream" class="btn btn-sm btn-primary">
+                    <span class="stream-dot dot-active"></span> Live Capture: <strong id="streamStatusText">ON</strong>
+                </button>
+                <button id="btnFetchSnapshot" class="btn btn-sm btn-outline" title="Capture Single Frame">📸 Capture</button>
+                <label class="btn btn-sm btn-outline file-upload-label" title="Upload Screenshot">
+                    📁 Upload <input type="file" id="fileUploadInput" accept="image/*" hidden>
+                </label>
+            </div>
+
+            <div class="server-sync-group">
+                <button id="btnLoadROI" class="btn btn-sm btn-secondary">Load Active</button>
+                <button id="btnSaveROI" class="btn btn-sm btn-success">💾 Save to Server</button>
+                <a href="/hud.html" target="_blank" class="btn btn-sm btn-outline">Launch HUD ↗</a>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Workspace Container: Left Canvas Area + Right Properties Inspector -->
+    <main class="cal-workspace">
+        
+        <!-- Left / Center: Interactive Calibration Canvas Area -->
+        <section class="canvas-panel">
+            <div class="canvas-toolbar">
+                <div class="toolbar-group">
+                    <span class="tool-label">View Filter:</span>
+                    <button class="filter-chip active" data-filter="all">All Regions</button>
+                    <button class="filter-chip" data-filter="hero">Hero Cards</button>
+                    <button class="filter-chip" data-filter="community">Board</button>
+                    <button class="filter-chip" data-filter="pot">Pot</button>
+                    <button class="filter-chip" data-filter="seats">Seats</button>
+                    <button class="filter-chip" data-filter="actions">Buttons</button>
+                </div>
+
+                <div class="toolbar-group">
+                    <span class="tool-label">Zoom:</span>
+                    <button id="btnZoomOut" class="btn-tool">-</button>
+                    <span id="zoomLevelDisplay" class="zoom-text">100%</span>
+                    <button id="btnZoomIn" class="btn-tool">+</button>
+                    <button id="btnZoomReset" class="btn-tool">Fit</button>
+                </div>
+            </div>
+
+            <!-- Viewport Container with Interactive Canvas Layers -->
+            <div class="canvas-viewport" id="canvasViewport">
+                <div class="canvas-stage" id="canvasStage">
+                    <canvas id="bgImageCanvas" class="stage-layer bg-layer"></canvas>
+                    <canvas id="roiOverlayCanvas" class="stage-layer overlay-layer"></canvas>
+                </div>
+
+                <!-- Empty State Placeholder when no frame is loaded -->
+                <div class="empty-canvas-state" id="emptyCanvasState">
+                    <div class="empty-icon">🎯</div>
+                    <h3>No Live Snapshot Available</h3>
+                    <p>Start the Live Capture Agent, select a poker window above, or upload a table screenshot to calibrate.</p>
+                    <button id="btnLoadSampleImage" class="btn btn-primary">Generate Synthetic Sample Table</button>
+                </div>
+            </div>
+
+            <!-- Canvas Footer Status Bar -->
+            <footer class="canvas-footer">
+                <div class="footer-item">
+                    <span class="f-label">Frame Resolution:</span>
+                    <span id="frameDimDisplay" class="f-val">-- x --</span>
+                </div>
+                <div class="footer-item">
+                    <span class="f-label">Cursor Relative:</span>
+                    <span id="cursorPosDisplay" class="f-val">X: 0.000, Y: 0.000</span>
+                </div>
+                <div class="footer-item">
+                    <span class="f-label">Selected Box:</span>
+                    <span id="selectedBoxName" class="f-val text-cyan">None (Click box to select & resize)</span>
+                </div>
+            </footer>
+        </section>
+
+        <!-- Right Side: Properties & Hierarchy Inspector -->
+        <aside class="inspector-panel">
+            <div class="inspector-card">
+                <div class="inspector-header">
+                    <h3>ROI Region Hierarchy</h3>
+                    <button id="btnResetDefaults" class="btn-link" title="Reset to CoinPoker 6-Max Defaults">Reset Defaults</button>
+                </div>
+                
+                <!-- Region Tree Selector -->
+                <div class="region-selector-box">
+                    <label for="regionSelect">Active Element:</label>
+                    <select id="regionSelect">
+                        <optgroup label="Hero & Board">
+                            <option value="hero_card_0">Hero Card 1 (Left)</option>
+                            <option value="hero_card_1">Hero Card 2 (Right)</option>
+                            <option value="comm_card_0">Community Card 1 (Flop 1)</option>
+                            <option value="comm_card_1">Community Card 2 (Flop 2)</option>
+                            <option value="comm_card_2">Community Card 3 (Flop 3)</option>
+                            <option value="comm_card_3">Community Card 4 (Turn)</option>
+                            <option value="comm_card_4">Community Card 5 (River)</option>
+                            <option value="pot">Total Pot Area</option>
+                            <option value="action_buttons">Action Buttons Area</option>
+                            <option value="timer_bar">Timer Bar</option>
+                        </optgroup>
+                        <optgroup label="Seat 0 (Hero / Bottom Center)">
+                            <option value="seat_0_avatar">Seat 0: Avatar</option>
+                            <option value="seat_0_nameplate">Seat 0: Nameplate</option>
+                            <option value="seat_0_stack">Seat 0: Stack</option>
+                            <option value="seat_0_bet">Seat 0: Bet</option>
+                            <option value="seat_0_card_0">Seat 0: Card 1</option>
+                            <option value="seat_0_card_1">Seat 0: Card 2</option>
+                            <option value="seat_0_active">Seat 0: Active Badge</option>
+                        </optgroup>
+                        <optgroup label="Seat 1 (Bottom Left)">
+                            <option value="seat_1_avatar">Seat 1: Avatar</option>
+                            <option value="seat_1_nameplate">Seat 1: Nameplate</option>
+                            <option value="seat_1_stack">Seat 1: Stack</option>
+                            <option value="seat_1_bet">Seat 1: Bet</option>
+                            <option value="seat_1_card_0">Seat 1: Card 1</option>
+                            <option value="seat_1_card_1">Seat 1: Card 2</option>
+                            <option value="seat_1_active">Seat 1: Active Badge</option>
+                        </optgroup>
+                        <optgroup label="Seat 2 (Top Left)">
+                            <option value="seat_2_avatar">Seat 2: Avatar</option>
+                            <option value="seat_2_nameplate">Seat 2: Nameplate</option>
+                            <option value="seat_2_stack">Seat 2: Stack</option>
+                            <option value="seat_2_bet">Seat 2: Bet</option>
+                            <option value="seat_2_card_0">Seat 2: Card 1</option>
+                            <option value="seat_2_card_1">Seat 2: Card 2</option>
+                            <option value="seat_2_active">Seat 2: Active Badge</option>
+                        </optgroup>
+                        <optgroup label="Seat 3 (Top Center)">
+                            <option value="seat_3_avatar">Seat 3: Avatar</option>
+                            <option value="seat_3_nameplate">Seat 3: Nameplate</option>
+                            <option value="seat_3_stack">Seat 3: Stack</option>
+                            <option value="seat_3_bet">Seat 3: Bet</option>
+                            <option value="seat_3_card_0">Seat 3: Card 1</option>
+                            <option value="seat_3_card_1">Seat 3: Card 2</option>
+                            <option value="seat_3_active">Seat 3: Active Badge</option>
+                        </optgroup>
+                        <optgroup label="Seat 4 (Top Right)">
+                            <option value="seat_4_avatar">Seat 4: Avatar</option>
+                            <option value="seat_4_nameplate">Seat 4: Nameplate</option>
+                            <option value="seat_4_stack">Seat 4: Stack</option>
+                            <option value="seat_4_bet">Seat 4: Bet</option>
+                            <option value="seat_4_card_0">Seat 4: Card 1</option>
+                            <option value="seat_4_card_1">Seat 4: Card 2</option>
+                            <option value="seat_4_active">Seat 4: Active Badge</option>
+                        </optgroup>
+                        <optgroup label="Seat 5 (Bottom Right)">
+                            <option value="seat_5_avatar">Seat 5: Avatar</option>
+                            <option value="seat_5_nameplate">Seat 5: Nameplate</option>
+                            <option value="seat_5_stack">Seat 5: Stack</option>
+                            <option value="seat_5_bet">Seat 5: Bet</option>
+                            <option value="seat_5_card_0">Seat 5: Card 1</option>
+                            <option value="seat_5_card_1">Seat 5: Card 2</option>
+                            <option value="seat_5_active">Seat 5: Active Badge</option>
+                        </optgroup>
+                    </select>
+                </div>
+
+                <!-- Precision Coordinate Editors -->
+                <div class="coord-editor-grid">
+                    <div class="coord-field">
+                        <label for="inputX">X (Relative):</label>
+                        <div class="input-spinner">
+                            <input type="number" id="inputX" min="0" max="1" step="0.005" value="0.440">
+                            <span class="unit">%</span>
+                        </div>
+                    </div>
+
+                    <div class="coord-field">
+                        <label for="inputY">Y (Relative):</label>
+                        <div class="input-spinner">
+                            <input type="number" id="inputY" min="0" max="1" step="0.005" value="0.740">
+                            <span class="unit">%</span>
+                        </div>
+                    </div>
+
+                    <div class="coord-field">
+                        <label for="inputWidth">Width:</label>
+                        <div class="input-spinner">
+                            <input type="number" id="inputWidth" min="0.005" max="1" step="0.005" value="0.055">
+                            <span class="unit">%</span>
+                        </div>
+                    </div>
+
+                    <div class="coord-field">
+                        <label for="inputHeight">Height:</label>
+                        <div class="input-spinner">
+                            <input type="number" id="inputHeight" min="0.005" max="1" step="0.005" value="0.110">
+                            <span class="unit">%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fine Nudge Buttons -->
+                <div class="nudge-toolbar">
+                    <span class="nudge-label">Nudge (0.002):</span>
+                    <div class="nudge-pad">
+                        <button class="btn-nudge" id="nudgeUp">▲</button>
+                        <div class="nudge-row">
+                            <button class="btn-nudge" id="nudgeLeft">◀</button>
+                            <button class="btn-nudge" id="nudgeRight">▶</button>
+                        </div>
+                        <button class="btn-nudge" id="nudgeDown">▼</button>
+                    </div>
+                </div>
+
+                <!-- JSON Import / Export -->
+                <div class="json-actions-section">
+                    <div class="section-subtitle">Configuration JSON</div>
+                    <div class="json-btn-row">
+                        <button id="btnCopyJSON" class="btn btn-xs btn-outline">📋 Copy JSON</button>
+                        <button id="btnPasteJSON" class="btn btn-xs btn-outline">📥 Paste JSON</button>
+                        <button id="btnDownloadJSON" class="btn btn-xs btn-outline">💾 Export File</button>
+                    </div>
+                    <textarea id="roiJsonTextarea" class="json-preview" placeholder="ROI JSON configuration..."></textarea>
+                </div>
+            </div>
+        </aside>
+    </main>
+
+    <!-- Toast Notification Banner -->
+    <div class="toast-banner" id="toastBanner">ROI Configuration saved to server!</div>
+
+    <script src="/calibrate.js"></script>
+</body>
+</html>

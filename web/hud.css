@@ -1,0 +1,788 @@
+/* ==========================================================================
+   POKER RTA HUD // Always-On-Top Floating Widget Stylesheet
+   Ultra-compact, high-contrast glassmorphic design for floating overlays (~320-360px)
+   ========================================================================== */
+
+:root {
+    --hud-bg: rgba(10, 14, 22, 0.94);
+    --hud-bg-elevated: rgba(18, 25, 38, 0.95);
+    --hud-bg-subtle: rgba(255, 255, 255, 0.04);
+    
+    --hud-border: rgba(255, 255, 255, 0.12);
+    --hud-border-glow: rgba(0, 242, 254, 0.35);
+
+    --text-main: #f8fafc;
+    --text-sub: #94a3b8;
+    --text-muted: #64748b;
+
+    /* 4-Color Vibrant Poker Deck */
+    --suit-spades: #e2e8f0;
+    --suit-hearts: #f43f5e;
+    --suit-diamonds: #38bdf8;
+    --suit-clubs: #10b981;
+
+    /* Action & Status Colors */
+    --color-cyan: #00f2fe;
+    --color-green: #10b981;
+    --color-red: #ef4444;
+    --color-amber: #f59e0b;
+    --color-purple: #a855f7;
+
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+    --radius-sm: 4px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+body.hud-body {
+    background-color: transparent;
+    font-family: var(--font-sans);
+    color: var(--text-main);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    padding: 8px;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+
+/* Custom Scrollbar for HUD */
+::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+}
+::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.2);
+}
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+}
+
+/* ==========================================================================
+   Main HUD Widget Container
+   ========================================================================== */
+.hud-widget {
+    width: 100%;
+    max-width: 340px;
+    background: var(--hud-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--hud-border);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.65), 0 0 1px rgba(255, 255, 255, 0.2);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.hud-widget.hero-active {
+    border-color: var(--color-cyan);
+    box-shadow: 0 0 24px rgba(0, 242, 254, 0.3), 0 8px 32px rgba(0, 0, 0, 0.75);
+}
+
+/* ==========================================================================
+   Header Bar
+   ========================================================================== */
+.hud-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: rgba(0, 0, 0, 0.4);
+    border-bottom: 1px solid var(--hud-border);
+    font-size: 11px;
+}
+
+.hud-status-group {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.dot-live {
+    background-color: var(--color-green);
+    box-shadow: 0 0 8px var(--color-green);
+}
+
+.dot-searching {
+    background-color: var(--color-amber);
+    box-shadow: 0 0 8px var(--color-amber);
+    animation: pulse-dot 1.5s infinite ease-in-out;
+}
+
+.dot-offline {
+    background-color: var(--color-red);
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+}
+
+.hud-status-text {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--text-sub);
+}
+
+.hud-header-center {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.hud-street-badge {
+    padding: 1px 5px;
+    border-radius: var(--radius-sm);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+.street-preflop { background: #1e293b; color: #94a3b8; }
+.street-flop { background: #0c4a6e; color: #38bdf8; }
+.street-turn { background: #4c1d95; color: #c084fc; }
+.street-river { background: #831843; color: #f472b6; }
+.street-showdown { background: #064e3b; color: #34d399; }
+
+.hud-pot-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--color-amber);
+}
+
+.hud-header-actions {
+    display: flex;
+    gap: 2px;
+}
+
+.hud-icon-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-sub);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 4px;
+    border-radius: var(--radius-sm);
+    transition: background 0.15s ease;
+}
+
+.hud-icon-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+}
+
+/* ==========================================================================
+   Cards & Hand Row
+   ========================================================================== */
+.hud-main {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.hud-cards-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: var(--hud-bg-subtle);
+    border-radius: var(--radius-md);
+    padding: 5px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.hud-hole-cards {
+    display: flex;
+    gap: 4px;
+}
+
+.hud-card {
+    width: 32px;
+    height: 44px;
+    background: #0f172a;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-sm);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+    position: relative;
+    transition: transform 0.15s ease;
+}
+
+.hud-card:hover {
+    transform: translateY(-2px);
+}
+
+.hud-card.card-empty {
+    border-style: dashed;
+    border-color: rgba(255, 255, 255, 0.1);
+    color: var(--text-muted);
+}
+
+.card-rank {
+    font-size: 15px;
+    line-height: 1;
+    font-family: var(--font-mono);
+}
+
+.card-suit {
+    font-size: 12px;
+    line-height: 1;
+    margin-top: 1px;
+}
+
+.suit-s { color: var(--suit-spades); }
+.suit-h { color: var(--suit-hearts); }
+.suit-d { color: var(--suit-diamonds); }
+.suit-c { color: var(--suit-clubs); }
+
+.hud-hand-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    overflow: hidden;
+}
+
+.hud-hand-rank {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--color-cyan);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 190px;
+}
+
+.hud-community-mini {
+    display: flex;
+    gap: 2px;
+    margin-top: 2px;
+}
+
+.mini-board-slot {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 3px;
+    background: rgba(0, 0, 0, 0.4);
+    border-radius: 2px;
+    min-width: 16px;
+    text-align: center;
+}
+
+.mini-board-slot.empty {
+    color: var(--text-muted);
+}
+
+/* ==========================================================================
+   Primary Action Highlight Banner
+   ========================================================================== */
+.hud-primary-action-section {
+    width: 100%;
+}
+
+.hud-action-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(135deg, rgba(6, 182, 212, 0.18) 0%, rgba(0, 242, 254, 0.08) 100%);
+    border: 1px solid rgba(0, 242, 254, 0.4);
+    border-radius: var(--radius-md);
+    padding: 7px 10px;
+    box-shadow: 0 0 16px rgba(0, 242, 254, 0.15);
+}
+
+.hud-action-badge {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.action-type {
+    font-size: 15px;
+    font-weight: 900;
+    letter-spacing: 0.8px;
+    color: var(--text-main);
+    text-transform: uppercase;
+}
+
+.action-amount {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--color-cyan);
+}
+
+.hud-ev-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    background: rgba(16, 185, 129, 0.2);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    color: var(--color-green);
+    border-radius: var(--radius-full);
+}
+
+/* Action Type Variations */
+.action-raise {
+    border-color: rgba(0, 242, 254, 0.6);
+    background: linear-gradient(135deg, rgba(0, 242, 254, 0.25) 0%, rgba(59, 130, 246, 0.15) 100%);
+}
+.action-raise .action-type { color: #67e8f9; }
+
+.action-call {
+    border-color: rgba(16, 185, 129, 0.6);
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.25) 0%, rgba(5, 150, 105, 0.15) 100%);
+}
+.action-call .action-type { color: #6ee7b7; }
+.action-call .action-amount { color: #6ee7b7; }
+
+.action-fold {
+    border-color: rgba(239, 68, 68, 0.4);
+    background: linear-gradient(135deg, rgba(239, 68, 68, 0.18) 0%, rgba(153, 27, 27, 0.1) 100%);
+}
+.action-fold .action-type { color: #fca5a5; }
+
+.action-allin {
+    border-color: rgba(168, 85, 247, 0.7);
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.3) 0%, rgba(126, 34, 206, 0.2) 100%);
+    animation: pulse-allin 1.2s infinite alternate;
+}
+.action-allin .action-type { color: #d8b4fe; }
+
+@keyframes pulse-allin {
+    0% { box-shadow: 0 0 10px rgba(168, 85, 247, 0.3); }
+    100% { box-shadow: 0 0 20px rgba(168, 85, 247, 0.7); }
+}
+
+/* ==========================================================================
+   Equity & Pot Odds Gauges
+   ========================================================================== */
+.hud-gauges-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: var(--radius-md);
+    padding: 6px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.hud-gauge {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.gauge-label-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+.g-name { color: var(--text-sub); }
+.text-cyan { color: var(--color-cyan); }
+.text-amber { color: var(--color-amber); }
+
+.gauge-bar-bg {
+    width: 100%;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.gauge-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.fill-equity {
+    background: linear-gradient(90deg, #0284c7 0%, #00f2fe 100%);
+    box-shadow: 0 0 8px rgba(0, 242, 254, 0.5);
+}
+
+.fill-pot-odds {
+    background: linear-gradient(90deg, #d97706 0%, #fbbf24 100%);
+}
+
+.hud-verdict-pill {
+    margin-top: 2px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9.5px;
+    font-weight: 600;
+    color: var(--text-sub);
+    padding-top: 2px;
+}
+
+.hud-verdict-pill.positive { color: #6ee7b7; }
+.hud-verdict-pill.negative { color: #fca5a5; }
+
+/* ==========================================================================
+   Sizing Matrix Grid
+   ========================================================================== */
+.hud-sizing-section {
+    width: 100%;
+}
+
+.hud-sizing-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+}
+
+.sizing-chip-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-sm);
+    color: var(--text-main);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 3px 2px;
+    transition: all 0.15s ease;
+}
+
+.sizing-chip-btn:hover {
+    background: rgba(0, 242, 254, 0.15);
+    border-color: var(--color-cyan);
+    transform: translateY(-1px);
+}
+
+.sizing-chip-btn.btn-allin {
+    border-color: rgba(168, 85, 247, 0.4);
+    background: rgba(168, 85, 247, 0.08);
+}
+.sizing-chip-btn.btn-allin:hover {
+    background: rgba(168, 85, 247, 0.25);
+    border-color: var(--color-purple);
+}
+
+.s-label {
+    font-size: 8.5px;
+    font-weight: 700;
+    color: var(--text-sub);
+    text-transform: uppercase;
+}
+
+.s-amt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 700;
+    color: var(--text-main);
+}
+
+/* ==========================================================================
+   Tactical Reasoning Summary
+   ========================================================================== */
+.hud-reasoning-section {
+    width: 100%;
+}
+
+.hud-reasoning-text {
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: var(--radius-sm);
+    padding: 5px 8px;
+    font-size: 10px;
+    line-height: 1.35;
+    color: var(--text-sub);
+    font-style: italic;
+    max-height: 48px;
+    overflow-y: auto;
+}
+
+/* ==========================================================================
+   Collapsible Opponents & History Drawer
+   ========================================================================== */
+.hud-collapsible-drawer {
+    background: var(--hud-bg-elevated);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: max-height 0.25s ease-in-out, opacity 0.2s ease;
+    max-height: 240px;
+    opacity: 1;
+}
+
+.hud-collapsible-drawer.collapsed {
+    max-height: 0;
+    opacity: 0;
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+
+.drawer-tabs {
+    display: flex;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(0, 0, 0, 0.3);
+}
+
+.drawer-tab {
+    flex: 1;
+    background: transparent;
+    border: none;
+    padding: 5px 0;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color 0.15s ease, border-bottom 0.15s ease;
+}
+
+.drawer-tab.active {
+    color: var(--color-cyan);
+    border-bottom: 2px solid var(--color-cyan);
+}
+
+.drawer-content {
+    padding: 6px;
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.drawer-pane {
+    display: none;
+}
+.drawer-pane.active {
+    display: block;
+}
+
+/* Opponent Item */
+.opp-card {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: var(--radius-sm);
+    padding: 4px 6px;
+    margin-bottom: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.opp-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.opp-name { color: var(--text-main); }
+.opp-badge-arch {
+    font-size: 8px;
+    padding: 1px 4px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    font-weight: 800;
+}
+
+.arch-tag { background: #0891b2; color: #fff; }
+.arch-lag { background: #ea580c; color: #fff; }
+.arch-nit { background: #475569; color: #cbd5e1; }
+.arch-fish { background: #059669; color: #fff; }
+.arch-station { background: #d97706; color: #fff; }
+
+.opp-stats-row {
+    display: flex;
+    gap: 6px;
+    font-size: 9px;
+    font-family: var(--font-mono);
+    color: var(--text-sub);
+}
+
+.opp-stats-row span strong {
+    color: var(--text-main);
+}
+
+.opp-exploit-text {
+    font-size: 8.5px;
+    color: var(--color-amber);
+    font-style: italic;
+}
+
+/* Action History Log Entry */
+.act-entry {
+    font-size: 9.5px;
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.act-player { font-weight: 700; color: var(--text-main); }
+.act-desc { color: var(--text-sub); font-family: var(--font-mono); }
+
+.empty-opponents, .empty-actions {
+    font-size: 9.5px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 12px 0;
+}
+
+/* ==========================================================================
+   Settings Modal & Simulation Drawer
+   ========================================================================== */
+.hud-settings-modal {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(10, 14, 22, 0.98);
+    backdrop-filter: blur(20px);
+    z-index: 100;
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    box-sizing: border-box;
+}
+
+.hud-settings-modal.hidden {
+    display: none;
+}
+
+.settings-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--hud-border);
+    padding-bottom: 6px;
+    margin-bottom: 8px;
+}
+
+.settings-modal-header h4 {
+    font-size: 11px;
+    color: var(--color-cyan);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.btn-close-modal {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 13px;
+}
+.btn-close-modal:hover { color: var(--text-main); }
+
+.settings-modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 10px;
+}
+
+.setting-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.setting-row label {
+    width: 80px;
+    color: var(--text-sub);
+}
+
+.setting-row input[type="text"] {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--hud-border);
+    border-radius: var(--radius-sm);
+    color: var(--text-main);
+    padding: 3px 6px;
+    font-size: 10px;
+    flex: 1;
+}
+
+.btn-sm {
+    background: var(--color-cyan);
+    color: #000;
+    border: none;
+    font-weight: 700;
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.sim-actions-title {
+    font-weight: 700;
+    color: var(--text-sub);
+    font-size: 9.5px;
+    margin-top: 4px;
+}
+
+.sim-btn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+}
+
+.sim-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--text-main);
+    padding: 4px 6px;
+    border-radius: var(--radius-sm);
+    font-size: 9.5px;
+    cursor: pointer;
+    text-align: left;
+}
+.sim-btn:hover {
+    background: rgba(0, 242, 254, 0.2);
+    border-color: var(--color-cyan);
+}
+
+.nav-links {
+    margin-top: 8px;
+    display: flex;
+    justify-content: space-between;
+}
+.nav-links a {
+    color: var(--color-cyan);
+    text-decoration: none;
+    font-size: 9.5px;
+    font-weight: 600;
+}
+.nav-links a:hover {
+    text-decoration: underline;
+}

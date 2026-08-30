@@ -8,10 +8,16 @@ import (
 	"sync"
 	"time"
 
-	"poker-game-analyzer/pkg/server"
+	"poker-game-analyzer/pkg/advisor"
 	"poker-game-analyzer/pkg/table"
 	"poker-game-analyzer/pkg/vision"
 )
+
+// EventIngester defines the interface for ingesting parsed vision events and table states.
+type EventIngester interface {
+	ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorResponse, error)
+	IngestLiveState(state *table.HandState) (*advisor.AdvisorResponse, error)
+}
 
 // LiveAgentConfig specifies configuration options for the real-time capture agent.
 type LiveAgentConfig struct {
@@ -25,7 +31,7 @@ type LiveAgentConfig struct {
 // LiveAgent orchestrates continuous screen capture, vision parsing, event diffing, and real-time ingestion.
 type LiveAgent struct {
 	grabber FrameGrabber
-	srv     *server.Server
+	srv     EventIngester
 	parser  *vision.FrameParser
 	differ  *vision.StateDiffer
 
@@ -41,7 +47,7 @@ type LiveAgent struct {
 }
 
 // NewLiveAgent creates and initializes a new LiveAgent with defaults.
-func NewLiveAgent(grabber FrameGrabber, srv *server.Server, cfg LiveAgentConfig) *LiveAgent {
+func NewLiveAgent(grabber FrameGrabber, srv EventIngester, cfg LiveAgentConfig) *LiveAgent {
 	if cfg.FPS <= 0 {
 		cfg.FPS = 3
 	}
@@ -202,6 +208,12 @@ func (a *LiveAgent) Step(ctx context.Context) error {
 	a.mu.Lock()
 	a.lastFrame = img
 	a.mu.Unlock()
+
+	if srv != nil {
+		if sr, ok := srv.(interface{ SetSnapshot(image.Image) }); ok {
+			sr.SetSnapshot(img)
+		}
+	}
 
 	state, err := parser.ParseFrame(img, roiCfg)
 	if err != nil {

@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"image"
+	"image/color"
+	"image/draw"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"poker-game-analyzer/pkg/capture"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
@@ -487,5 +492,235 @@ func TestMountStatic(t *testing.T) {
 
 	if wCSS.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for /style.css, got %d", wCSS.Code)
+	}
+
+	// Test Floating HUD Widget
+	reqHUD := httptest.NewRequest("GET", "/hud.html", nil)
+	wHUD := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wHUD, reqHUD)
+
+	if wHUD.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /hud.html, got %d", wHUD.Code)
+	}
+	if !bytes.Contains(wHUD.Body.Bytes(), []byte("hud-widget")) {
+		t.Errorf("expected hud.html to contain 'hud-widget'")
+	}
+
+	// Test ROI Calibration UI
+	reqCal := httptest.NewRequest("GET", "/calibrate.html", nil)
+	wCal := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wCal, reqCal)
+
+	if wCal.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /calibrate.html, got %d", wCal.Code)
+	}
+	if !bytes.Contains(wCal.Body.Bytes(), []byte("ROI Calibrator")) {
+		t.Errorf("expected calibrate.html to contain 'ROI Calibrator'")
+	}
+}
+
+func TestGetSnapshot_NotFound(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("GET", "/api/v1/snapshot", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found when no snapshot, got %d", w.Code)
+	}
+}
+
+func TestGetSnapshot_Found(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	// Create a synthetic test image
+	img := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 200, G: 50, B: 50, A: 255}}, image.Point{}, draw.Src)
+
+	srv.SetSnapshot(img)
+
+	req := httptest.NewRequest("GET", "/api/v1/snapshot", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "image/jpeg" {
+		t.Errorf("expected Content-Type 'image/jpeg', got %q", contentType)
+	}
+
+	body := w.Body.Bytes()
+	if len(body) < 4 {
+		t.Fatalf("expected non-empty JPEG body, got %d bytes", len(body))
+	}
+	// Verify JPEG magic bytes: 0xFF, 0xD8
+	if body[0] != 0xFF || body[1] != 0xD8 {
+		t.Errorf("expected JPEG magic bytes 0xFFD8, got 0x%X 0x%X", body[0], body[1])
+	}
+}
+
+func TestSetSnapshotBytesAndClear(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	customPayload := []byte("custom-image-payload")
+	srv.SetSnapshotBytes(customPayload, "image/jpeg")
+
+	req := httptest.NewRequest("GET", "/api/v1/snapshot", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w.Code)
+	}
+	if !bytes.Equal(w.Body.Bytes(), customPayload) {
+		t.Errorf("expected body %q, got %q", customPayload, w.Body.Bytes())
+	}
+
+	// Clearing snapshot
+	srv.SetSnapshot(nil)
+	req2 := httptest.NewRequest("GET", "/api/v1/snapshot", nil)
+	w2 := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusNotFound {
+		t.Errorf("expected 404 after clearing snapshot, got %d", w2.Code)
+	}
+}
+
+func TestGetAndSetROIConfig(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	// 1. GET initial default ROI
+	reqGet := httptest.NewRequest("GET", "/api/v1/roi", nil)
+	wGet := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wGet, reqGet)
+
+	if wGet.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET /api/v1/roi, got %d", wGet.Code)
+	}
+
+	var initialROI vision.ROIConfig
+	if err := json.Unmarshal(wGet.Body.Bytes(), &initialROI); err != nil {
+		t.Fatalf("failed to parse initial ROI JSON: %v", err)
+	}
+
+	if len(initialROI.Seats) != 6 || len(initialROI.CommunityCards) != 5 {
+		t.Errorf("unexpected default ROI structure: %+v", initialROI)
+	}
+
+	// 2. POST updated ROI
+	updatedROI := initialROI
+	updatedROI.Pot = vision.RectF{X: 0.45, Y: 0.35, Width: 0.20, Height: 0.08}
+	updatedROI.HeroCards[0].X = 0.41
+
+	postBody, err := json.Marshal(updatedROI)
+	if err != nil {
+		t.Fatalf("failed to marshal updated ROI: %v", err)
+	}
+
+	reqPost := httptest.NewRequest("POST", "/api/v1/roi", bytes.NewReader(postBody))
+	reqPost.Header.Set("Content-Type", "application/json")
+	wPost := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wPost, reqPost)
+
+	if wPost.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for POST /api/v1/roi, got %d: %s", wPost.Code, wPost.Body.String())
+	}
+
+	var postResp vision.ROIConfig
+	if err := json.Unmarshal(wPost.Body.Bytes(), &postResp); err != nil {
+		t.Fatalf("failed to decode POST response: %v", err)
+	}
+	if postResp.Pot.X != 0.45 || postResp.HeroCards[0].X != 0.41 {
+		t.Errorf("POST response did not match updated ROI: %+v", postResp)
+	}
+
+	// 3. GET verify persistence
+	reqGet2 := httptest.NewRequest("GET", "/api/v1/roi", nil)
+	wGet2 := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wGet2, reqGet2)
+
+	var savedROI vision.ROIConfig
+	_ = json.Unmarshal(wGet2.Body.Bytes(), &savedROI)
+	if savedROI.Pot.X != 0.45 || savedROI.HeroCards[0].X != 0.41 {
+		t.Errorf("saved ROI did not reflect POST changes: %+v", savedROI)
+	}
+}
+
+func TestSetROIConfig_InvalidJSON(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	req := httptest.NewRequest("POST", "/api/v1/roi", bytes.NewReader([]byte("{invalid-json-body")))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for invalid ROI JSON, got %d", w.Code)
+	}
+}
+
+func TestGetWindows_MockProvider(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	mockWindows := []capture.WindowInfo{
+		{
+			ID:         1001,
+			Title:      "CoinPoker - Table NLH 100",
+			OwnerName:  "CoinPoker",
+			Bounds:     image.Rect(100, 100, 900, 700),
+			IsOnScreen: true,
+		},
+		{
+			ID:         1002,
+			Title:      "Terminal",
+			OwnerName:  "iTerm2",
+			Bounds:     image.Rect(0, 0, 800, 600),
+			IsOnScreen: true,
+		},
+	}
+
+	srv.SetWindowsProvider(func() ([]capture.WindowInfo, error) {
+		return mockWindows, nil
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/windows", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for GET /api/v1/windows, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var wins []capture.WindowInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &wins); err != nil {
+		t.Fatalf("failed to decode windows response: %v", err)
+	}
+
+	if len(wins) != 2 {
+		t.Fatalf("expected 2 windows, got %d", len(wins))
+	}
+	if wins[0].ID != 1001 || wins[0].Title != "CoinPoker - Table NLH 100" {
+		t.Errorf("unexpected first window: %+v", wins[0])
+	}
+}
+
+func TestGetWindows_Error(t *testing.T) {
+	srv, _, _, _ := setupTestServer(t)
+
+	srv.SetWindowsProvider(func() ([]capture.WindowInfo, error) {
+		return nil, errors.New("simulated window server failure")
+	})
+
+	req := httptest.NewRequest("GET", "/api/v1/windows", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error when window provider fails, got %d", w.Code)
 	}
 }
