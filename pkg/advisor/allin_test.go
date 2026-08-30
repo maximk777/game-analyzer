@@ -154,3 +154,49 @@ func TestSmallBetInADeepPotIsNotDiscounted(t *testing.T) {
 		t.Errorf("top pair shoved 100 times the pot")
 	}
 }
+
+// Reported live: the board paired kings, a queen fell on the river, hero held
+// eights. Two pair, and the tool said raise -- with no sign that a full house
+// was even possible.
+//
+// The equity was not wrong; it was answering a different question. Against
+// everything, those eights are 75%. Against the strongest tenth of a range they
+// are 31%, because the hands that call a river bet on that board are exactly
+// the kings and queens that just filled up. Minimum defence frequency describes
+// a defender with a street left to play, draws to continue with and a bluff
+// available later. On the river that defender does not exist: what calls has
+// showdown value, and on a paired board showdown value is a full house.
+//
+// The same rule covers an all-in on any street, because both are the same fact:
+// there is nothing after this bet.
+func TestRiverTwoPairDoesNotBetIntoAPairedBoard(t *testing.T) {
+	for _, villains := range []int{1, 3} {
+		_, in := liveShoveSpot(t, "8h 8d", "Ks Kd 4c 7h Qs", 1000, 8000, villains)
+		advice := Calculate(in)
+
+		t.Logf("%d opponent(s): %s %.0f on %.3f equity", villains,
+			advice.PrimaryAction, advice.RecommendedAmount, advice.Equity)
+
+		switch advice.PrimaryAction {
+		case table.ActionBet, table.ActionRaise, table.ActionAllIn:
+			t.Errorf("%d opponent(s): bet two pair into a paired board on the river: %s %.0f",
+				villains, advice.PrimaryAction, advice.RecommendedAmount)
+		}
+	}
+}
+
+// And the counterpart, so the river rule is a narrowing rather than a ban on
+// betting rivers: a hand that beats a narrow range too must still bet one.
+// Measured, a set on this board is 0.975 against everything and 0.876 against
+// the strongest tenth -- the value is real, and it should be collected.
+func TestRiverSetStillBets(t *testing.T) {
+	_, in := liveShoveSpot(t, "5h 5c", "Ks Qd 5s 9h 3c", 1000, 8000, 1)
+	advice := Calculate(in)
+
+	t.Logf("%s %.0f on %.3f equity", advice.PrimaryAction, advice.RecommendedAmount, advice.Equity)
+	switch advice.PrimaryAction {
+	case table.ActionBet, table.ActionRaise, table.ActionAllIn:
+	default:
+		t.Errorf("a set stopped betting the river: %s", advice.PrimaryAction)
+	}
+}

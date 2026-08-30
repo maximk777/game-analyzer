@@ -50,10 +50,10 @@ type AdvisorResponse struct {
 }
 
 // committedCallNarrowing is how much narrower a calling range is against a bet
-// that risks the caller's whole stack than minimum defence frequency describes.
-// At full commitment three quarters of what MDF would defend with is gone, and
-// it scales down with the share of the stack at risk, so a small bet in a deep
-// pot is left alone.
+// with nothing after it -- an all-in, or any bet on the river -- than minimum
+// defence frequency describes. Three quarters of what MDF would defend with is
+// gone, scaled by how completely the bet ends the hand, so a small bet in a
+// deep pot with streets to come is left alone.
 //
 // Stated, not derived. It was set by measuring what the slice actually does to
 // a hand's equity, on the boards where the tool was shoving live:
@@ -462,9 +462,29 @@ func Calculate(in Inputs) AdvisorResponse {
 		// with that hand. The same rule already governs bettorRangeFraction on
 		// the call side, for the same reason.
 		callShare := 1 - f
-		if in.EquityVsTop != nil && effectiveStack > 0 {
-			commitment := math.Min(raiseTo/effectiveStack, 1)
-			callShare *= 1 - committedCallNarrowing*commitment
+		if in.EquityVsTop != nil {
+			// How completely this bet ends the hand. A bet that takes the
+			// caller's stack ends it, and so does any bet on the river --
+			// there are no cards to come either way. Both are the same fact,
+			// and it is the fact that makes MDF describe the wrong range: a
+			// caller with a street left continues with draws and with hands
+			// that can bluff later, and a caller with nothing left continues
+			// only with showdown value.
+			//
+			// Live report that added the river half: board paired kings, a
+			// queen on the river, hero holding eights. Two pair, and the tool
+			// bet the pot. Against everything it is 75%; against the strongest
+			// tenth it is 31%, because the hands that call a river bet on that
+			// board are the kings and queens that just made a full house.
+			// Nothing about that risk reached the decision.
+			finality := 0.0
+			if effectiveStack > 0 {
+				finality = math.Min(raiseTo/effectiveStack, 1)
+			}
+			if state.Street == table.StreetRiver || state.Street == table.StreetShowdown {
+				finality = 1
+			}
+			callShare *= 1 - committedCallNarrowing*finality
 		}
 		allFold = math.Pow(f, float64(opponents))
 
