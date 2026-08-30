@@ -30,6 +30,7 @@ struct ParsedTableState: Codable {
 func parseAmount(_ str: String) -> Double {
     let clean = str.replacingOccurrences(of: "Pot", with: "")
                    .replacingOccurrences(of: "pot", with: "")
+                   .replacingOccurrences(of: "POT", with: "")
                    .replacingOccurrences(of: ":", with: "")
                    .replacingOccurrences(of: ",", with: "")
                    .replacingOccurrences(of: "$", with: "")
@@ -95,9 +96,12 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
         is_hero_turn: false
     )
 
-    var players: [ParsedSeat] = []
-    var detectedBoardCards: [(rank: String, x: CGFloat)] = []
-    var detectedHeroCards: [(rank: String, x: CGFloat)] = []
+    var nameItems: [(name: String, box: CGRect)] = []
+    var numberItems: [(val: Double, box: CGRect)] = []
+    var detectedBoardCards: [(rank: String, suit: String, x: CGFloat)] = []
+    var detectedHeroCards: [(rank: String, suit: String, x: CGFloat)] = []
+
+    let validRanks = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2"]
 
     for item in texts {
         let t = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -109,9 +113,12 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
             state.table_id = t
         }
 
-        // 2. Pot
+        // 2. Pot (Ignore strings without numbers)
         if lower.contains("pot") {
-            state.pot = parseAmount(t)
+            let pVal = parseAmount(t)
+            if pVal > 0 {
+                state.pot = pVal
+            }
         }
 
         // 3. Hero Turn Detection
@@ -129,50 +136,81 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
         }
 
         // 5. Board & Hero Cards by rank detection
-        let validRanks = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2"]
         let upper = t.uppercased()
-        if validRanks.contains(upper) && b.size.height < 0.06 {
-            // Community Cards band (center Y: 0.45..0.65 in Vision coords)
-            if b.origin.y > 0.45 && b.origin.y < 0.65 && b.origin.x > 0.25 && b.origin.x < 0.75 {
-                detectedBoardCards.append((rank: upper, x: b.origin.x))
+        if validRanks.contains(upper) && b.size.height < 0.08 {
+            // Sample suit color around card box in image
+            let suit = sampleSuitAt(cgImg: cgImg, box: b)
+            
+            // Community Cards band (Y: 0.45..0.65 in Vision coords)
+            if b.origin.y > 0.45 && b.origin.y < 0.68 && b.origin.x > 0.20 && b.origin.x < 0.80 {
+                detectedBoardCards.append((rank: upper, suit: suit, x: b.origin.x))
             }
-            // Hero Cards band (bottom Y: 0.15..0.35)
+            // Hero Cards band (Y: 0.15..0.35 in Vision coords)
             if b.origin.y > 0.15 && b.origin.y < 0.35 && b.origin.x > 0.30 && b.origin.x < 0.60 {
-                detectedHeroCards.append((rank: upper, x: b.origin.x))
+                detectedHeroCards.append((rank: upper, suit: suit, x: b.origin.x))
             }
         }
 
-        // 6. Seats & Players
-        let isNumber = Double(t.replacingOccurrences(of: ",", with: "").replacingOccurrences(of: "$", with: "")) != nil
-        if !isNumber && t.count >= 4 && !lower.contains("pot") && !lower.contains("fold") && !lower.contains("check") && !lower.contains("call") && !lower.contains("bet") && !lower.contains("raise") && !lower.contains("empty") && !lower.contains("coin") && !lower.contains("nlh") && !lower.contains("plo") && !lower.contains("wait") && !lower.contains("find") {
-            let seatIndex = players.count
-            players.append(ParsedSeat(
-                seat_number: seatIndex,
-                player_id: t,
-                player_name: t,
-                stack: 0,
-                current_bet: 0,
-                is_active: true,
-                is_folded: false
-            ))
+        // 6. Separate player names vs player stack numbers
+        let numVal = parseAmount(t)
+        let isPureNumber = numVal > 0 && !lower.contains("pot") && !lower.contains("nlh") && !lower.contains("plo")
+        if isPureNumber && b.size.height < 0.06 {
+            numberItems.append((val: numVal, box: b))
+        } else if t.count >= 4 && !lower.contains("pot") && !lower.contains("fold") && !lower.contains("check") && !lower.contains("call") && !lower.contains("bet") && !lower.contains("raise") && !lower.contains("empty") && !lower.contains("coin") && !lower.contains("nlh") && !lower.contains("plo") && !lower.contains("wait") && !lower.contains("find") && !lower.contains("pair") && !lower.contains("flush") && !lower.contains("straight") {
+            nameItems.append((name: t, box: b))
         }
     }
 
-    // Sort detected board cards left-to-right by X
-    detectedBoardCards.sort { $0.x < $1.x }
-    var boardCardStrings: [String] = []
-    for c in detectedBoardCards {
-        boardCardStrings.append("\(c.rank)s")
+    // Pair player name with the stack number directly below it
+    var players: [ParsedSeat] = []
+    for (idx, nameItem) in nameItems.enumerated() {
+        var stackVal: Double = 0.0
+        // Find closest number below nameplate (deltaX < 0.06, Y below name)
+        var closestDist: CGFloat = 1000.0
+        for numItem in numberItems {
+            let dx = abs(numItem.box.origin.x - nameItem.box.origin.x)
+            let dy = nameItem.box.origin.y - numItem.box.origin.y // in Vision coords, lower on screen has smaller Y
+            if dx < 0.08 && dy >= 0 && dy < 0.08 {
+                let dist = dx + dy
+                if dist < closestDist {
+                    closestDist = dist
+                    stackVal = numItem.val
+                }
+            }
+        }
+
+        players.append(ParsedSeat(
+            seat_number: idx,
+            player_id: nameItem.name,
+            player_name: nameItem.name,
+            stack: stackVal,
+            current_bet: 0,
+            is_active: true,
+            is_folded: false
+        ))
     }
-    state.community_cards = boardCardStrings
+
+    // Sort detected board cards left-to-right by X and deduplicate
+    detectedBoardCards.sort { $0.x < $1.x }
+    var uniqueBoard: [String] = []
+    for c in detectedBoardCards {
+        let cardStr = "\(c.rank)\(c.suit)"
+        if uniqueBoard.count < 5 && !uniqueBoard.contains(cardStr) {
+            uniqueBoard.append(cardStr)
+        }
+    }
+    state.community_cards = uniqueBoard
 
     // Sort detected hero cards left-to-right
     detectedHeroCards.sort { $0.x < $1.x }
-    var heroCardStrings: [String] = []
+    var uniqueHero: [String] = []
     for c in detectedHeroCards {
-        heroCardStrings.append("\(c.rank)h")
+        let cardStr = "\(c.rank)\(c.suit)"
+        if uniqueHero.count < 2 && !uniqueHero.contains(cardStr) {
+            uniqueHero.append(cardStr)
+        }
     }
-    state.hero_cards = heroCardStrings
+    state.hero_cards = uniqueHero
 
     // Determine street
     switch state.community_cards.count {
@@ -190,6 +228,66 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
 
     state.seats = players
     return state
+}
+
+// Sample color in card area to distinguish Red (h/d) vs Black (s/c) suits
+func sampleSuitAt(cgImg: CGImage, box: CGRect) -> String {
+    let imgW = CGFloat(cgImg.width)
+    let imgH = CGFloat(cgImg.height)
+    
+    // Vision box is normalized [0..1] with bottom-left origin
+    let pixelX = Int(box.origin.x * imgW)
+    let pixelY = Int((1.0 - box.origin.y - box.size.height) * imgH)
+    let pixelW = max(Int(box.size.width * imgW), 10)
+    let pixelH = max(Int(box.size.height * imgH * 2.0), 10) // sample rank + suit below it
+
+    guard let dataProvider = cgImg.dataProvider,
+          let data = dataProvider.data,
+          let ptr = CFDataGetBytePtr(data) else {
+        return "s"
+    }
+
+    let bpr = cgImg.bytesPerRow
+    let bpp = cgImg.bitsPerPixel / 8
+
+    var redPixels = 0
+    var bluePixels = 0
+    var greenPixels = 0
+    var blackPixels = 0
+
+    for dy in 0..<min(pixelH, cgImg.height - pixelY) {
+        for dx in 0..<min(pixelW, cgImg.width - pixelX) {
+            let offset = (pixelY + dy) * bpr + (pixelX + dx) * bpp
+            let r = Double(ptr[offset])
+            let g = Double(ptr[offset + 1])
+            let b = Double(ptr[offset + 2])
+
+            // Ignore white card background & green felt
+            if r > 200 && g > 200 && b > 200 { continue }
+            if g > r + 40 && g > b + 40 { continue }
+
+            if r > 160 && r > g + 40 && r > b + 40 {
+                redPixels += 1
+            } else if b > 160 && b > r + 40 && b > g + 40 {
+                bluePixels += 1
+            } else if g > 160 && g > r + 40 && g > b + 40 {
+                greenPixels += 1
+            } else if r < 60 && g < 60 && b < 60 {
+                blackPixels += 1
+            }
+        }
+    }
+
+    if bluePixels > redPixels && bluePixels > blackPixels {
+        return "d" // 4-color blue diamonds
+    }
+    if greenPixels > redPixels && greenPixels > blackPixels {
+        return "c" // 4-color green clubs
+    }
+    if redPixels > blackPixels {
+        return "h" // Red hearts / diamonds
+    }
+    return "s" // Black spades / clubs
 }
 
 @main
@@ -237,13 +335,14 @@ struct MacVisionAgent {
                         req.httpBody = jsonData
 
                         _ = try? await URLSession.shared.data(for: req)
-                        print("[MAC-VISION] Live Update: Pot=\(parsed.pot), Street=\(parsed.street), Board=\(parsed.community_cards), Players=\(parsed.seats.map { $0.player_name }.joined(separator: ", "))")
+                        let playerSummary = parsed.seats.map { "\($0.player_name) (\(Int($0.stack)))" }.joined(separator: ", ")
+                        print("[MAC-VISION] Live Update: Pot=\(Int(parsed.pot)), Street=\(parsed.street), Board=\(parsed.community_cards), Players=[\(playerSummary)]")
                     }
                 } else {
                     print("[MAC-VISION] Waiting for CoinPoker table window...")
                 }
             } catch {
-                // Ignore brief audio/video stream hiccups
+                // Ignore transient stream errors
             }
 
             try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
