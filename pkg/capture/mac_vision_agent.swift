@@ -52,18 +52,15 @@ func findTargetWindow() async -> SCWindow? {
         return nil
     }
 
-    let pokerWindows = content.windows.filter {
-        let owner = ($0.owningApplication?.applicationName ?? "").lowercased()
-        let title = ($0.title ?? "").lowercased()
-        let isLarge = $0.frame.width > 500 && $0.frame.height > 350
-        return isLarge && (owner.contains("coin") || title.contains("nlh") || title.contains("plo") || title.contains("table") || title.contains("1228"))
+    let coinWins = content.windows.filter {
+        let app = ($0.owningApplication?.applicationName ?? "").lowercased()
+        let isCoinPoker = app.contains("coin")
+        let isTableSize = $0.frame.width > 500 && $0.frame.height > 350
+        let ratio = $0.frame.width / max($0.frame.height, 1)
+        return isCoinPoker && isTableSize && ratio >= 1.15 && ratio <= 1.55
     }
 
-    // Prioritize table windows over lobby
-    return pokerWindows.first(where: {
-        let t = ($0.title ?? "").lowercased()
-        return t.contains("nlh") || t.contains("plo") || t.contains("table") || t.contains("1228")
-    }) ?? pokerWindows.first
+    return coinWins.first
 }
 
 func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
@@ -85,7 +82,7 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
 
     var state = ParsedTableState(
         hand_id: "live-hand",
-        table_id: title.isEmpty ? "coinpoker-live" : title,
+        table_id: "coinpoker-live",
         street: "preflop",
         pot: 0.0,
         current_bet: 0.0,
@@ -99,34 +96,55 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
     )
 
     var players: [ParsedSeat] = []
+    var detectedBoardCards: [(rank: String, x: CGFloat)] = []
+    var detectedHeroCards: [(rank: String, x: CGFloat)] = []
 
     for item in texts {
-        let t = item.text
+        let t = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let b = item.box
         let lower = t.lowercased()
 
-        // 1. Pot
+        // 1. Table Title
+        if lower.contains("nlh") || lower.contains("plo") {
+            state.table_id = t
+        }
+
+        // 2. Pot
         if lower.contains("pot") {
             state.pot = parseAmount(t)
         }
 
-        // 2. Hero Turn Detection
+        // 3. Hero Turn Detection
         if lower == "check" || lower == "fold" || lower.contains("call") || lower.contains("bet") || lower.contains("raise") || lower.contains("all-in") {
             if b.origin.y < 0.20 && b.origin.x > 0.45 {
                 state.is_hero_turn = true
             }
         }
 
-        // 3. Hero Made Hand
+        // 4. Hero Made Hand
         if lower.contains("pair") || lower.contains("high card") || lower.contains("straight") || lower.contains("flush") || lower.contains("full house") || lower.contains("three of a kind") {
             if b.origin.y < 0.15 && b.origin.x > 0.30 && b.origin.x < 0.70 {
                 state.hero_made_hand = t
             }
         }
 
-        // 4. Seats & Players
+        // 5. Board & Hero Cards by rank detection
+        let validRanks = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5", "4", "3", "2"]
+        let upper = t.uppercased()
+        if validRanks.contains(upper) && b.size.height < 0.06 {
+            // Community Cards band (center Y: 0.45..0.65 in Vision coords)
+            if b.origin.y > 0.45 && b.origin.y < 0.65 && b.origin.x > 0.25 && b.origin.x < 0.75 {
+                detectedBoardCards.append((rank: upper, x: b.origin.x))
+            }
+            // Hero Cards band (bottom Y: 0.15..0.35)
+            if b.origin.y > 0.15 && b.origin.y < 0.35 && b.origin.x > 0.30 && b.origin.x < 0.60 {
+                detectedHeroCards.append((rank: upper, x: b.origin.x))
+            }
+        }
+
+        // 6. Seats & Players
         let isNumber = Double(t.replacingOccurrences(of: ",", with: "").replacingOccurrences(of: "$", with: "")) != nil
-        if !isNumber && t.count >= 4 && !lower.contains("pot") && !lower.contains("fold") && !lower.contains("check") && !lower.contains("call") && !lower.contains("bet") && !lower.contains("raise") && !lower.contains("empty") && !lower.contains("coin") && !lower.contains("nlh") {
+        if !isNumber && t.count >= 4 && !lower.contains("pot") && !lower.contains("fold") && !lower.contains("check") && !lower.contains("call") && !lower.contains("bet") && !lower.contains("raise") && !lower.contains("empty") && !lower.contains("coin") && !lower.contains("nlh") && !lower.contains("plo") && !lower.contains("wait") && !lower.contains("find") {
             let seatIndex = players.count
             players.append(ParsedSeat(
                 seat_number: seatIndex,
@@ -140,6 +158,36 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
         }
     }
 
+    // Sort detected board cards left-to-right by X
+    detectedBoardCards.sort { $0.x < $1.x }
+    var boardCardStrings: [String] = []
+    for c in detectedBoardCards {
+        boardCardStrings.append("\(c.rank)s")
+    }
+    state.community_cards = boardCardStrings
+
+    // Sort detected hero cards left-to-right
+    detectedHeroCards.sort { $0.x < $1.x }
+    var heroCardStrings: [String] = []
+    for c in detectedHeroCards {
+        heroCardStrings.append("\(c.rank)h")
+    }
+    state.hero_cards = heroCardStrings
+
+    // Determine street
+    switch state.community_cards.count {
+    case 0:
+        state.street = "preflop"
+    case 3:
+        state.street = "flop"
+    case 4:
+        state.street = "turn"
+    case 5:
+        state.street = "river"
+    default:
+        state.street = state.community_cards.count > 0 ? "flop" : "preflop"
+    }
+
     state.seats = players
     return state
 }
@@ -148,9 +196,16 @@ func analyzeTable(cgImg: CGImage, title: String) -> ParsedTableState {
 struct MacVisionAgent {
     static func main() async {
         _ = NSApplication.shared
+        setbuf(stdout, nil)
         
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let logsDir = cwd.appendingPathComponent("bin/logs")
+        try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        let logFile = logsDir.appendingPathComponent("live_session.jsonl")
+
         let serverURL = URL(string: "http://127.0.0.1:8080/api/v1/tables/coinpoker-live/events")!
-        print("[MAC-VISION] ScreenCaptureKit Vision Agent initialized. Monitoring CoinPoker window...")
+        print("[MAC-VISION] ScreenCaptureKit Vision Agent active. Monitoring CoinPoker table...")
+        print("[MAC-VISION] Logging live session to: \(logFile.path)")
 
         while true {
             do {
@@ -164,22 +219,34 @@ struct MacVisionAgent {
                     let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
                     let parsed = analyzeTable(cgImg: img, title: win.title ?? "CoinPoker Table")
 
-                    // Post to Go Server
-                    var req = URLRequest(url: serverURL)
-                    req.httpMethod = "POST"
-                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    req.httpBody = try JSONEncoder().encode(parsed)
+                    if let jsonData = try? JSONEncoder().encode(parsed) {
+                        // Write to live log file
+                        if let handle = try? FileHandle(forWritingTo: logFile) {
+                            handle.seekToEndOfFile()
+                            handle.write(jsonData)
+                            handle.write("\n".data(using: .utf8)!)
+                            try? handle.close()
+                        } else {
+                            try? jsonData.write(to: logFile)
+                        }
 
-                    let (_, resp) = try await URLSession.shared.data(for: req)
-                    if let httpResp = resp as? HTTPURLResponse, httpResp.statusCode == 200 {
-                        // Success
+                        // Forward to Go Server
+                        var req = URLRequest(url: serverURL)
+                        req.httpMethod = "POST"
+                        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                        req.httpBody = jsonData
+
+                        _ = try? await URLSession.shared.data(for: req)
+                        print("[MAC-VISION] Live Update: Pot=\(parsed.pot), Street=\(parsed.street), Board=\(parsed.community_cards), Players=\(parsed.seats.map { $0.player_name }.joined(separator: ", "))")
                     }
+                } else {
+                    print("[MAC-VISION] Waiting for CoinPoker table window...")
                 }
             } catch {
-                // Sleep briefly on error
+                // Ignore brief audio/video stream hiccups
             }
 
-            try? await Task.sleep(nanoseconds: 333_000_000) // ~3 FPS
+            try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
         }
     }
 }

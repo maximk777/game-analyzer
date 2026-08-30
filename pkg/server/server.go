@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -332,30 +333,53 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var event vision.VisionEvent
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-		http.Error(w, "invalid event payload", http.StatusBadRequest)
-		return
-	}
-
-	if event.TableID == "" {
-		event.TableID = tableID
-	}
-
-	rec, err := s.ProcessEvent(event)
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return
 	}
 
-	resp := EventIngestResponse{
-		Status:         "ok",
-		Recommendation: rec,
-		Event:          &event,
+	var event vision.VisionEvent
+	if err := json.Unmarshal(bodyBytes, &event); err == nil && (event.Type != "" || event.HandState != nil) {
+		if event.TableID == "" {
+			event.TableID = tableID
+		}
+		rec, err := s.ProcessEvent(event)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		resp := EventIngestResponse{
+			Status:         "ok",
+			Recommendation: rec,
+			Event:          &event,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	// Try unmarshaling directly as HandState
+	var state table.HandState
+	if err := json.Unmarshal(bodyBytes, &state); err == nil {
+		if state.TableID == "" {
+			state.TableID = tableID
+		}
+		rec, err := s.IngestLiveState(&state)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":         "ok",
+			"recommendation": rec,
+			"state":          state,
+		})
+		return
+	}
+
+	http.Error(w, "invalid event or hand state payload", http.StatusBadRequest)
 }
 
 func (s *Server) handleGetPlayerProfile(w http.ResponseWriter, r *http.Request) {
