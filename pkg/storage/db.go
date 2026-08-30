@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	stdpath "path/filepath"
 
 	_ "modernc.org/sqlite"
 
@@ -41,6 +43,15 @@ type SQLiteDB struct {
 
 // NewSQLiteDB creates a new SQLiteDB instance and runs schema migrations.
 func NewSQLiteDB(filepath string) (*SQLiteDB, error) {
+	if filepath != ":memory:" {
+		dir := stdpath.Dir(filepath)
+		if dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create db directory %q: %w", dir, err)
+			}
+		}
+	}
+
 	db, err := sql.Open("sqlite", filepath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)

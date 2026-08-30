@@ -20,7 +20,7 @@ import (
 func main() {
 	var (
 		portFlag        = flag.Int("port", 8080, "HTTP and WebSocket server port")
-		dbPathFlag      = flag.String("db", "./poker_analyzer.db", "SQLite database file path")
+		dbPathFlag      = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
 		openAIKeyFlag   = flag.String("openai-key", "", "OpenAI API key (falls back to OPENAI_API_KEY env)")
 		openAIModelFlag = flag.String("openai-model", "gpt-4o-mini", "OpenAI model name")
 		mockLLMFlag     = flag.Bool("mock-llm", false, "Use mock deterministic LLM profiler")

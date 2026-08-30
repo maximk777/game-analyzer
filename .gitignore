@@ -1,0 +1,18 @@
+# Binaries and build artifacts
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS artifacts
+.DS_Store
+
+# Superpowers scratch
+.superpowers/sdd/
