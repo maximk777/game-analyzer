@@ -178,14 +178,16 @@ func (app *AgentApp) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start live agent: %w", err)
 	}
 
+	hudURL := fmt.Sprintf("http://localhost:%d/hud.html", app.cfg.Port)
 	if app.cfg.OpenHUD {
-		hudURL := fmt.Sprintf("http://localhost:%d/hud.html", app.cfg.Port)
 		go func() {
 			time.Sleep(150 * time.Millisecond)
-			if err := LaunchBrowserHUD(hudURL); err != nil {
-				log.Printf("[AGENT] Warning: failed to launch browser HUD: %v", err)
+			if err := LaunchHUD(hudURL); err != nil {
+				log.Printf("[AGENT] HUD not started: %v", err)
 			}
 		}()
+	} else {
+		log.Printf("[AGENT] HUD not started. Run `make ui` for the floating panel, or open %s", hudURL)
 	}
 
 	// On macOS, launch ScreenCaptureKit Vision Helper if available
@@ -313,74 +315,52 @@ func swiftSourcesNewerThan(builtAt time.Time) []string {
 	return stale
 }
 
-// LaunchBrowserHUD opens the floating HUD window in browser compact app mode or default browser.
-// hudWindowSize is the compact footprint the HUD is designed for: wide enough
-// for the recommendation line and the sizing matrix, tall enough for the seated
-// players, and no larger.
-const hudWindowSize = "400,780"
-
-// hudChromeArgs builds the flags that actually produce a small window.
+// LaunchHUD opens the HUD as a native floating panel, and only as that.
 //
-// --window-size alone is not enough: Chrome remembers the last bounds per app
-// per profile, so once the window has been resized (or opened before this size
-// was set) it reopens at the old size and the flag is ignored. Pointing the HUD
-// at its own profile directory gives it bounds nothing else shares, so the
-// requested size applies and stays applied.
-func hudChromeArgs(hudURL string) []string {
-	profile := filepath.Join(os.TempDir(), "poker-rta-hud-profile")
-	return []string{
-		fmt.Sprintf("--app=%s", hudURL),
-		fmt.Sprintf("--window-size=%s", hudWindowSize),
-		"--window-position=40,40",
-		fmt.Sprintf("--user-data-dir=%s", profile),
-		"--no-first-run",
-		"--no-default-browser-check",
+// It used to fall back through Chrome, Chromium and finally the default
+// browser. A browser window cannot be kept above another application's window,
+// so the advice went behind the client at exactly the moment it was being
+// acted on -- and a build that opened a browser tab on its own was noise on
+// top of that. The panel floats, takes no focus when clicked, and follows the
+// table; nothing else is worth opening.
+//
+// Not finding the panel is not an error. The server is useful on its own, and
+// the interface is a separate thing to start -- see `make ui`.
+func LaunchHUD(hudURL string) error {
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("the HUD panel is macOS only; open %s in a browser", hudURL)
 	}
+
+	for _, panel := range hudPanelCandidates() {
+		if _, err := os.Stat(panel); err != nil {
+			continue
+		}
+		cmd := exec.Command(panel, "--url", hudURL)
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("starting %s: %w", panel, err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("bin/hud_panel not built -- run `make` and then `make ui`")
 }
 
-func LaunchBrowserHUD(hudURL string) error {
-	// 1. On macOS, try Google Chrome in compact app mode
-	if runtime.GOOS == "darwin" {
-		chromeMac := "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-		if _, err := os.Stat(chromeMac); err == nil {
-			cmd := exec.Command(chromeMac, hudChromeArgs(hudURL)...)
-			if err := cmd.Start(); err == nil {
-				return nil
-			}
-		}
+// hudPanelCandidates looks beside the running binary first, so an installed
+// copy finds its own panel rather than one left in a working directory.
+func hudPanelCandidates() []string {
+	out := []string{filepath.Join("bin", "hud_panel")}
+	if exe, err := os.Executable(); err == nil {
+		out = append([]string{filepath.Join(filepath.Dir(exe), "hud_panel")}, out...)
 	}
-
-	// 2. Try Chrome on PATH (e.g. google-chrome, chromium, chrome)
-	for _, name := range []string{"google-chrome", "chromium", "google-chrome-stable", "chrome"} {
-		if path, err := exec.LookPath(name); err == nil {
-			cmd := exec.Command(path, hudChromeArgs(hudURL)...)
-			if err := cmd.Start(); err == nil {
-				return nil
-			}
-		}
-	}
-
-	// 3. Fallback to OS default browser opener
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", hudURL)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", hudURL)
-	default: // linux, freebsd, etc.
-		cmd = exec.Command("xdg-open", hudURL)
-	}
-
-	return cmd.Start()
+	return out
 }
-
 func main() {
 	var (
 		windowFlag      = flag.String("window", "CoinPoker", "Target poker window query")
 		portFlag        = flag.Int("port", 8080, "Server HTTP/WebSocket port")
 		fpsFlag         = flag.Int("fps", 3, "Frame grabber capture rate")
 		dbPathFlag      = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
-		openHUDFlag     = flag.Bool("open-hud", false, "Automatically open Always-On-Top floating HUD window in browser app mode")
+		openHUDFlag     = flag.Bool("open-hud", false, "Open the native floating HUD panel with the server (see `make ui` to run it separately)")
 		tableIDFlag     = flag.String("table-id", "coinpoker-live", "Active table ID")
 		heroIDFlag      = flag.String("hero-id", "Hero", "Active hero player ID")
 		mockLLMFlag     = flag.Bool("mock-llm", false, "Use offline deterministic mock profiler")

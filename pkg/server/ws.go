@@ -26,6 +26,14 @@ type WSMessage struct {
 	TableID   string        `json:"table_id,omitempty"`
 	Payload   any           `json:"payload,omitempty"`
 	Timestamp int64         `json:"timestamp"`
+	// Reason says why a recommendation is absent, when it is.
+	//
+	// The interface had one message for every case and it was the wrong one
+	// more often than not: at a showdown, with hero's cards plainly on screen
+	// and shown in its own panel, it read "no hero cards". Saying "no advice"
+	// without saying why reads as a fault in the tool, and a player cannot tell
+	// a fault from a hand that is simply over.
+	Reason string `json:"reason,omitempty"`
 }
 
 const (

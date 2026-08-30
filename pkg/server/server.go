@@ -230,6 +230,7 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	// 3. Real-time Equity and Advisor Recommendation calculation
 	var rec *advisor.AdvisorResponse
 	var auditReads map[string]map[string]float64
+	noAdvice := ""
 	if event.HandState != nil && !isHandEnd {
 		h := event.HandState
 		hasHeroCards := h.HeroCards[0].Rank > 0 && h.HeroCards[1].Rank > 0
@@ -246,7 +247,24 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 			}
 		}
 
-		if hasHeroCards && !heroFolded {
+		// Advice only where there is a decision to make.
+		//
+		// Hero's own seat is not always among the ones read -- live, a frame
+		// listed two players of six -- so "has hero folded" cannot be answered
+		// from the seats alone, and the tool went on recommending a bet on a
+		// hand whose nameplate said FOLD. Whether the client is waiting on hero
+		// is a separate signal, it was being reported all along, and nothing
+		// read it.
+		switch {
+		case !hasHeroCards:
+			noAdvice = "Карты героя не прочитаны"
+		case heroFolded:
+			noAdvice = "Вы сбросили — решать нечего"
+		case !h.HeroCanAct():
+			noAdvice = "Не ваш ход"
+		}
+
+		if hasHeroCards && !heroFolded && h.HeroCanAct() {
 			var oppTendencies map[string]float64
 			seatReads := make(map[string]map[string]float64)
 
@@ -323,11 +341,31 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 				return v
 			}
 
+			// What one opponent's range already beats hero with, counted
+			// exactly rather than sampled. Equity says how often hero wins;
+			// this says what the losses are made of, and on a paired board
+			// those are not the same question.
+			var risk *equity.RiskProfile
+			if len(h.CommunityCards) >= 3 {
+				ranges := rangesAt(1.0)
+				widest := 0
+				for i := range ranges {
+					if len(ranges[i].Combos) > len(ranges[widest].Combos) {
+						widest = i
+					}
+				}
+				if len(ranges) > 0 {
+					r := equity.Risk(h.HeroCards, h.CommunityCards, ranges[widest])
+					risk = &r
+				}
+			}
+
 			advice := advisor.Calculate(advisor.Inputs{
 				State:         *h,
 				Equity:        eqResult,
 				OppTendencies: oppTendencies,
 				EquityVsTop:   equityVsTop,
+				Risk:          risk,
 			})
 			rec = &advice
 			auditReads = seatReads
@@ -363,11 +401,15 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	// advice has expired -- live, that showed a confident CHECK, computed for a
 	// pot of 4,280, while the table sat at 61,680 and hero was facing a raise.
 	// A null payload is the signal that there is currently no advice.
+	if isHandEnd && rec == nil && noAdvice == "" {
+		noAdvice = "Раздача закончена"
+	}
 	s.hub.BroadcastToTable(tableID, WSMessage{
 		Type:      WSMsgRecommendation,
 		TableID:   tableID,
 		Payload:   rec,
 		Timestamp: now,
+		Reason:    noAdvice,
 	})
 
 	return rec, nil

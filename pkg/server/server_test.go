@@ -162,13 +162,17 @@ func TestIngestEvent_HeroTurnAndRecommendation(t *testing.T) {
 	b3, _ := table.ParseCard("2c")
 
 	handState := &table.HandState{
-		HandID:         "hand-555",
-		TableID:        "table-555",
-		Street:         table.StreetFlop,
-		Pot:            100.0,
-		CurrentBet:     20.0,
-		MinRaise:       40.0,
-		HeroID:         "hero-p1",
+		HandID:     "hand-555",
+		TableID:    "table-555",
+		Street:     table.StreetFlop,
+		Pot:        100.0,
+		CurrentBet: 20.0,
+		MinRaise:   40.0,
+		HeroID:     "hero-p1",
+		// The client is waiting on hero: without that there is no decision
+		// to advise about, and the tool used to advise on hands hero had
+		// already folded.
+		IsHeroTurn:     true,
 		HeroCards:      [2]table.Card{c1, c2},
 		CommunityCards: []table.Card{b1, b2, b3},
 		Seats: []table.SeatState{

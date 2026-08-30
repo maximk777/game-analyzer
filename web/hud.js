@@ -32,6 +32,14 @@
         hudActionAmount: document.getElementById("hudActionAmount"),
         hudEdgeCallout: document.getElementById("hudEdgeCallout"),
         hudEdgeText: document.getElementById("hudEdgeText"),
+        hudRiskCard: document.getElementById("hudRiskCard"),
+        hudRiskHeroHand: document.getElementById("hudRiskHeroHand"),
+        hudRiskBehind: document.getElementById("hudRiskBehind"),
+        hudRiskList: document.getElementById("hudRiskList"),
+        hudRiskCard: document.getElementById("hudRiskCard"),
+        hudRiskHeroHand: document.getElementById("hudRiskHeroHand"),
+        hudRiskBehind: document.getElementById("hudRiskBehind"),
+        hudRiskList: document.getElementById("hudRiskList"),
 
         hudEquityVal: document.getElementById("hudEquityVal"),
         hudEquityBar: document.getElementById("hudEquityBar"),
@@ -90,11 +98,36 @@
         return null;
     }
 
+    // Money, printed at whatever precision the amount actually has.
+    //
+    // This used to round to the nearest whole chip below a thousand, which is
+    // right for a table playing 1K/2K and wrong for every micro table: a pot of
+    // 0.02 printed as "$0". And not only the pot -- the same formatter prints
+    // the recommended amount, every bet size and every opponent stack, so on a
+    // 0.01/0.02 table the entire HUD read zero while the numbers behind it were
+    // correct all along.
     function formatChips(val) {
         if (typeof val !== "number" || isNaN(val) || val <= 0) return "$0";
         if (val >= 1000000) return `$${(val / 1000000).toFixed(2)}M`;
         if (val >= 1000) return `$${(val / 1000).toFixed(1)}k`;
-        return `$${Math.round(val)}`;
+        if (Number.isInteger(val)) return `$${val}`;
+
+        // Four places below a unit, two above it: enough for a 0.0025 ante and
+        // for a 12.75 stack, without printing noise on either.
+        let text = val.toFixed(val < 1 ? 4 : 2);
+        if (text.includes(".")) {
+            text = text.replace(/0+$/, "").replace(/\.$/, "");
+            // Money keeps two places once it has any, so a big blind reads
+            // "$0.10" rather than "$0.1"; a sub-cent ante keeps what it needs.
+            const dot = text.indexOf(".");
+            if (dot >= 0 && text.length - dot - 1 < 2) {
+                text = Number(text).toFixed(2);
+            }
+        }
+        // Smaller than the smallest place shown. Saying "$0" here would be the
+        // bug all over again, so say what it is instead.
+        if (text === "0" || text === "") return `$${val.toPrecision(2)}`;
+        return `$${text}`;
     }
 
     // Connect WebSocket to live stream
@@ -159,7 +192,7 @@
                 // A null payload means "no advice for this state". It must be
                 // rendered, not ignored: dropping it left the previous hand's
                 // recommendation on screen looking current.
-                renderAdvisorRecommendation(msg.payload || null);
+                renderAdvisorRecommendation(msg.payload || null, msg.reason || "");
                 break;
             case "event":
                 if (msg.payload && msg.payload.hand_state) {
@@ -240,7 +273,7 @@
         renderPlayers(handState.seats || []);
     }
 
-    function clearAdvisorRecommendation() {
+    function clearAdvisorRecommendation(reason) {
         elements.hudActionType.textContent = "—";
         elements.hudActionAmount.textContent = "";
         elements.hudRecCard.className = "hud-recommendation-card rec-idle";
@@ -249,16 +282,21 @@
         elements.hudEquityBar.style.width = "0%";
         elements.hudPotOddsVal.textContent = "—";
         elements.hudPotOddsBar.style.width = "0%";
-        elements.hudEdgeText.textContent = "Нет карт героя — совет не считается";
+        // Say which of the reasons it is. One message for every case was the
+        // wrong message more often than not: at a showdown, with hero's cards
+        // in the panel above, it read "no hero cards" -- which looks like the
+        // tool is broken rather than like a hand that is over.
+        elements.hudEdgeText.textContent = reason || "Совет не считается";
         elements.hudEdgeCallout.style.color = "var(--text-muted)";
-        elements.hudReasoningText.textContent =
-            "Ожидание раздачи с видимыми карманными картами.";
+        elements.hudReasoningText.textContent = reason
+            ? reason + "."
+            : "Ожидание раздачи с видимыми карманными картами.";
     }
 
-    function renderAdvisorRecommendation(rec) {
+    function renderAdvisorRecommendation(rec, reason) {
         state.currentAdvice = rec;
         if (!rec) {
-            clearAdvisorRecommendation();
+            clearAdvisorRecommendation(reason);
             return;
         }
 
@@ -286,6 +324,8 @@
         // EV Badge
         const evVal = rec.ev || (rec.actions && rec.actions[0] ? rec.actions[0].ev : 0.0);
         elements.hudEvBadge.textContent = `EV: ${evVal >= 0 ? "+" : ""}$${evVal.toFixed(2)}`;
+
+        renderRisk(rec.risk);
 
         // Equity & Pot Odds Gauges
         const eq = Math.round((rec.equity || 0) * 1000) / 10;
@@ -320,16 +360,90 @@
         }
     }
 
-    function updateSizingGrid(handState) {
-        const pot = handState.pot || 1000;
-        const curBet = handState.current_bet || 0;
-        const minRaise = handState.min_raise || curBet * 2 || 2000;
+    // What beats hero right now, and how much of an opponent's range holds it.
+    //
+    // The counts arrive exact -- every combination in the range is played
+    // against the board -- so this can name hands and numbers plainly. It
+    // exists because a single equity figure hides the shape of the losses:
+    // kings on 9-9-7-5-Q win 88 hands in 100 and are dead against the queens,
+    // and the percentage alone never says a full house is live.
+    const RISK_NAMES = {
+        "High Card": "старшая карта",
+        "One Pair": "пара",
+        "Two Pair": "две пары",
+        "Three of a Kind": "тройка",
+        "Straight": "стрит",
+        "Flush": "флеш",
+        "Full House": "фулл-хаус",
+        "Four of a Kind": "каре",
+        "Straight Flush": "стрит-флеш",
+    };
 
-        elements.sizeAmtMin.textContent = formatChips(minRaise);
-        elements.sizeAmt25x.textContent = formatChips(Math.max(curBet * 2.5, minRaise));
-        elements.sizeAmt33.textContent = formatChips(curBet + pot * 0.33);
-        elements.sizeAmt66.textContent = formatChips(curBet + pot * 0.66);
-        elements.sizeAmtPot.textContent = formatChips(curBet + pot);
+    function renderRisk(risk) {
+        const card = elements.hudRiskCard;
+        if (!card) return;
+
+        if (!risk || !risk.combos || !risk.beaten_by || risk.beaten_by.length === 0) {
+            card.hidden = true;
+            return;
+        }
+        card.hidden = false;
+
+        const behind = (risk.behind || 0) * 100;
+        elements.hudRiskHeroHand.textContent = RISK_NAMES[risk.hero_hand] || risk.hero_hand || "—";
+        elements.hudRiskBehind.textContent = `бьют ${behind.toFixed(0)} из 100`;
+        elements.hudRiskBehind.className = "risk-behind " +
+            (behind >= 20 ? "risk-high" : behind >= 8 ? "risk-mid" : "risk-low");
+
+        elements.hudRiskList.innerHTML = risk.beaten_by.slice(0, 4).map((c) => {
+            let name = RISK_NAMES[c.category] || c.category;
+            // The same hand you hold beats you by its kicker, and naming it
+            // plainly reads as though something rarer were needed.
+            if (c.category === risk.hero_hand) name += " со старшим киккером";
+            const pct = (c.share || 0) * 100;
+            // Under half a percent, a rounded figure would read as zero and
+            // look like a bug rather than a rarity.
+            const shown = pct < 0.5 ? "<1" : pct.toFixed(0);
+            return `<li><span class="risk-name">${name}</span>` +
+                `<span class="risk-share">${shown} из 100</span>` +
+                `<span class="risk-combos">${c.combos}</span></li>`;
+        }).join("");
+    }
+
+    // Hero's own stack, from the seats. Everything offered has to fit inside it.
+    function heroStack(handState) {
+        const heroID = handState.hero_id;
+        for (const s of handState.seats || []) {
+            if (s.player_id && s.player_id === heroID && s.stack > 0) return s.stack;
+        }
+        return 0;
+    }
+
+    function updateSizingGrid(handState) {
+        const pot = handState.pot || 0;
+        const curBet = handState.current_bet || 0;
+        const minRaise = handState.min_raise || curBet * 2 || 0;
+
+        // Nothing above the stack. This grid recomputes sizes from the pot,
+        // beside an advisor that caps every size it offers at the effective
+        // stack -- so the two disagreed, and the grid won because it is what a
+        // player reads. Live, with 71,040 behind, it offered 168.2k, 334.5k and
+        // 505.8k: three sizes that cannot be bet.
+        const stack = heroStack(handState);
+        const fits = (v) => (stack > 0 ? Math.min(v, stack) : v);
+
+        // With no pot read there is no scale, and a fabricated one is worse
+        // than a blank: these fell back to a pot of 1000 and a minimum raise of
+        // 2000, which are the chips at 1K/2K and a hundred thousand big blinds
+        // at 0.01/0.02. The grid showed confident sizes for a table it had not
+        // read. A dash says what is true.
+        const dash = "—";
+        elements.sizeAmtMin.textContent = minRaise > 0 ? formatChips(fits(minRaise)) : dash;
+        elements.sizeAmt25x.textContent = curBet > 0 || minRaise > 0
+            ? formatChips(fits(Math.max(curBet * 2.5, minRaise))) : dash;
+        elements.sizeAmt33.textContent = pot > 0 ? formatChips(fits(curBet + pot * 0.33)) : dash;
+        elements.sizeAmt66.textContent = pot > 0 ? formatChips(fits(curBet + pot * 0.66)) : dash;
+        elements.sizeAmtPot.textContent = pot > 0 ? formatChips(fits(curBet + pot)) : dash;
         elements.sizeAmtAllIn.textContent = "All-In";
     }
 

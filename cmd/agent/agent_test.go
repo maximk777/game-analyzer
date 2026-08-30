@@ -402,7 +402,21 @@ func TestAgent_StaticEndpoints(t *testing.T) {
 	respWin.Body.Close()
 }
 
-func TestLaunchBrowserHUD_Helper(t *testing.T) {
-	// Call helper with a dummy URL - should not panic
-	_ = LaunchBrowserHUD("http://127.0.0.1:65530/hud.html")
+// The HUD opens as a native panel or not at all -- never as a browser window,
+// which cannot be kept above the client and so is worse than nothing at the
+// moment the advice is read.
+//
+// Not finding the panel is a reported condition rather than a failure: the
+// server runs on its own and the interface is started separately.
+func TestLaunchHUD_ReportsRatherThanOpeningABrowser(t *testing.T) {
+	err := LaunchHUD("http://127.0.0.1:65530/hud.html")
+
+	if err == nil {
+		// The panel was built and started. Nothing else to assert -- the point
+		// is only that no browser was involved.
+		return
+	}
+	if !strings.Contains(err.Error(), "hud_panel") && !strings.Contains(err.Error(), "macOS only") {
+		t.Errorf("unexpected reason for not starting the HUD: %v", err)
+	}
 }
