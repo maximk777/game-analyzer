@@ -53,6 +53,8 @@ func NewSQLiteDB(filepath string) (*SQLiteDB, error) {
 	}
 	if filepath != ":memory:" {
 		pragmas = append(pragmas, "PRAGMA journal_mode = WAL;")
+	} else {
+		db.SetMaxOpenConns(1)
 	}
 
 	for _, p := range pragmas {
