@@ -2,6 +2,7 @@ package advisor
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"poker-game-analyzer/pkg/equity"
@@ -82,7 +83,15 @@ func liveShoveSpot(t *testing.T, hero, board string, pot, effStack float64, vill
 		return v
 	}
 
-	return state, Inputs{State: state, Equity: eq, EquityVsTop: equityVsTop}
+	// Exactly what the server supplies: an exact count of what one opponent's
+	// range already beats hero with.
+	var risk *equity.RiskProfile
+	if len(boardCards) >= 3 {
+		r := equity.Risk(heroCards, boardCards, rangesAt(1.0)[0])
+		risk = &r
+	}
+
+	return state, Inputs{State: state, Equity: eq, EquityVsTop: equityVsTop, Risk: risk}
 }
 
 // Queens on a board with two aces, shoved.
@@ -198,5 +207,58 @@ func TestRiverSetStillBets(t *testing.T) {
 	case table.ActionBet, table.ActionRaise, table.ActionAllIn:
 	default:
 		t.Errorf("a set stopped betting the river: %s", advice.PrimaryAction)
+	}
+}
+
+// The hand as it was reported: hero holds kings, the board is two nines, a
+// seven, a five and a queen on the river, and the opponent turns over queens
+// for a full house.
+//
+// The equity was not wrong and narrowing the calling range does not touch it --
+// measured, these kings are 0.878 against everything and 0.859 against the
+// strongest tenth, because two pair on this board really does beat almost
+// everything. Betting is right. What was missing is that a player looking at a
+// paired board wants to be told a full house is live, and a single percentage
+// never says so: 88% because the opponent usually has nothing and 88% because
+// the other 12% has you drawing dead read identically.
+//
+// So the advice stands and the account of it now carries the count.
+func TestKingsOnPairedBoardWarnAboutTheFullHouse(t *testing.T) {
+	_, in := liveShoveSpot(t, "Kh Kd", "9s 9c 7d 5h Qs", 1000, 8000, 1)
+
+	if in.Risk == nil {
+		t.Fatal("no risk profile was computed for a five-card board")
+	}
+	if in.Risk.HeroHand != "Two Pair" {
+		t.Errorf("hero hand read as %q, want Two Pair", in.Risk.HeroHand)
+	}
+	var fullHouse float64
+	for _, c := range in.Risk.BeatenBy {
+		if c.Category == "Full House" {
+			fullHouse = c.Share
+		}
+	}
+	if fullHouse <= 0 {
+		t.Errorf("a full house is live here and was not counted: %+v", in.Risk.BeatenBy)
+	}
+
+	advice := Calculate(in)
+	t.Logf("%s %.0f: %s", advice.PrimaryAction, advice.RecommendedAmount, advice.Reasoning)
+
+	if !strings.Contains(advice.Reasoning, "фулл-хаус") {
+		t.Errorf("the reasoning does not warn about the full house: %q", advice.Reasoning)
+	}
+	if advice.Risk == nil {
+		t.Error("the risk profile was not passed through to the response for the interface to show")
+	}
+
+	// And it stays out of the way when nothing is threatening: a set on an
+	// unpaired, unconnected board has almost nothing beating it.
+	_, safe := liveShoveSpot(t, "5h 5c", "5s Kd 2c 7h 9d", 1000, 8000, 1)
+	safeAdvice := Calculate(safe)
+	t.Logf("set: %s", safeAdvice.Reasoning)
+	if strings.Contains(safeAdvice.Reasoning, "Осторожно") && safe.Risk.Behind > 0.05 {
+		t.Errorf("warned about a hand that is barely beaten (%.3f behind): %q",
+			safe.Risk.Behind, safeAdvice.Reasoning)
 	}
 }

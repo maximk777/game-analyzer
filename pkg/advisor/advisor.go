@@ -47,6 +47,10 @@ type AdvisorResponse struct {
 	// CallEquity is hero's equity against that narrowed range, which is what
 	// the call decision actually rests on -- not the headline equity.
 	CallEquity float64 `json:"call_equity"`
+
+	// Risk is what beats hero right now, counted rather than sampled, so the
+	// interface can show the losing cases instead of only the winning share.
+	Risk *equity.RiskProfile `json:"risk,omitempty"`
 }
 
 // committedCallNarrowing is how much narrower a calling range is against a bet
@@ -94,6 +98,42 @@ func roundToTwoDecimals(val float64) float64 {
 // `readWeight`, so a confident-sounding tendency can move the estimate but
 // cannot become the estimate -- see readWeight for why that matters.
 func foldFrequency(bet, pot, observed float64, weight float64) float64 {
+	return foldFrequencyAtDepth(bet, pot, observed, weight, 0)
+}
+
+// foldFrequencyAtDepth is foldFrequency, told what the bet costs the player
+// deciding whether to pay it.
+//
+// Minimum defence frequency is a ratio of bet to pot and says nothing about
+// stacks, so a bet of a pot folded out the same share of a range whether it
+// took the caller's last chip or one fiftieth of their stack. It does not:
+// somebody risking two per cent of what they have calls light, because the
+// price of being wrong is small and busting the short stack is worth something.
+//
+// Live, hero had 68,080 against 3.14M and the advice came out as it would
+// between equal stacks -- which is what "the strategy is straight-line, as
+// though we were sitting on level terms" describes. The correction is stated,
+// not derived, and it only ever reduces fold equity: at a bet that takes the
+// caller's whole stack nothing changes, and at a bet they barely feel a third
+// of the folding goes.
+func foldFrequencyAtDepth(bet, pot, observed, weight, callerStack float64) float64 {
+	base := rawFoldFrequency(bet, pot, observed, weight)
+	if callerStack <= 0 || bet <= 0 {
+		return base
+	}
+	risk := math.Min(bet/callerStack, 1)
+	// Full weight when the bet commits them, and a third off when it costs
+	// them nothing worth the name.
+	return base * (1 - shallowRiskFoldPenalty*(1-risk))
+}
+
+// shallowRiskFoldPenalty is how much of the modelled folding disappears against
+// a player the bet cannot hurt. Stated, not derived, and deliberately modest:
+// the point is that being covered enters the decision at all, not that this
+// particular number is exact.
+const shallowRiskFoldPenalty = 0.33
+
+func rawFoldFrequency(bet, pot, observed float64, weight float64) float64 {
 	if bet <= 0 || pot <= 0 {
 		return 0
 	}
@@ -321,6 +361,13 @@ type Inputs struct {
 	// real Monte Carlo answer.
 	EquityVsTop func(frac float64) float64
 
+	// Risk is an exact count of what an opponent's range already beats hero
+	// with, on the board as it stands. Optional. Equity says how often hero
+	// wins; this says what the losses are made of, which is the difference
+	// between a hand that is 88% because the opponent usually has nothing and
+	// one that is 88% because the other 12% is a full house.
+	Risk *equity.RiskProfile
+
 	// ReadHands is how many hands the tendencies in OppTendencies were counted
 	// over. Zero means they were not counted at all.
 	ReadHands int
@@ -364,6 +411,31 @@ func Calculate(in Inputs) AdvisorResponse {
 	}
 	if state.CurrentBet > 0 && toCall == 0 && heroCurrentBet == 0 {
 		toCall = state.CurrentBet
+	}
+
+	// The amount owed has to be at least what is already in front of somebody
+	// else. It comes off the call button, which is the one place the client
+	// states it outright -- and when that fails to read, what is left is a
+	// number from somewhere else entirely. Live, two players sat all-in for
+	// 199,680 apiece and the tool offered to call 2,000, which is the big
+	// blind: a price nobody at that table could pay.
+	//
+	// The chips on the felt are the check. They are read separately, they
+	// cannot be smaller than the wager they represent, and a call cannot be
+	// cheaper than the largest of them.
+	owed := 0.0
+	for _, seat := range state.Seats {
+		if seat.PlayerID == state.HeroID || seat.IsFolded {
+			continue
+		}
+		if seat.CurrentBet > owed {
+			owed = seat.CurrentBet
+		}
+	}
+	if owed > heroCurrentBet {
+		if want := owed - heroCurrentBet; want > toCall {
+			toCall = want
+		}
 	}
 
 	potOdds := 0.0
@@ -415,7 +487,7 @@ func Calculate(in Inputs) AdvisorResponse {
 		if raiseTo <= 0 {
 			return 0, 0
 		}
-		f := foldFrequency(raiseTo-toCall, pot, observedFold, weight)
+		f := foldFrequencyAtDepth(raiseTo-toCall, pot, observedFold, weight, deepestOpponent)
 
 		// Minimum defence frequency is a bluff-catching rule, and it describes
 		// a defender who still has something to defend with: streets left to
@@ -477,9 +549,25 @@ func Calculate(in Inputs) AdvisorResponse {
 			// tenth it is 31%, because the hands that call a river bet on that
 			// board are the kings and queens that just made a full house.
 			// Nothing about that risk reached the decision.
+			// Whose stack is at risk is the caller's, not hero's.
+			//
+			// This was measured against the effective stack, which is hero's
+			// whenever hero is the shorter -- so a shove that took all of
+			// hero's money was treated as committing whoever called it, however
+			// deep they were. Live, hero had 68,080 against 3.14M: calling that
+			// shove costs the opponent two per cent of their stack, they are
+			// committed to nothing, and they call as wide as they like. Told
+			// otherwise, the model credited hero with folding out hands that
+			// were never folding, and the advice came out the same as it would
+			// between equal stacks. "As though we were sitting on level terms"
+			// is exactly what it was doing.
+			callerStack := deepestOpponent
+			if callerStack <= 0 {
+				callerStack = effectiveStack
+			}
 			finality := 0.0
-			if effectiveStack > 0 {
-				finality = math.Min(raiseTo/effectiveStack, 1)
+			if callerStack > 0 {
+				finality = math.Min(raiseTo/callerStack, 1)
 			}
 			if state.Street == table.StreetRiver || state.Street == table.StreetShowdown {
 				finality = 1
@@ -711,6 +799,7 @@ func Calculate(in Inputs) AdvisorResponse {
 	}
 
 	reasoning := buildReasoning(reasoningInput{
+		risk:           in.Risk,
 		action:         primaryAct,
 		winEq:          winEq,
 		callEquity:     callEquity,
@@ -740,6 +829,7 @@ func Calculate(in Inputs) AdvisorResponse {
 		HasReads:          hasReads,
 		CallRangeFraction: callRangeFraction,
 		CallEquity:        callEquity,
+		Risk:              in.Risk,
 	}
 }
 
@@ -824,6 +914,7 @@ type reasoningInput struct {
 	hasReads       bool
 	bluffFreq      float64
 	fromChart      bool
+	risk           *equity.RiskProfile
 }
 
 // chartReasoning explains a preflop decision in the terms that actually made
@@ -899,29 +990,128 @@ func buildReasoning(in reasoningInput) string {
 	case table.ActionBet, table.ActionRaise, table.ActionAllIn:
 		name := actionRU[in.action.Action]
 		if in.winEq >= fairShare {
-			body = fmt.Sprintf("Вэлью-%s %.0f (%s), %s: эквити %.1f%%, фолд-эквити на этом размере %.0f%%, EV %+.0f.",
-				name, in.action.Amount, in.action.SizingLabel, way,
-				in.winEq*100, in.action.FoldEquity*100, in.action.EV)
+			body = fmt.Sprintf("%s %.0f — вы впереди: выигрываете %.0f из 100 раз (%s). Соперник сбросит примерно в %.0f случаях из 100; в среднем эта ставка приносит %+.0f.",
+				capitalise(name), in.action.Amount, in.winEq*100, way,
+				in.action.FoldEquity*100, in.action.EV)
 		} else {
-			body = fmt.Sprintf("Полублеф-%s %.0f (%s), %s: фолд-эквити %.0f%% при эквити руки %.1f%%, EV %+.0f.",
-				name, in.action.Amount, in.action.SizingLabel, way,
-				in.action.FoldEquity*100, in.winEq*100, in.action.EV)
+			body = fmt.Sprintf("%s %.0f без готовой руки: выигрываете только %.0f из 100 раз (%s), но соперник сбросит примерно в %.0f. За счёт этого в среднем %+.0f.",
+				capitalise(name), in.action.Amount, in.winEq*100, way,
+				in.action.FoldEquity*100, in.action.EV)
 		}
 	case table.ActionCall:
-		body = fmt.Sprintf("Колл %.0f, %s: эквити против ставящего диапазона (верхние %.0f%%) — %.1f%%, требуется по пот-оддсам %.1f%%. EV %+.0f.",
-			in.toCall, way, in.callRangeFrac*100, in.callEquity*100, in.potOdds*100, in.action.EV)
+		body = fmt.Sprintf("Коллируйте %.0f (%s). Против того, чем он мог сюда поставить, вы выигрываете %.0f из 100 раз, а чтобы колл окупился нужно %.0f. В среднем %+.0f.",
+			in.toCall, way, in.callEquity*100, in.potOdds*100, in.action.EV)
 		if in.bluffFreq >= 0.30 {
-			body += fmt.Sprintf(" Оппонент блефует в %.0f%% случаев.", in.bluffFreq*100)
+			body += fmt.Sprintf(" Этот игрок блефует часто — примерно в %.0f случаях из 100.", in.bluffFreq*100)
 		}
 	case table.ActionCheck:
-		body = fmt.Sprintf("Чек, %s: эквити %.1f%% в банк %.0f.", way, in.winEq*100, in.pot)
+		body = fmt.Sprintf("Чек (%s). Выигрываете %.0f из 100 раз, но ставка себя не окупает: платить будут в основном руки, которые вас уже бьют.",
+			way, in.winEq*100)
 	default:
-		body = fmt.Sprintf("Фолд, %s: эквити против ставящего диапазона (верхние %.0f%%) — %.1f%%, а пот-оддсы требуют %.1f%%. Колл дал бы EV %+.0f.",
-			way, in.callRangeFrac*100, in.callEquity*100, in.potOdds*100, in.evCall)
+		body = fmt.Sprintf("Сбрасывайте (%s). Против того, чем он поставил, вы выигрываете %.0f из 100 раз, а чтобы колл окупился нужно %.0f — колл в среднем даёт %+.0f.",
+			way, in.callEquity*100, in.potOdds*100, in.evCall)
+	}
+
+	if danger := dangerLine(in.risk, in.opponents); danger != "" {
+		body += " " + danger
 	}
 
 	if !in.hasReads {
-		body += " Статистики по этим оппонентам нет — фолд-эквити взята из равновесия, а не из наблюдений."
+		body += " По этим соперникам ещё нет статистики, так что «сбросит / не сбросит» — это оценка по теории, а не по тому, как они играли."
 	}
 	return body
+}
+
+func capitalise(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	return strings.ToUpper(string(r[0])) + string(r[1:])
+}
+
+// dangerLine says what is beating hero and how often, in the words a player
+// would use.
+//
+// Equity is one number, and one number hides the shape of the losses. Kings on
+// 9-9-7-5-Q win 88 hands in 100 and are drawing dead against the queens; a
+// player looking at that board wants to be told that a full house is live, not
+// to infer it from a percentage. The counts behind this are exact -- every
+// combination in the opponent's range is played against the board -- so the
+// line can name hands and numbers without hedging.
+func dangerLine(r *equity.RiskProfile, opponents int) string {
+	if r == nil || r.Combos == 0 || len(r.BeatenBy) == 0 {
+		return ""
+	}
+	// Below a percent of the range there is nothing worth interrupting for.
+	if r.Behind < 0.01 {
+		return ""
+	}
+
+	names := map[string]string{
+		"High Card":       "старшей картой",
+		"One Pair":        "парой",
+		"Two Pair":        "двумя парами",
+		"Three of a Kind": "тройкой",
+		"Straight":        "стритом",
+		"Flush":           "флешем",
+		"Full House":      "фулл-хаусом",
+		"Four of a Kind":  "каре",
+		"Straight Flush":  "стрит-флешем",
+	}
+
+	var parts []string
+	for _, c := range r.BeatenBy {
+		if len(parts) == 2 {
+			break
+		}
+		name := names[c.Category]
+		if name == "" {
+			name = c.Category
+		}
+		// Beaten by the same hand you hold means beaten by the kicker, and
+		// saying "трипс" against a player who also holds trips reads as though
+		// something rarer is required. Live, hero held trip aces with a seven
+		// and the twenty combinations listed as "трипс" were every ace with a
+		// better card beside it -- which is the whole danger of the hand and is
+		// not what the category name conveys.
+		if c.Category == r.HeroHand {
+			name += " со старшим киккером"
+		}
+		parts = append(parts, fmt.Sprintf("%s — %.0f из 100", name, c.Share*100))
+	}
+
+	who := "соперник уже сильнее"
+	if opponents > 1 {
+		// The count is against one range, so multiway it is a floor and has to
+		// be said as one. Claiming it for the whole field would be arithmetic
+		// nobody did.
+		who = "любой отдельный соперник уже сильнее"
+	}
+	return fmt.Sprintf("Осторожно: у вас %s, и в %.0f случаях из 100 %s (%s).",
+		heroHandRU(r.HeroHand), r.Behind*100, who, strings.Join(parts, ", "))
+}
+
+func heroHandRU(s string) string {
+	switch s {
+	case "High Card":
+		return "старшая карта"
+	case "One Pair":
+		return "пара"
+	case "Two Pair":
+		return "две пары"
+	case "Three of a Kind":
+		return "тройка"
+	case "Straight":
+		return "стрит"
+	case "Flush":
+		return "флеш"
+	case "Full House":
+		return "фулл-хаус"
+	case "Four of a Kind":
+		return "каре"
+	case "Straight Flush":
+		return "стрит-флеш"
+	}
+	return s
 }
