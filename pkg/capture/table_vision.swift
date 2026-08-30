@@ -178,15 +178,19 @@ func makeInkMask(_ bmp: Bitmap) -> InkMask {
             let lum = 0.299 * r + 0.587 * g + 0.114 * b
             guard lum < 190 else { continue }
 
-            // Cards are printed in black and red on white. Anything where green
-            // or blue dominates is not part of the card: it is the felt caught
-            // along the crop edge, or a position badge sitting on the corner.
-            // Treating felt as ink fused it to the rank glyph, the pair became
-            // one full-height blob, that blob was rejected as card border, and
-            // the card went unread with the hand plainly on screen. A margin is
-            // deliberately not used -- felt in shadow is dark and unsaturated,
-            // and a threshold tuned to lit felt missed it.
-            if g > r + 18 && g > b + 10 { continue }
+            // Green is felt caught along the crop edge, not ink -- with one
+            // exception. The client ships two decks, and on the four-colour one
+            // a club is printed green: measured from its own sprites, felt is
+            // (9,67,50) and a club is (48,135,0). What separates them is blue.
+            // Felt carries about three quarters as much blue as green; a club
+            // carries none, and only picks any up where it blends into the
+            // white card beneath it. So the felt test keeps its shape and gains
+            // one clause, which leaves the felt margin comfortable (100 against
+            // 67) and costs a club only its outermost blended pixels.
+            //
+            // Without this clause a green club is deleted outright, and the
+            // card comes back with a rank and no suit.
+            if g > r + 18 && g > b + 10 && b * 2 > g { continue }
 
             mask[y * bmp.width + x] = true
             ink += 1
@@ -518,13 +522,63 @@ struct SuitResult {
     let isRed: Bool
     let profile: [Double]
     let distance: Double
+    /// Distance to the other suit of the same colour. The pip is only ever
+    /// decided between two candidates, so this is the whole of the evidence
+    /// that the winner won: a pip that sits between them is not a reading.
+    let runnerUp: Double
+    /// True when the pip's colour named the suit on its own, which happens only
+    /// on the four-colour deck. Shape thresholds do not apply to those.
+    var decidedByColour: Bool = false
 }
 
-func classifySuit(pip: InkMask, isRed: Bool) -> SuitResult? {
+/// Mean colour of a mask's ink, taken from the bitmap it was built over.
+func meanInkColour(_ m: InkMask, in bmp: Bitmap) -> (r: Double, g: Double, b: Double)? {
+    guard m.inkCount > 0, m.width == bmp.width, m.height == bmp.height else { return nil }
+    var sr = 0.0, sg = 0.0, sb = 0.0
+    for y in 0..<m.height {
+        for x in 0..<m.width where m.mask[y * m.width + x] {
+            let (r, g, b) = bmp.rgb(x, y)
+            sr += r; sg += g; sb += b
+        }
+    }
+    let n = Double(m.inkCount)
+    return (sr / n, sg / n, sb / n)
+}
+
+/// The suit a pip's colour names outright, if any.
+///
+/// The client ships two decks, and this is the whole difference between them.
+/// On the two-colour deck both black suits are (1,1,1) and both red ones
+/// (254,1,0), so colour narrows the field to a pair and shape has to finish the
+/// job -- and the black pair is the hard one, a spade and a club sitting only
+/// 0.11 apart where hearts and diamonds sit 0.44 apart. On the four-colour deck
+/// a club is green (48,135,0) and a diamond blue (0,144,234), which are unique,
+/// and no shape comparison can improve on an answer the colour already gives.
+///
+/// So the two suits that shape reads worst are exactly the two the four-colour
+/// deck makes trivial. Every number above is measured from the sprites the
+/// client itself draws with, in bin/assets/coinpoker.
+func suitFromColour(_ c: (r: Double, g: Double, b: Double)) -> String? {
+    if c.g > c.r + 40 && c.g > c.b + 40 { return "c" }
+    if c.b > c.r + 60 && c.b > c.g + 40 { return "d" }
+    return nil
+}
+
+func classifySuit(pip: InkMask, isRed: Bool, colour: (r: Double, g: Double, b: Double)? = nil) -> SuitResult? {
     guard pip.inkCount >= 24 else { return nil }
 
     let profile = widthProfile(pip)
     guard !profile.isEmpty else { return nil }
+
+    // A colour that belongs to one suit only settles it. The profile is still
+    // measured, so a disagreement between the two shows up in the diagnostics
+    // rather than being silently discarded.
+    if let colour, let named = suitFromColour(colour) {
+        let ref = named == "c" ? SuitProfiles.club : SuitProfiles.diamond
+        return SuitResult(suit: named, isRed: named == "d", profile: profile,
+                          distance: profileDistance(profile, ref), runnerUp: .infinity,
+                          decidedByColour: true)
+    }
 
     let candidates: [(String, [Double])] = isRed
         ? [("h", SuitProfiles.heart), ("d", SuitProfiles.diamond)]
@@ -532,15 +586,36 @@ func classifySuit(pip: InkMask, isRed: Bool) -> SuitResult? {
 
     var bestSuit = candidates[0].0
     var bestDist = Double.infinity
+    var runnerUp = Double.infinity
     for (name, ref) in candidates {
         let d = profileDistance(profile, ref)
         if d < bestDist {
+            runnerUp = bestDist
             bestDist = d
             bestSuit = name
+        } else if d < runnerUp {
+            runnerUp = d
         }
     }
 
-    return SuitResult(suit: bestSuit, isRed: isRed, profile: profile, distance: bestDist)
+    // A pip that matches nothing is not a suit. Measured across the reference
+    // frames, a clean pip sits 0.008-0.027 from its own reference; a crop that
+    // straddled two overlapping cards measured 0.16-0.17. Until this gate
+    // existed the nearest of the two same-colour candidates was returned no
+    // matter how far away it was, so a garbage crop produced a confident suit
+    // -- 10c 3s came back as 10c Kc, wrong in both halves and indistinguishable
+    // downstream from a good reading.
+    //
+    // The margin is deliberately loose. Spade against club is the tight pair:
+    // on a real board card they are only 0.11 apart, against 0.44 for hearts
+    // against diamonds. A margin tuned to the red pair would reject every black
+    // card on the table.
+    guard bestDist <= 0.09 else { return nil }
+    guard !runnerUp.isFinite || runnerUp - bestDist >= 0.04 else { return nil }
+
+
+    return SuitResult(suit: bestSuit, isRed: isRed, profile: profile,
+                      distance: bestDist, runnerUp: runnerUp)
 }
 
 // MARK: - Rank recognition
@@ -926,6 +1001,28 @@ func readCardRect(cgImg: CGImage, slotRect: CGRect, debugDir: URL? = nil, label:
         width: ceil(TableGeometry.indexSize.width * faceRect.size.width),
         height: ceil(TableGeometry.indexSize.height * faceRect.size.height))
 
+    let reading = readIndexRect(cgImg: cgImg, indexRect: indexRect, whiteRatio: whiteRatio,
+                                note: "inset=(\(inset.left),\(inset.top))",
+                                debugDir: debugDir, label: label)
+
+    // Bounded so a long session cannot grow it without limit; a table only ever
+    // shows a handful of distinct cards at a time.
+    if cardReadingCache.count > 512 {
+        cardReadingCache.removeAll(keepingCapacity: true)
+    }
+    cardReadingCache[signature] = reading
+    return reading
+}
+
+/// Reads rank and suit out of an already-located index corner.
+///
+/// Split out of readCardRect so the corner can be located two ways: derived
+/// from a card rectangle (readCardRect, used for the board, whose cards never
+/// touch) or found directly as ink (readCardsInRegion, used wherever cards
+/// overlap). Everything below the corner -- the rank templates, the loop
+/// topology, the suit width profile -- is shared by both.
+func readIndexRect(cgImg: CGImage, indexRect: CGRect, whiteRatio: Double,
+                   note: String = "", debugDir: URL? = nil, label: String = "") -> CardReading {
     guard let indexImg = cgImg.cropping(to: indexRect), let indexBmp = Bitmap(cgImage: indexImg) else {
         return CardReading(card: nil, rank: nil, suit: nil, whiteRatio: whiteRatio, profile: [], suitDistance: .infinity)
     }
@@ -935,7 +1032,7 @@ func readCardRect(cgImg: CGImage, slotRect: CGRect, debugDir: URL? = nil, label:
 
     let indexMask = makeInkMask(indexBmp)
     let rows = splitIndexRows(indexMask)
-    let dbg = "index=\(indexBmp.width)x\(indexBmp.height) inset=(\(inset.left),\(inset.top)) "
+    var dbg = "index=\(indexBmp.width)x\(indexBmp.height) \(note) "
         + "allBlobs=" + findBlobs(indexMask).map { "\($0.width)x\($0.height)@\($0.minX),\($0.minY)#\($0.size)" }.joined(separator: ",")
         + " rows=" + rows.map { r in "[" + r.map { "\($0.width)x\($0.height)" }.joined(separator: "+") + "]" }.joined(separator: " ")
     guard rows.count >= 2 else {
@@ -944,11 +1041,12 @@ func readCardRect(cgImg: CGImage, slotRect: CGRect, debugDir: URL? = nil, label:
         }.joined(separator: " ")
         return CardReading(card: nil, rank: nil, suit: nil, whiteRatio: whiteRatio,
                            profile: [], suitDistance: .infinity,
-                           debug: "face=\(Int(face.rect.width))x\(Int(face.rect.height))@\(Int(face.rect.minX)),\(Int(face.rect.minY)) white=\(String(format: "%.2f", whiteRatio)) inset=(\(inset.left),\(inset.top)) index=\(indexBmp.width)x\(indexBmp.height) rows=\(rows.count) blobs=[\(all)]")
+                           debug: "white=\(String(format: "%.2f", whiteRatio)) \(note) index=\(indexBmp.width)x\(indexBmp.height) rows=\(rows.count) blobs=[\(all)]")
     }
 
     // Row 0: rank glyph.
     var rank: String?
+    var rankEvidence = ""
     let rankMask = maskFromBlobs(indexMask, rows[0])
     do {
         // Ten is the only two-part rank, and deciding that structurally
@@ -972,11 +1070,30 @@ func readCardRect(cgImg: CGImage, slotRect: CGRect, debugDir: URL? = nil, label:
         // "ten" from the blob count -- was scaffolding around reading a known
         // shape as unknown text.
         let metrics = holeMetrics(rankMask)
+        let scores = CardTemplates.shared.rankScores(rankMask)
+        rankEvidence = "holes=\(metrics.count) aspect=" + String(format: "%.2f", groupAspect)
+            + " parts=\(rows[0].count) top=" + scores.prefix(3)
+                .map { $0.0 + String(format: ":%.3f", $0.1) }.joined(separator: ",")
+        // With the client's own shapes in hand, a low score means the crop is
+        // not a rank -- not that a weaker reader should be asked. Both weaker
+        // readers below exist for the case where the assets could not be
+        // extracted, and both of them guess: the two-part rule read a rank
+        // glyph and its neighbour's, caught in one crop, as a ten, and text
+        // recognition on an isolated glyph is the unreliability this whole
+        // approach was built to escape. Measured, a real ten scores 0.75 and is
+        // taken by the template outright; the two-part rule only ever fired on
+        // a crop that had strayed onto a second card, where nothing scored
+        // above 0.41.
+        let templatesReady = CardTemplates.shared.isLoaded
         if let match = CardTemplates.shared.matchRank(rankMask, holes: metrics.count, holeY: metrics.centreY),
            match.score >= 0.45 {
             rank = match.label
+            rankEvidence += " picked=" + match.label + String(format: ":%.3f", match.score)
+        } else if templatesReady {
+            rankEvidence += " picked=nil:belowFloor"
         } else if rows[0].count >= 2 && groupAspect > 0.70 {
             rank = "10"
+            rankEvidence += " picked=10:byShape"
         } else if let img = renderMaskForOCR(rankMask, repeats: 4) {
             // Rendering the tiled image is only paid for on this path; doing it
             // unconditionally cost as much as the recognition it replaced.
@@ -984,6 +1101,7 @@ func readCardRect(cgImg: CGImage, slotRect: CGRect, debugDir: URL? = nil, label:
                 writePNG(img, to: dir.appendingPathComponent("\(label)-rank.png"))
             }
             rank = recognizeRankText(img, holes: metrics.count)
+            rankEvidence += " picked=" + (rank ?? "nil") + ":byOCR"
         }
     }
 
@@ -992,28 +1110,31 @@ func readCardRect(cgImg: CGImage, slotRect: CGRect, debugDir: URL? = nil, label:
     if let dir = debugDir, let img = renderMaskForOCR(pipMask, scale: 4, padding: 4) {
         writePNG(img, to: dir.appendingPathComponent("\(label)-pip.png"))
     }
-    let suitResult = classifySuit(pip: pipMask, isRed: indexMask.isRed)
+    let pipColour = meanInkColour(pipMask, in: indexBmp)
+    let suitResult = classifySuit(pip: pipMask, isRed: indexMask.isRed, colour: pipColour)
+
+    if let c = pipColour {
+        dbg += String(format: " pip=(%.0f,%.0f,%.0f)", c.r, c.g, c.b)
+    }
+    if let sr = suitResult {
+        dbg += String(format: " suit=%@%@ d=%.4f runnerUp=%.4f margin=%.4f",
+                      sr.suit, sr.decidedByColour ? "(colour)" : "",
+                      sr.distance, sr.runnerUp, sr.runnerUp - sr.distance)
+    }
+    dbg += " rank=\(rank ?? "nil") \(rankEvidence)"
 
     var card: String?
     if let r = rank, let s = suitResult?.suit {
         card = r + s
     }
 
-    let reading = CardReading(card: card,
-                              rank: rank,
-                              suit: suitResult?.suit,
-                              whiteRatio: whiteRatio,
-                              profile: suitResult?.profile ?? [],
-                              suitDistance: suitResult?.distance ?? .infinity,
-                              debug: dbg)
-
-    // Bounded so a long session cannot grow it without limit; a table only ever
-    // shows a handful of distinct cards at a time.
-    if cardReadingCache.count > 512 {
-        cardReadingCache.removeAll(keepingCapacity: true)
-    }
-    cardReadingCache[signature] = reading
-    return reading
+    return CardReading(card: card,
+                       rank: rank,
+                       suit: suitResult?.suit,
+                       whiteRatio: whiteRatio,
+                       profile: suitResult?.profile ?? [],
+                       suitDistance: suitResult?.distance ?? .infinity,
+                       debug: dbg)
 }
 
 func writePNG(_ img: CGImage, to url: URL) {
@@ -1240,7 +1361,10 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     let boardRows = frame.map { findBoardRows(bmp: $0) } ?? []
     let boardRects = boardRows.first ?? []
     let secondBoardRects = boardRows.count > 1 ? boardRows[1] : []
-    let heroRects = frame.map { findHeroCardRects(bmp: $0, excluding: boardRects) } ?? []
+    // The whole white region, not cards cut out of it: hero's two overlap, and
+    // how many cards a region holds is decided from the corners visible inside
+    // it rather than from its outline.
+    let heroRects = frame.map { findHeroCardRegions(bmp: $0, excluding: boardRects) } ?? []
 
     // Position, from the dealer button. Seat boxes come from Vision's
     // bottom-left space and the button from top-left pixel space, so the y axis
@@ -1313,10 +1437,13 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     // Held in place, the stabiliser fills the missing slot from a later frame.
     var hero: [String] = []
     var heroResolved = false
-    for (i, rect) in heroRects.enumerated() {
-        let reading = readCardRect(cgImg: cgImg, slotRect: rect, debugDir: debugDir, label: "hero\(i + 1)")
-        hero.append(reading.card ?? "")
-        if reading.card != nil { heroResolved = true }
+    for (i, region) in heroRects.enumerated() {
+        for (_, reading) in readCardsInRegion(cgImg: cgImg, region: region,
+                                              debugDir: debugDir, label: "hero\(i + 1)-") {
+            guard hero.count < 2 else { break }
+            hero.append(reading.card ?? "")
+            if reading.card != nil { heroResolved = true }
+        }
     }
     while hero.count < 2 { hero.append("") }
     state.hero_cards = heroResolved ? hero : []
@@ -1585,6 +1712,52 @@ let cardAspectRatio: CGFloat = 0.694
 /// the cards that are actually showing -- which is what makes the same routine
 /// serve both hero's hand and an opponent's cards at showdown.
 func findCardFaceRects(bmp: Bitmap, region: CGRect, limit: Int, excluding: [CGRect] = []) -> [CGRect] {
+    var faces: [CGRect] = []
+    for rect in findCardFaceBlobs(bmp: bmp, region: region, excluding: excluding) {
+        let aspect = Double(rect.width) / Double(max(rect.height, 1))
+        switch aspect {
+        case 0.55..<0.95:
+            faces.append(rect)
+        case 0.95..<1.90:
+            // Two cards side by side, their white faces touching. Splitting the
+            // merged region down the middle is wrong whenever they overlap: the
+            // left card shows less than half, so the midpoint falls inside the
+            // right card and its index column -- rank and pip both -- ends up
+            // outside the crop.
+            //
+            // This proportional split is now only a fallback. Where cards
+            // overlap -- hero's hand, an opponent's at showdown -- the caller
+            // uses findCardIndexes instead, which finds each card's corner as
+            // ink. This path still serves the board, whose cards never touch.
+            let cardW = min(rect.height * cardAspectRatio, rect.width)
+            faces.append(CGRect(x: rect.minX, y: rect.minY, width: cardW, height: rect.height))
+            faces.append(CGRect(x: rect.maxX - cardW, y: rect.minY, width: cardW, height: rect.height))
+        case 0.28..<0.45:
+            // Two cards stacked vertically: a hand run twice shows a second
+            // board beneath the first.
+            let half = rect.height / 2
+            faces.append(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: half))
+            faces.append(CGRect(x: rect.minX, y: rect.midY, width: rect.width, height: half))
+        default:
+            continue
+        }
+    }
+    return faces.sorted { $0.width * $0.height > $1.width * $1.height }
+        .prefix(limit)
+        .sorted { $0.minX < $1.minX }
+}
+
+/// The white card-face regions themselves, unsplit and in full-frame pixels.
+///
+/// A region is whatever the white mask came back as: one card, or several whose
+/// faces touch. Deciding how many cards are inside is deliberately left to the
+/// caller, because deciding it from the region's shape is what failed. The
+/// bands used to be 0.55..0.95 for one card and 1.05..1.80 for two, and they
+/// did not meet: a pair overlapped by 41-52% of a card came back at aspect
+/// 0.97..1.04, matched neither band, and hero's whole hand was dropped without
+/// a trace. Overlapped further still it matched the *single* card band, and a
+/// crop straddling the seam read 6d 3d as a confident "Jd".
+func findCardFaceBlobs(bmp: Bitmap, region: CGRect, excluding: [CGRect] = []) -> [CGRect] {
     let w = bmp.width
     let h = bmp.height
 
@@ -1633,49 +1806,141 @@ func findCardFaceRects(bmp: Bitmap, region: CGRect, limit: Int, excluding: [CGRe
     let minW = Int(0.040 * Double(w))
     let maxW = Int(0.180 * Double(w))
 
-    var faces: [CGRect] = []
+    var regions: [CGRect] = []
     for blob in findBlobBoxes(mask: mask, width: w, height: h) {
         guard blob.width >= minW, blob.width <= maxW else { continue }
         let fill = Double(blob.size) / Double(max(blob.width * blob.height, 1))
         guard fill > 0.55 else { continue }
 
         let aspect = Double(blob.width) / Double(max(blob.height, 1))
-        let rect = blob.rect
+        guard aspect >= 0.28, aspect < 1.90 else { continue }
+        regions.append(blob.rect)
+    }
 
-        switch aspect {
-        case 0.55..<0.95:
-            faces.append(rect)
-        case 1.05..<1.80:
-            // Two cards side by side, their white faces touching. Splitting the
-            // merged region down the middle is wrong whenever they overlap: the
-            // left card shows less than half, so the midpoint falls inside the
-            // right card and its index column -- rank and pip both -- ends up
-            // outside the crop. Live that read one card and left the other
-            // blank for the whole hand.
-            //
-            // A card's width follows from its height, so the boundary does not
-            // have to be found: the right card is complete, so it occupies the
-            // last card-width of the region, and the left card starts at the
-            // left edge. Their index columns sit at their own left edges, which
-            // is all that is read from them.
-            let cardW = min(rect.height * cardAspectRatio, rect.width)
-            faces.append(CGRect(x: rect.minX, y: rect.minY, width: cardW, height: rect.height))
-            faces.append(CGRect(x: rect.maxX - cardW, y: rect.minY, width: cardW, height: rect.height))
-        case 0.28..<0.45:
-            // Two cards stacked vertically: a hand run twice shows a second
-            // board beneath the first.
-            let half = rect.height / 2
-            faces.append(CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: half))
-            faces.append(CGRect(x: rect.minX, y: rect.midY, width: rect.width, height: half))
-        default:
-            continue
+    return regions.sorted { $0.width * $0.height > $1.width * $1.height }
+        .map { CGRect(x: $0.minX * k, y: $0.minY * k, width: $0.width * k, height: $0.height * k) }
+        .sorted { $0.minX < $1.minX }
+}
+
+/// One card's index corner -- the rank over its pip -- located as ink.
+struct CardIndex {
+    /// The corner itself, in full-frame pixels, ready to be read.
+    let indexRect: CGRect
+    /// The card the corner belongs to, inferred from it. Only the corner is
+    /// read; this exists for callers that need to know where the card sits.
+    let cardRect: CGRect
+}
+
+/// Finds every card inside a white region by clustering the ink of their index
+/// corners, rather than by cutting the region at a boundary.
+///
+/// The reason this works is a property of how cards are dealt on screen: they
+/// are fanned so that every index corner stays visible, because a player has to
+/// read them. So overlap never hides a corner -- it only destroys the geometry
+/// that was being used to find one. Measured on two live frames, the corners of
+/// an overlapping pair come back as two clean clusters about 90 pixels apart on
+/// a 149-pixel card, with the rank at 29x57 and the pip at 44x49.
+///
+/// Deriving the split instead cost three separate failures live: a pair
+/// overlapped 41-52% vanished entirely, past that it read as one card with both
+/// rank and suit wrong, and in between the answer depended on where the blob's
+/// aspect landed relative to a threshold.
+func findCardIndexes(cgImg: CGImage, region: CGRect) -> [CardIndex] {
+    guard let img = cgImg.cropping(to: region), let bmp = Bitmap(cgImage: img) else { return [] }
+    let h = Double(bmp.height)
+    guard h >= 40 else { return [] }
+
+    let ink = makeInkMask(bmp)
+    let blobs = findBlobs(ink)
+
+    // Everything is sized against the card's height, which is the one dimension
+    // overlap cannot change. Measured on this client at a 216-pixel card: rank
+    // glyph 29x57 (0.13 x 0.26), index pip 44x49 (0.20 x 0.23). The centre
+    // artwork is both larger and lower; the card's own border and the seam
+    // where the next card lies over it run the full height.
+    var candidates: [Blob] = []
+    for b in blobs {
+        let bh = Double(b.height) / h
+        let bw = Double(b.width) / h
+        guard bh >= 0.08, bh <= 0.38, bw >= 0.03, bw <= 0.32 else { continue }
+        guard Double(b.maxY) / h <= 0.72 else { continue }
+        guard b.size >= 40 else { continue }
+        candidates.append(b)
+    }
+    guard !candidates.isEmpty else { return [] }
+
+    // Cluster on the left edge. Within one card the rank and its pip start
+    // within a few pixels of each other; between cards they are a whole card
+    // pitch apart, and the pitch cannot fall below the width of the corner
+    // itself without hiding it. Clustering on the gap between blobs instead
+    // would not survive a deep overlap, where that gap shrinks to nothing.
+    let sorted = candidates.sorted { $0.minX < $1.minX }
+    let spread = 0.22 * h
+    var clusters: [[Blob]] = []
+    for b in sorted {
+        if let last = clusters.last, let anchor = last.map({ $0.minX }).min(),
+           Double(b.minX - anchor) <= spread {
+            clusters[clusters.count - 1].append(b)
+        } else {
+            clusters.append([b])
         }
     }
 
-    return faces.sorted { $0.width * $0.height > $1.width * $1.height }
-        .prefix(limit)
+    var found: [CardIndex] = []
+    for cluster in clusters {
+        // A corner is a rank over a pip: one blob alone cannot be read, and a
+        // cluster that starts halfway down the card is the centre artwork of a
+        // face card, not a corner.
+        guard cluster.count >= 2 else { continue }
+        guard let top = cluster.map({ $0.minY }).min(), Double(top) / h <= 0.24 else { continue }
+
+        let minX = cluster.map { $0.minX }.min()!
+        let maxX = cluster.map { $0.maxX }.max()!
+        let maxY = cluster.map { $0.maxY }.max()!
+
+        // A pixel of margin either side: the crop is re-masked when it is read,
+        // and a glyph flush against the edge loses its outermost stroke.
+        let pad = 2.0
+        let ix = region.minX + CGFloat(minX) - pad
+        let iy = region.minY + CGFloat(top) - pad
+        let iw = CGFloat(maxX - minX) + 1 + pad * 2
+        let ih = CGFloat(maxY - top) + 1 + pad * 2
+
+        // The corner sits about 0.05 of a card height in from the card's left
+        // edge; the card is as wide as its height times the client's ratio.
+        let cardW = CGFloat(h) * cardAspectRatio
+        let cardX = max(region.minX, region.minX + CGFloat(minX) - CGFloat(0.05 * h))
+
+        found.append(CardIndex(
+            indexRect: CGRect(x: ix, y: iy, width: iw, height: ih),
+            cardRect: CGRect(x: cardX, y: region.minY, width: cardW, height: region.height)))
+    }
+
+    return found.sorted { $0.indexRect.minX < $1.indexRect.minX }
+}
+
+/// Reads every card in a white region, overlapping or not.
+func readCardsInRegion(cgImg: CGImage, region: CGRect,
+                       debugDir: URL? = nil, label: String = "") -> [(rect: CGRect, reading: CardReading)] {
+    return findCardIndexes(cgImg: cgImg, region: region).enumerated().map { i, found in
+        (found.cardRect,
+         readIndexRect(cgImg: cgImg, indexRect: found.indexRect, whiteRatio: 1.0,
+                       note: "clustered", debugDir: debugDir, label: "\(label)\(i + 1)"))
+    }
+}
+
+/// Hero's hole cards, as white regions rather than as individual cards.
+///
+/// Hero's two are drawn overlapping, so how many cards a region holds is
+/// decided by readCardsInRegion from the corners it can see, not here from the
+/// region's shape.
+func findHeroCardRegions(bmp: Bitmap, excluding board: [CGRect]) -> [CGRect] {
+    return findCardFaceBlobs(bmp: bmp,
+                             region: CGRect(x: 0.20, y: 0.58, width: 0.60, height: 0.36),
+                             excluding: board)
+        .sorted { $0.width * $0.height > $1.width * $1.height }
+        .prefix(2)
         .sorted { $0.minX < $1.minX }
-        .map { CGRect(x: $0.minX * k, y: $0.minY * k, width: $0.width * k, height: $0.height * k) }
 }
 
 /// Locates the dealer button on the felt.

@@ -73,9 +73,14 @@ struct ParseImageTool {
         // actually saw rather than probing fixed coordinates.
         if let frame = Bitmap(cgImage: img, downscale: 4) {
             let board = findBoardRows(bmp: frame).first ?? []
-            for (i, rect) in findHeroCardRects(bmp: frame, excluding: board).enumerated() {
-                let r = readCardRect(cgImg: img, slotRect: rect, label: "heroDebug\(i)")
-                print("  hero\(i + 1) rect=\(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))x\(Int(rect.height)) card=\(r.card ?? "nil") \(r.debug)")
+            for (i, region) in findHeroCardRegions(bmp: frame, excluding: board).enumerated() {
+                let aspect = region.width / max(region.height, 1)
+                print(String(format: "  heroRegion%d %d,%d %dx%d aspect=%.2f",
+                             i + 1, Int(region.minX), Int(region.minY),
+                             Int(region.width), Int(region.height), aspect))
+                for (n, found) in readCardsInRegion(cgImg: img, region: region, label: "heroDebug\(i)-").enumerated() {
+                    print("    card\(n + 1) at \(Int(found.rect.minX)),\(Int(found.rect.minY)) = \(found.reading.card ?? "nil") \(found.reading.debug)")
+                }
             }
         }
 

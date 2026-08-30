@@ -30,6 +30,13 @@ type StateStabilizer struct {
 	pendingPot      float64
 	pendingPotSeen  int
 	pendingDropSeen int
+
+	// Hero's hole cards do not change within a hand, so a frame that disagrees
+	// with the hand in progress is either the next hand or a misread -- and the
+	// two are told apart the only way they can be, by whether the disagreement
+	// survives into the next frame.
+	pendingHero     [2]Card
+	pendingHeroSeen int
 }
 
 // NewStateStabilizer creates a new StateStabilizer instance.
@@ -215,7 +222,33 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		// wrong at anything but the stake they were tuned at.
 		isNewHand = true
 	case heroCardsBothKnown(prev.HeroCards) && heroCardsBothKnown(raw.HeroCards) && !sameHoleCards(prev.HeroCards, raw.HeroCards):
-		isNewHand = true
+		// Hero was dealt different cards, so this is the next hand -- but only
+		// once the same different cards have been seen twice.
+		//
+		// Unconfirmed, this was the most destructive misread in the pipeline. A
+		// single frame that read both hole cards wrongly did not merely produce
+		// bad advice for that frame: it ended the hand in progress, recorded it
+		// as complete, and opened a new one. The hand came back the next frame
+		// and was recorded a second time, so one live hand reached the database
+		// as two, each with a different holding. The pot already waits for a
+		// second frame for exactly this reason a few lines below; hole cards
+		// are at least as easy to misread and were not waiting for anything.
+		if sameHoleCards(s.pendingHero, raw.HeroCards) {
+			s.pendingHeroSeen++
+		} else {
+			s.pendingHero = raw.HeroCards
+			s.pendingHeroSeen = 1
+		}
+		if s.pendingHeroSeen >= 2 {
+			isNewHand = true
+		}
+	default:
+		// Any frame that agrees with the hand in progress withdraws a pending
+		// change: two disagreeing frames have to be consecutive to count.
+		if heroCardsBothKnown(raw.HeroCards) {
+			s.pendingHero = [2]Card{}
+			s.pendingHeroSeen = 0
+		}
 	}
 
 	// A pot only grows within a hand, so a pot that shrinks means the next hand
@@ -238,6 +271,8 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		s.pendingDropSeen = 0
 		s.pendingPot = 0
 		s.pendingPotSeen = 0
+		s.pendingHero = [2]Card{}
+		s.pendingHeroSeen = 0
 
 		// The hand that was in progress is now over. Handing it back is the
 		// only end-of-hand signal this pipeline has.
@@ -278,11 +313,26 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 	// resolving a frame before the other is the normal case, and only handling
 	// slot 0 left the second card stuck unknown for the whole hand.
 	mergedHero := prev.HeroCards
-	if heroCardsBothKnown(raw.HeroCards) {
+	switch {
+	case !heroCardsBothKnown(prev.HeroCards) && heroCardsBothKnown(raw.HeroCards):
+		// Nothing settled yet, so the first complete reading stands.
 		mergedHero = raw.HeroCards
-	} else {
+	case heroCardsBothKnown(raw.HeroCards):
+		// A complete reading that disagrees with the settled hand does not
+		// replace it on its own word. Reaching here means the disagreement was
+		// not confirmed above, so it was a misread; the settled hand is kept
+		// and the next frame decides. Taking the newest reading unconditionally
+		// meant one bad frame changed what hero was holding mid-hand, and the
+		// advisor sized a bet for a hand hero did not have.
+		if sameHoleCards(prev.HeroCards, raw.HeroCards) {
+			mergedHero = raw.HeroCards
+		}
+	default:
+		// Each slot fills independently: one card resolving a frame before the
+		// other is the normal case, and only handling slot 0 left the second
+		// card stuck unknown for the whole hand.
 		for i := 0; i < 2; i++ {
-			if raw.HeroCards[i].Rank > 0 && mergedHero[i].Rank == 0 {
+			if raw.HeroCards[i].Known() && !mergedHero[i].Known() {
 				mergedHero[i] = raw.HeroCards[i]
 			}
 		}

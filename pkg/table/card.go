@@ -38,13 +38,23 @@ type Card struct {
 	Suit Suit `json:"suit"`
 }
 
+// Known reports whether this card was actually read. The zero Card means "not
+// read", and every consumer that renders or stores one has to be able to tell
+// that apart from a card that was.
+func (c Card) Known() bool {
+	return c.Rank >= RankTwo && c.Rank <= RankAce
+}
+
 func (c Card) String() string {
-	rankStrs := map[Rank]string{
-		RankTwo: "2", RankThree: "3", RankFour: "4", RankFive: "5",
-		RankSix: "6", RankSeven: "7", RankEight: "8", RankNine: "9",
-		RankTen: "Ts", RankJack: "Js", RankQueen: "Qs", RankKing: "Ks", RankAce: "As",
+	// An unread card has no suit either. Suit is an enum whose zero value is
+	// Spades, so a card that was never read printed as "?s" -- which reads as
+	// "some spade", and that is how it reached the hand histories in the
+	// database. It was mistaken for a half-read card; it is not one, it is no
+	// card at all. Nothing partial is ever produced: the recogniser emits a
+	// card only when both halves are read.
+	if !c.Known() {
+		return "??"
 	}
-	_ = rankStrs
 
 	var rStr string
 	switch c.Rank {

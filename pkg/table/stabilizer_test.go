@@ -501,3 +501,132 @@ func TestStateStabilizer_RejectsBoardClashingWithHero(t *testing.T) {
 		t.Errorf("the board was altered: %v", got.CommunityCards)
 	}
 }
+
+// A frame that misreads both of hero's hole cards must not be allowed to end
+// the hand in progress.
+//
+// This was the most destructive misread in the pipeline, and it did not look
+// like a card bug at all. One bad frame ended the hand, recorded it as
+// complete, and opened a new one; the real hand came back on the next frame and
+// was recorded again. A single live hand reached the database as two, each with
+// a different holding, and every statistic built on that history was wrong by
+// however often a card was misread.
+//
+// The vision side has since stopped producing confident garbage -- see
+// pkg/capture/vision_overlap_test.go -- but a reading that clears every
+// threshold can still be wrong, and this is the layer that has more than one
+// frame to work with.
+func TestStateStabilizer_SingleBadHoleCardFrameDoesNotSplitTheHand(t *testing.T) {
+	st := NewStateStabilizer()
+
+	tenClubs, _ := ParseCard("10c")
+	threeSpades, _ := ParseCard("3s")
+	kingClubs, _ := ParseCard("Kc")
+
+	settled := func() *HandState {
+		return &HandState{
+			TableID:   "coinpoker-live",
+			Pot:       6000,
+			HeroCards: [2]Card{tenClubs, threeSpades},
+			Seats:     []SeatState{{PlayerID: "hero", PlayerName: "hero", Stack: 100000}},
+		}
+	}
+
+	first := st.Stabilize(settled())
+	handID := first.HandID
+	if handID == "" {
+		t.Fatal("first frame produced no hand id")
+	}
+
+	// The live misread: 10c 3s came back as 10c Kc. Wrong rank and wrong suit
+	// on the second card, and nothing in the frame says so.
+	misread := settled()
+	misread.HeroCards = [2]Card{tenClubs, kingClubs}
+	got := st.Stabilize(misread)
+
+	if got.HandID != handID {
+		t.Errorf("one misread frame started a new hand: %q became %q", handID, got.HandID)
+	}
+	if !sameHoleCards(got.HeroCards, [2]Card{tenClubs, threeSpades}) {
+		t.Errorf("one misread frame changed hero's hand: got %v %v, want 10c 3s",
+			got.HeroCards[0], got.HeroCards[1])
+	}
+	if done := st.TakeCompletedHand(); done != nil {
+		t.Errorf("one misread frame recorded a completed hand: %+v", done.HeroCards)
+	}
+
+	// The next frame reads correctly again, which has to withdraw the pending
+	// change rather than leave it half-armed for the rest of the hand.
+	back := st.Stabilize(settled())
+	if back.HandID != handID {
+		t.Errorf("recovering frame started a new hand: %q became %q", handID, back.HandID)
+	}
+}
+
+// The other half of the same rule: hero really is dealt a new hand, and the
+// stabiliser has to notice. Two consecutive frames agreeing on different cards
+// is the evidence, and it is the same evidence the pot rule already demands.
+func TestStateStabilizer_ConfirmedHoleCardChangeStartsNewHand(t *testing.T) {
+	st := NewStateStabilizer()
+
+	tenClubs, _ := ParseCard("10c")
+	threeSpades, _ := ParseCard("3s")
+	aceHearts, _ := ParseCard("Ah")
+	aceSpades, _ := ParseCard("As")
+
+	frame := func(a, b Card) *HandState {
+		return &HandState{
+			TableID:   "coinpoker-live",
+			Pot:       6000,
+			HeroCards: [2]Card{a, b},
+			Seats:     []SeatState{{PlayerID: "hero", PlayerName: "hero", Stack: 100000}},
+		}
+	}
+
+	first := st.Stabilize(frame(tenClubs, threeSpades))
+	handID := first.HandID
+
+	if got := st.Stabilize(frame(aceHearts, aceSpades)); got.HandID != handID {
+		t.Fatalf("new cards were believed on one frame: %q became %q", handID, got.HandID)
+	}
+	next := st.Stabilize(frame(aceHearts, aceSpades))
+	if next.HandID == handID {
+		t.Errorf("new cards confirmed twice did not start a new hand, still %q", handID)
+	}
+	if !sameHoleCards(next.HeroCards, [2]Card{aceHearts, aceSpades}) {
+		t.Errorf("new hand kept the old hole cards: got %v %v", next.HeroCards[0], next.HeroCards[1])
+	}
+	if done := st.TakeCompletedHand(); done == nil {
+		t.Error("the finished hand was not handed back for recording")
+	}
+}
+
+// An unread card is not a spade.
+//
+// Suit is an enum whose zero value is Spades, so the zero Card -- meaning "not
+// read" -- rendered as "?s". Hand histories in the database carry entries like
+// ["?s", "3d"], which were taken for half-read cards and are nothing of the
+// kind: the recogniser only ever emits a card when both halves are read.
+func TestCard_UnreadCardIsNotASpade(t *testing.T) {
+	if got := (Card{}).String(); got != "??" {
+		t.Errorf("unread card rendered as %q, want %q", got, "??")
+	}
+	if (Card{}).Known() {
+		t.Error("the zero card reports itself as known")
+	}
+
+	// It still round-trips, so nothing already written can fail to load.
+	var c Card
+	if err := c.UnmarshalJSON([]byte(`"??"`)); err != nil {
+		t.Fatalf("decoding %q: %v", "??", err)
+	}
+	if c.Known() {
+		t.Errorf("%q decoded to a known card %v", "??", c)
+	}
+	if err := c.UnmarshalJSON([]byte(`"?s"`)); err != nil {
+		t.Fatalf("decoding the legacy %q: %v", "?s", err)
+	}
+	if c.Known() {
+		t.Errorf("legacy %q decoded to a known card %v", "?s", c)
+	}
+}

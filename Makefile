@@ -13,7 +13,7 @@ assets:
 # The Swift binaries each compile the shared table analyser alongside their own
 # entry point, so table_vision.swift stays the single source of card
 # recognition for the live agent, the offline harness and the recorder.
-vision: bin/mac_vision_agent bin/parse_image bin/diag_recorder
+vision: bin/mac_vision_agent bin/parse_image bin/diag_recorder bin/snap
 
 bin/mac_vision_agent: $(SWIFT_SHARED) pkg/capture/mac_vision_agent.swift
 	@mkdir -p bin
@@ -27,6 +27,12 @@ bin/diag_recorder: $(SWIFT_SHARED) pkg/capture/diag_recorder.swift
 	@mkdir -p bin
 	swiftc -parse-as-library $^ -o $@
 
+# Captures the table window to a PNG. Diagnosis starts from a frame, so the
+# tool that produces one is built alongside the tools that read one.
+bin/snap: $(SWIFT_SHARED) pkg/capture/snap_tool.swift
+	@mkdir -p bin
+	swiftc -parse-as-library $^ -o $@
+
 test:
 	go test ./...
 
@@ -34,4 +40,4 @@ test-race:
 	go test -race ./...
 
 clean:
-	rm -f bin/mac_vision_agent bin/parse_image bin/diag_recorder
+	rm -f bin/mac_vision_agent bin/parse_image bin/diag_recorder bin/snap
