@@ -57,6 +57,7 @@ type Server struct {
 	mux        *http.ServeMux
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
+	stabilizer *table.StateStabilizer
 	mu         sync.Mutex
 
 	roiConfig       vision.ROIConfig
@@ -72,13 +73,14 @@ type Server struct {
 func NewServer(cache *storage.MemoryCache, db *storage.SQLiteDB, prof *profiler.Profiler) *Server {
 	hub := NewWSHub()
 	s := &Server{
-		cache:     cache,
-		db:        db,
-		prof:      prof,
-		hub:       hub,
-		mux:       http.NewServeMux(),
-		roiConfig: vision.DefaultCoinPoker6MaxROI(),
+		cache:      cache,
+		db:         db,
+		prof:       prof,
+		hub:        hub,
+		mux:        http.NewServeMux(),
+		roiConfig:  vision.DefaultCoinPoker6MaxROI(),
 		windowsProvider: capture.ListAllWindows,
+		stabilizer: table.NewStateStabilizer(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -156,6 +158,11 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	}
 	if tableID == "" {
 		return nil, errors.New("missing table id in event")
+	}
+
+	// 0. State Stabilization (filter frame glitches, dropouts & maintain monotonic card/pot state)
+	if event.HandState != nil && s.stabilizer != nil {
+		event.HandState = s.stabilizer.Stabilize(event.HandState)
 	}
 
 	// 1. Cache update
