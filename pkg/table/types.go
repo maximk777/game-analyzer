@@ -62,12 +62,31 @@ type ActionRecord struct {
 }
 
 type HandState struct {
-	HandID         string         `json:"hand_id"`
-	TableID        string         `json:"table_id"`
-	Street         Street         `json:"street"`
-	Pot            float64        `json:"pot"`
-	CurrentBet     float64        `json:"current_bet"`
-	MinRaise       float64        `json:"min_raise"`
+	HandID     string  `json:"hand_id"`
+	TableID    string  `json:"table_id"`
+	Street     Street  `json:"street"`
+	Pot        float64 `json:"pot"`
+	CurrentBet float64 `json:"current_bet"`
+	MinRaise   float64 `json:"min_raise"`
+
+	// SmallBlind and BigBlind are the stake. The screen reader has always sent
+	// them -- they come from the window title, which the system hands over
+	// exactly -- and there was nowhere in Go to put them, so they were dropped
+	// at the boundary.
+	//
+	// Everything that needs a scale was then derived from whatever money
+	// happened to be on the felt. MinRaise came out of the vision parser as
+	// twice the largest bet, so a frame with no bets on it made the minimum
+	// zero and a chart open collapsed to five chips at blinds of 1000/2000.
+	// And a spot cannot be told from a raised pot without knowing what an
+	// unraised one costs.
+	//
+	// Zero means unknown, and nothing may be inferred from that: at a big
+	// blind of 0.1 every real wager is smaller than 1, so inventing a floor
+	// destroys a micro table outright.
+	SmallBlind float64 `json:"small_blind"`
+	BigBlind   float64 `json:"big_blind"`
+
 	CommunityCards []Card         `json:"community_cards"`
 	HeroID         string         `json:"hero_id"`
 	HeroCards      [2]Card        `json:"hero_cards"`

@@ -221,3 +221,49 @@ func (o observerFunc) OnHandEnd(r HandResult) {
 		o.end(r)
 	}
 }
+
+// The stake has to reach the state the tool decides on, or two rules that
+// depend on it are never exercised here: the preflop spot is classified by
+// money against the big blind, and a chart open is sized from it. Both fall
+// silent at zero, so their absence looks exactly like their working.
+func TestSpotStateCarriesTheStake(t *testing.T) {
+	cfg := DefaultConfig()
+	var seen []table.HandState
+	probe := &spyAgent{onAct: func(s Spot) { seen = append(seen, s.State) }}
+
+	players := []*Player{
+		{ID: "hero", Name: "hero", Agent: probe, Stack: 10000},
+		{ID: "a", Name: "a", Agent: CallBot{}, Stack: 10000},
+		{ID: "b", Name: "b", Agent: CallBot{}, Stack: 10000},
+	}
+	tb := NewTable("t", cfg, players, rand.New(rand.NewSource(1)))
+	for i := 0; i < 20; i++ {
+		tb.PlayHand()
+	}
+
+	if len(seen) == 0 {
+		t.Fatal("the probe never acted")
+	}
+	for i, st := range seen {
+		if st.BigBlind <= 0 {
+			t.Fatalf("decision %d: BigBlind = %v, want the table's stake", i, st.BigBlind)
+		}
+		if st.SmallBlind <= 0 {
+			t.Fatalf("decision %d: SmallBlind = %v", i, st.SmallBlind)
+		}
+		if st.SmallBlind >= st.BigBlind {
+			t.Fatalf("decision %d: blinds %v/%v", i, st.SmallBlind, st.BigBlind)
+		}
+	}
+}
+
+type spyAgent struct{ onAct func(Spot) }
+
+func (spyAgent) Name() string { return "spy" }
+func (a *spyAgent) Act(s Spot) Move {
+	a.onAct(s)
+	if s.ToCall > 0 {
+		return Move{Action: table.ActionFold}
+	}
+	return Move{Action: table.ActionCheck}
+}

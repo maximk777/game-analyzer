@@ -16,7 +16,7 @@ struct ParseImageTool {
     static func main() {
         let args = CommandLine.arguments
         guard args.count >= 2 else {
-            FileHandle.standardError.write("usage: parse_image <image.png> [--dump <dir>] [--verbose] [--title <window title>] [--amount <text>...]\n".data(using: .utf8)!)
+            FileHandle.standardError.write("usage: parse_image <image.png> [--dump <dir>] [--verbose] [--texts] [--title <window title>] [--amount <text>...]\n".data(using: .utf8)!)
             exit(2)
         }
 
@@ -39,6 +39,15 @@ struct ParseImageTool {
                 i += 2
             case "--verbose":
                 verbose = true
+                i += 1
+            case "--texts":
+                textSink = { text, box in
+                    FileHandle.standardError.write(
+                        String(format: "text %-24s x=%.3f y=%.3f w=%.3f h=%.3f\n",
+                               (text as NSString).utf8String!, box.midX, box.midY, box.width, box.height)
+                            .data(using: .utf8)!)
+                }
+                i += 1
             case "--amount":
                 // Reads one amount the way a frame's text would be read, so a
                 // stake or a pot that comes back wrong can be checked without a

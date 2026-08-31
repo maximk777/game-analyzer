@@ -71,26 +71,45 @@ func findPokerWindowID() -> (id: Int, title: String)? {
     return nil
 }
 
+/// Captures one window through the screencapture tool.
+///
+/// screencapture cannot write to standard output. Its usage line is
+/// `screencapture [-options] [files]`, and a trailing "-" is taken as a file
+/// named "-" rather than as a stream -- so the previous version wrote a PNG
+/// into the working directory under that name and then read an empty pipe. It
+/// could not return an image under any circumstances, and it left the stray
+/// file behind on every call. The same mistake was in the Go grabber, where it
+/// was on a live path.
+///
+/// Nothing in the Makefile builds this file; the agent that runs captures
+/// through ScreenCaptureKit instead. It is corrected rather than left as it
+/// was because a wrong pattern sitting in the repository is how the wrong
+/// pattern spreads.
 func captureWindowImage(windowID: Int) -> CGImage? {
-    let pipe = Pipe()
+    let path = NSTemporaryDirectory() + "poker-rta-frame-\(UUID().uuidString).png"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    proc.arguments = ["-l\(windowID)", "-x", "-o", "-tpng", "-"]
-    proc.standardOutput = pipe
+    proc.arguments = ["-l\(windowID)", "-x", "-o", "-tpng", path]
     proc.standardError = FileHandle.nullDevice
-    
+
     do {
         try proc.run()
         proc.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let nsImg = NSImage(data: data),
-              let cgImg = nsImg.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return nil
-        }
-        return cgImg
     } catch {
         return nil
     }
+
+    // screencapture exits zero whether or not it captured anything -- a window
+    // that has gone, or no screen-recording permission, both leave no file --
+    // so the file is the only evidence that it worked.
+    guard let data = FileManager.default.contents(atPath: path), !data.isEmpty,
+          let nsImg = NSImage(data: data),
+          let cgImg = nsImg.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        return nil
+    }
+    return cgImg
 }
 
 func analyzeTableImage(cgImg: CGImage, title: String) -> ParsedTableState {

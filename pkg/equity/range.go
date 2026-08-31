@@ -2,6 +2,7 @@ package equity
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -562,3 +563,47 @@ func HandPercentile(hole [2]table.Card) float64 {
 	}
 	return float64(idx) / float64(handRankN)
 }
+
+// TopRange is the strongest `percent` of starting hands, built once and shared.
+//
+// Ranges used to be described by a handful of numbers -- a player's VPIP, or a
+// hundred -- and parsing one per decision cost nothing. Now that a range is
+// narrowed by position and by every action in the hand, the widths are
+// continuous and a decision asks for several of them, so the same string was
+// being reparsed into thirteen hundred combinations thousands of times a second.
+//
+// The width is rounded to whole percentage points, which is far finer than any
+// read behind it justifies and keeps the table to a hundred entries. The Range
+// returned is shared and must not be mutated; nothing in this package does.
+func TopRange(percent float64) Range {
+	w := int(math.Round(percent))
+	if w >= 100 {
+		w = 100
+	}
+	if w < 1 {
+		w = 1
+	}
+
+	topRangeMu.RLock()
+	r, ok := topRangeCache[w]
+	topRangeMu.RUnlock()
+	if ok {
+		return r
+	}
+
+	spec := "random"
+	if w < 100 {
+		spec = fmt.Sprintf("top%d%%", w)
+	}
+	r = ParseRange(spec)
+
+	topRangeMu.Lock()
+	topRangeCache[w] = r
+	topRangeMu.Unlock()
+	return r
+}
+
+var (
+	topRangeMu    sync.RWMutex
+	topRangeCache = map[int]Range{}
+)

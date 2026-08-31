@@ -12,7 +12,6 @@
 package advice
 
 import (
-	"fmt"
 	"math/rand"
 	"time"
 
@@ -53,6 +52,25 @@ type Options struct {
 	// Rng makes a run reproducible. Nil seeds from the clock, which is what the
 	// live path wants and what a harness cannot use.
 	Rng *rand.Rand
+
+	// ActionRanges narrows each opponent's range by what they have done this
+	// hand -- position, the raises they made, the streets they continued on --
+	// instead of holding it at their VPIP for the whole hand and at the whole
+	// deck when nothing is known about them. See ranges.go.
+	//
+	// It is a switch only so that the two can be measured against each other on
+	// the same decks. See docs/HARNESS.md.
+	ActionRanges bool
+
+	// SizingPolicy decides which bet sizes exist in a spot from the board and
+	// the stack-to-pot ratio, rather than letting the one-street expected-value
+	// comparison pick from a fixed list it systematically overprices the top of.
+	// See pkg/advisor/sizing.go. A switch for the same reason.
+	SizingPolicy bool
+
+	// SemiBluff lets a hand with outs bet without a counted read on every
+	// opponent at the table. See advisor.Inputs.AllowSemiBluff.
+	SemiBluff bool
 }
 
 const (
@@ -135,8 +153,16 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 				oppTendencies = t
 			}
 		}
-		if w, ok := reads.RangeWidth[seat.PlayerID]; ok && w > 0 {
-			width = w
+		vpip, hasVPIP := reads.RangeWidth[seat.PlayerID]
+		hasVPIP = hasVPIP && vpip > 0
+		if hasVPIP {
+			width = vpip
+		}
+		// What they have done this hand, which is a fact about this hand and
+		// not about the player, and so is available whether or not anybody has
+		// ever seen them before.
+		if opt.ActionRanges {
+			width = RangeWidthFor(*h, seat, vpip, hasVPIP)
 		}
 		rangeWidths = append(rangeWidths, width)
 
@@ -157,15 +183,7 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 	rangesAt := func(frac float64) []equity.Range {
 		out := make([]equity.Range, 0, len(rangeWidths))
 		for _, w := range rangeWidths {
-			narrowed := w * frac
-			if narrowed >= 100 {
-				out = append(out, equity.ParseRange("random"))
-				continue
-			}
-			if narrowed < 1 {
-				narrowed = 1
-			}
-			out = append(out, equity.ParseRange(fmt.Sprintf("top%.0f%%", narrowed)))
+			out = append(out, equity.TopRange(w*frac))
 		}
 		return out
 	}
@@ -248,6 +266,9 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 		Opponents:     oppReads,
 		EquityVsTop:   equityVsTop,
 		Risk:          risk,
+
+		UseSizingPolicy: opt.SizingPolicy,
+		AllowSemiBluff:  opt.SemiBluff,
 	}
 
 	advice := advisor.Calculate(in)

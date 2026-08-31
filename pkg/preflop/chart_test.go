@@ -215,3 +215,77 @@ func TestChartWidths(t *testing.T) {
 		t.Logf("%-3s %-14s raise %5.1f%%  play %5.1f%%", c.pos, c.sit, r, total)
 	}
 }
+
+// A player who calls an all-in wears the same "call" badge as a player who
+// limps. Counting badges alone, the pot came out unraised -- and an unraised
+// pot is where the small blind completes for a fraction of what it is already
+// invested in, with almost anything.
+//
+// Live on 2026-08-31, hero held 6c2d in the small blind. Dukex1701 was all-in
+// for 188,440 and prey78 had called it; the all-in player's seat had been lost,
+// so the only badge left said "call". The tool advised calling off 184,800 with
+// 11.5% equity against the 32.9% it had itself printed as required.
+func TestSituationOf_ACalledAllInIsARaisedPot(t *testing.T) {
+	state := table.HandState{
+		HeroID: "hero", BigBlind: 2000, SmallBlind: 1000,
+		Seats: []table.SeatState{
+			{PlayerID: "hero", Position: table.PosSB, CurrentBet: 1000},
+			// The badge says "call"; the money says 94 big blinds.
+			{PlayerID: "prey78", CurrentBet: 188440, LastAction: "call"},
+			{PlayerID: "mature", CurrentBet: 0, LastAction: "fold", IsFolded: true},
+		},
+	}
+	if got := SituationOf(state); got != FacingRaise {
+		t.Errorf("SituationOf = %q, want %q", got, FacingRaise)
+	}
+}
+
+// The money may only promote the spot, never invent a level that is not there:
+// one raise with three callers is a single raise, not a three-bet.
+func TestSituationOf_CallersOfOneRaiseAreNotAThreeBet(t *testing.T) {
+	state := table.HandState{
+		HeroID: "hero", BigBlind: 2000,
+		Seats: []table.SeatState{
+			{PlayerID: "hero", Position: table.PosBB, CurrentBet: 2000},
+			{PlayerID: "a", CurrentBet: 12000, LastAction: "call"},
+			{PlayerID: "b", CurrentBet: 12000, LastAction: "call"},
+			{PlayerID: "c", CurrentBet: 12000, LastAction: "call"},
+		},
+	}
+	if got := SituationOf(state); got != FacingRaise {
+		t.Errorf("SituationOf = %q, want %q", got, FacingRaise)
+	}
+}
+
+// Genuine limpers still make a limped pot: everybody in for exactly the big
+// blind is what that situation means, and the small blind's wide completing
+// range depends on telling the two apart.
+func TestSituationOf_LimpersAtTheBigBlindAreStillLimpers(t *testing.T) {
+	state := table.HandState{
+		HeroID: "hero", BigBlind: 2000,
+		Seats: []table.SeatState{
+			{PlayerID: "hero", Position: table.PosSB, CurrentBet: 1000},
+			{PlayerID: "a", CurrentBet: 2000, LastAction: "call"},
+			{PlayerID: "b", CurrentBet: 2000, LastAction: "call"},
+		},
+	}
+	if got := SituationOf(state); got != FacingLimpers {
+		t.Errorf("SituationOf = %q, want %q", got, FacingLimpers)
+	}
+}
+
+// With no stake read there is no scale, and the money rule does nothing. This
+// is the same discipline the wager reader follows: at a big blind of 0.1 every
+// real wager is below 1, so a floor cannot be invented.
+func TestSituationOf_WithoutBlindsTheMoneyRuleIsSilent(t *testing.T) {
+	state := table.HandState{
+		HeroID: "hero",
+		Seats: []table.SeatState{
+			{PlayerID: "hero", Position: table.PosSB, CurrentBet: 1000},
+			{PlayerID: "a", CurrentBet: 188440, LastAction: "call"},
+		},
+	}
+	if got := SituationOf(state); got != FacingLimpers {
+		t.Errorf("SituationOf = %q, want %q without a known big blind", got, FacingLimpers)
+	}
+}

@@ -694,3 +694,270 @@ func TestStateStabilizer_ActionsAlreadyOnScreenWhenTheHandStarts(t *testing.T) {
 		t.Errorf("badges were recorded more than once: %v", got.ActionHistory)
 	}
 }
+
+// The screen reader names hero only on the frames where hero's hole cards
+// actually read; on every other frame it sends the placeholder, which matches
+// no seat. Hero's chair does not move when hero's cards stop being legible, so
+// the identity has to survive those frames.
+//
+// This is the defect the harness priced highest of the seven -- about
+// 50 bb/100 -- because losing the seat loses hero's position and hero's stack
+// at once: the preflop chart falls silent and the effective stack is taken from
+// whoever else is at the table.
+func TestStateStabilizer_HeroIdentitySurvivesUnreadableHoleCards(t *testing.T) {
+	st := NewStateStabilizer()
+
+	seats := func() []SeatState {
+		return []SeatState{
+			{PlayerID: "ludoStarik", PlayerName: "ludoStarik", Stack: 67940, Position: PosCO},
+			{PlayerID: "Rafidamage", PlayerName: "Rafidamage", Stack: 1190000, Position: PosBTN},
+		}
+	}
+
+	// A frame where hero's cards read: the reader can name the seat.
+	named := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 4920,
+		HeroID: "ludoStarik", Seats: seats(),
+	})
+	if named.HeroID != "ludoStarik" {
+		t.Fatalf("HeroID = %q on a frame that named hero", named.HeroID)
+	}
+
+	// The next frame could not read them -- hero folded, or a card was mid
+	// animation -- so the placeholder arrives instead.
+	blind := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 4920,
+		HeroID: "Hero", Seats: seats(),
+	})
+	if blind.HeroID != "ludoStarik" {
+		t.Fatalf("HeroID = %q after the placeholder arrived, want it carried forward", blind.HeroID)
+	}
+
+	// The seat has to be findable, because that is the whole point: hero's
+	// stack and hero's position are read off it.
+	var found *SeatState
+	for i := range blind.Seats {
+		if blind.Seats[i].PlayerID == blind.HeroID {
+			found = &blind.Seats[i]
+		}
+	}
+	if found == nil {
+		t.Fatal("hero id matches no seat, so stack and position are both unreadable")
+	}
+	if found.Stack != 67940 {
+		t.Errorf("hero stack = %v, want hero's own 67940", found.Stack)
+	}
+	if found.Position != PosCO {
+		t.Errorf("hero position = %q, want CO", found.Position)
+	}
+}
+
+// Hero keeps their seat across a hand boundary. The reader only names hero once
+// the hole cards read, which is a beat or two into preflop -- so without this
+// every hand opens with hero unidentified, in the street where the chart
+// matters most.
+func TestStateStabilizer_HeroIdentitySurvivesTheNextDeal(t *testing.T) {
+	st := NewStateStabilizer()
+	c1, _ := ParseCard("Jh")
+	c2, _ := ParseCard("Td")
+	c3, _ := ParseCard("8s")
+
+	seats := func() []SeatState {
+		return []SeatState{
+			{PlayerID: "ludoStarik", Stack: 67940},
+			{PlayerID: "Rafidamage", Stack: 1190000},
+		}
+	}
+
+	st.Stabilize(&HandState{
+		TableID: "t", Street: StreetFlop, Pot: 65600, HeroID: "ludoStarik",
+		CommunityCards: []Card{c1, c2, c3}, Seats: seats(),
+	})
+
+	// Board cleared and the pot shrank: the next hand has been dealt, and the
+	// reader has not managed to read hero's cards yet.
+	next := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 3000, HeroID: "Hero",
+		Seats: seats(),
+	})
+	if next.HeroID != "ludoStarik" {
+		t.Fatalf("HeroID = %q on the first frame of the next hand", next.HeroID)
+	}
+}
+
+// Carried forward only while that player is still at the table. Somebody who
+// gets up must not leave their name on hero, or the next person in the chair
+// inherits hero's identity along with it.
+func TestStateStabilizer_HeroIdentityIsNotCarriedToAnEmptyChair(t *testing.T) {
+	st := NewStateStabilizer()
+	c1, _ := ParseCard("Jh")
+	c2, _ := ParseCard("Td")
+	c3, _ := ParseCard("8s")
+
+	st.Stabilize(&HandState{
+		TableID: "t", Street: StreetFlop, Pot: 65600, HeroID: "ludoStarik",
+		CommunityCards: []Card{c1, c2, c3},
+		Seats: []SeatState{
+			{PlayerID: "ludoStarik", Stack: 67940},
+			{PlayerID: "Rafidamage", Stack: 1190000},
+		},
+	})
+
+	// Hero busted and got up; a stranger took the chair; the next hand is dealt
+	// and the reader cannot name hero.
+	gone := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 3000, HeroID: "Hero",
+		Seats: []SeatState{
+			{PlayerID: "newcomer", Stack: 80000},
+			{PlayerID: "Rafidamage", Stack: 1190000},
+		},
+	})
+	if gone.HeroID == "ludoStarik" {
+		t.Error("hero's name was carried to a table hero has left")
+	}
+	if gone.HeroID == "newcomer" {
+		t.Error("hero's identity was handed to whoever took the chair")
+	}
+}
+
+// A real name on the frame always wins. The carry-forward is a fallback for the
+// placeholder, not a lock on the first identity ever seen.
+func TestStateStabilizer_HeroIdentityYieldsToANamedFrame(t *testing.T) {
+	st := NewStateStabilizer()
+	seats := []SeatState{
+		{PlayerID: "ludoStarik", Stack: 67940},
+		{PlayerID: "Rafidamage", Stack: 1190000},
+	}
+	st.Stabilize(&HandState{TableID: "t", Street: StreetPreflop, Pot: 100, HeroID: "ludoStarik", Seats: seats})
+	moved := st.Stabilize(&HandState{TableID: "t", Street: StreetPreflop, Pot: 100, HeroID: "Rafidamage", Seats: seats})
+	if moved.HeroID != "Rafidamage" {
+		t.Fatalf("HeroID = %q, want the name the frame carried", moved.HeroID)
+	}
+}
+
+// Nothing to carry forward yet: a session that opens on the placeholder must
+// not invent a hero, because a spectator view has none.
+func TestStateStabilizer_NoHeroInventedOnTheFirstFrame(t *testing.T) {
+	st := NewStateStabilizer()
+	first := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 100, HeroID: "Hero",
+		Seats: []SeatState{{PlayerID: "a", Stack: 1}, {PlayerID: "b", Stack: 2}},
+	})
+	if seatedIn(first.Seats, first.HeroID) {
+		t.Fatalf("HeroID = %q matched a seat with nothing to carry forward", first.HeroID)
+	}
+}
+
+// A hand ends on the river and the next one is dealt with the same pot.
+//
+// The board clearing used to need a shrinking pot to confirm it, and "less
+// than" is false on equal numbers. Live on 2026-09-01 a hand ended on the river
+// with a pot of 8,920; the next hand's blinds and limps came to the same 8,920;
+// the old hand never ended. Hero had folded it, so the guard against advising a
+// folded hand silenced the panel for the whole of the following hand -- while
+// hero sat looking at Fold / Call 2,000 / Raise 4,000 and a running clock.
+func TestStateStabilizer_NewHandWhenTheBoardClearsAndThePotDoesNot(t *testing.T) {
+	st := NewStateStabilizer()
+	j, _ := ParseCard("Jh")
+	two, _ := ParseCard("2d")
+	jd, _ := ParseCard("Jd")
+	six, _ := ParseCard("6h")
+	ace, _ := ParseCard("As")
+
+	seats := func(folded bool) []SeatState {
+		return []SeatState{
+			{PlayerID: "ludoStarik", Stack: 184160, IsFolded: folded},
+			{PlayerID: "prey78", Stack: 1160000},
+		}
+	}
+
+	river := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetRiver, Pot: 8920,
+		CommunityCards: []Card{j, two, jd, six, ace},
+		HeroID:         "ludoStarik", Seats: seats(true),
+	})
+	if len(river.CommunityCards) != 5 {
+		t.Fatalf("board on the river: %d cards", len(river.CommunityCards))
+	}
+
+	// The next hand, dealt to exactly the same pot.
+	next := &HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 8920,
+		HeroID: "ludoStarik", Seats: seats(false),
+	}
+	first := st.Stabilize(next)
+	if len(first.CommunityCards) != 0 {
+		// One frame of confirmation is allowed; the board must not come back.
+		t.Logf("first frame still carries %d board cards", len(first.CommunityCards))
+	}
+
+	second := st.Stabilize(next)
+	if len(second.CommunityCards) != 0 {
+		t.Errorf("board still %d cards two frames into the next hand", len(second.CommunityCards))
+	}
+	if second.Street != StreetPreflop {
+		t.Errorf("street = %q, want preflop", second.Street)
+	}
+	// The decisive one: hero's fold belonged to the hand that ended.
+	for _, s := range second.Seats {
+		if s.PlayerID == "ludoStarik" && s.IsFolded {
+			t.Error("hero is still folded in the next hand, so no advice will be given in it")
+		}
+	}
+}
+
+// The pot shrinking still ends the hand on the first frame. Waiting for a
+// second one in the common case would cost a frame of advice at every deal.
+func TestStateStabilizer_ShrinkingPotEndsTheHandAtOnce(t *testing.T) {
+	st := NewStateStabilizer()
+	j, _ := ParseCard("Jh")
+	two, _ := ParseCard("2d")
+	jd, _ := ParseCard("Jd")
+
+	st.Stabilize(&HandState{
+		TableID: "t", Street: StreetFlop, Pot: 65600,
+		CommunityCards: []Card{j, two, jd},
+		HeroID:         "hero", Seats: []SeatState{{PlayerID: "hero", Stack: 100}},
+	})
+	next := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetPreflop, Pot: 3000,
+		HeroID: "hero", Seats: []SeatState{{PlayerID: "hero", Stack: 100}},
+	})
+	if len(next.CommunityCards) != 0 {
+		t.Errorf("board carried into the next hand: %d cards", len(next.CommunityCards))
+	}
+}
+
+// A single frame that reads no board at all is a dropout, not a new hand. This
+// is what the confirmation is for, and it is why the board rule cannot fire on
+// one frame without a shrinking pot to corroborate it.
+func TestStateStabilizer_SingleBoardDropoutIsNotANewHand(t *testing.T) {
+	st := NewStateStabilizer()
+	j, _ := ParseCard("Jh")
+	two, _ := ParseCard("2d")
+	jd, _ := ParseCard("Jd")
+	board := []Card{j, two, jd}
+
+	st.Stabilize(&HandState{
+		TableID: "t", Street: StreetFlop, Pot: 8920,
+		CommunityCards: board,
+		HeroID:         "hero", Seats: []SeatState{{PlayerID: "hero", Stack: 100}},
+	})
+	// The recogniser misses the board for one frame; the pot is unchanged.
+	dropped := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetFlop, Pot: 8920,
+		HeroID: "hero", Seats: []SeatState{{PlayerID: "hero", Stack: 100}},
+	})
+	if len(dropped.CommunityCards) != 3 {
+		t.Fatalf("a one-frame dropout ended the hand: board is %d cards", len(dropped.CommunityCards))
+	}
+	// And the board coming back withdraws the pending transition.
+	back := st.Stabilize(&HandState{
+		TableID: "t", Street: StreetFlop, Pot: 8920,
+		CommunityCards: board,
+		HeroID:         "hero", Seats: []SeatState{{PlayerID: "hero", Stack: 100}},
+	})
+	if len(back.CommunityCards) != 3 {
+		t.Errorf("board after recovery: %d cards", len(back.CommunityCards))
+	}
+}

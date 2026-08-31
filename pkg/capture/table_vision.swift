@@ -1207,7 +1207,19 @@ func writePNG(_ img: CGImage, to url: URL) {
 
 // MARK: - Amount parsing
 
-func parseAmount(_ str: String) -> Double {
+/// Parses an amount, or nil when the text is not a number at all.
+///
+/// The distinction exists for exactly one value: zero. An all-in player's
+/// nameplate reads "0", and a seat is only recognised when a number is found
+/// directly beneath the name -- so folding "not a number" and "the number zero"
+/// into the same result deleted every all-in opponent from the table.
+///
+/// Live on 2026-08-31 hero held 5s3s in the small blind facing an all-in of
+/// 28,560. The client's button said "Call 27,560"; the tool said "Call 1,000",
+/// because the all-in player was not in the seat list and the largest bet it
+/// could see was the big blind. The same frame under-counted the field, which
+/// is what multiway equity is computed against.
+func parsedAmount(_ str: String) -> Double? {
     var clean = str.replacingOccurrences(of: "Pot", with: "")
                    .replacingOccurrences(of: "pot", with: "")
                    .replacingOccurrences(of: "POT", with: "")
@@ -1228,19 +1240,47 @@ func parseAmount(_ str: String) -> Double {
     }
     clean = clean.replacingOccurrences(of: ",", with: "")
 
+    // Trailing letters are peeled off one at a time, honouring a k or m as the
+    // multiplier and discarding anything else as recogniser noise.
+    //
+    // A chip graphic sitting against the text is read as a letter: the all-in
+    // wager of 1,420,000 came back as "1.42MR", and one stray character turned
+    // the largest bet on the table into no number at all. Two characters is the
+    // limit -- enough for a suffix plus a smudge, not enough to make a word into
+    // a number, so "ALL-IN" and "CALL" still parse as nothing.
     var multiplier = 1.0
     var numStr = clean
-    if numStr.lowercased().hasSuffix("k") {
-        multiplier = 1000.0
+    var peeled = 0
+    while peeled < 2, let last = numStr.last, last.isLetter {
+        switch Character(last.lowercased()) {
+        case "k":
+            multiplier = 1000.0
+        case "m":
+            multiplier = 1000000.0
+        default:
+            break
+        }
         numStr = String(numStr.dropLast())
-    } else if numStr.lowercased().hasSuffix("m") {
-        multiplier = 1000000.0
-        numStr = String(numStr.dropLast())
+        peeled += 1
+        if Double(numStr) != nil { break }
     }
-    return (Double(numStr) ?? 0.0) * multiplier
+    guard let value = Double(numStr) else { return nil }
+    return value * multiplier
+}
+
+/// parseAmount is parsedAmount for the callers that cannot act on the
+/// difference: a missing number and a zero are both "no money here".
+func parseAmount(_ str: String) -> Double {
+    return parsedAmount(str) ?? 0.0
 }
 
 // MARK: - Whole-table analysis
+
+/// textSink, when set, receives every string the recogniser returned, before any
+/// of it is classified into names, numbers or badges. It exists because the
+/// classification is where seats are lost, and "the recogniser never saw it" and
+/// "the classifier threw it away" need very different fixes.
+var textSink: ((String, CGRect) -> Void)?
 
 func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> ParsedTableState {
     var texts: [(text: String, box: CGRect)] = []
@@ -1258,6 +1298,10 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
 
     let handler = VNImageRequestHandler(cgImage: cgImg, options: [:])
     try? handler.perform([request])
+
+    if let sink = textSink {
+        for t in texts { sink(t.text, t.box) }
+    }
 
     // The window title, which the system hands over exactly, is a better source
     // for both the table's identity and its blinds than a text recognition pass
@@ -1347,8 +1391,13 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
             }
         }
 
-        let numVal = parseAmount(t)
-        let isPureNumber = numVal > 0 && !lower.contains("pot") && !lower.contains("nlh") && !lower.contains("plo")
+        // A read zero counts as a number. It is the one value that separates an
+        // all-in player from no player at all: their stack is rendered as "0",
+        // and a nameplate with no number under it is not treated as a seat.
+        let parsedNum = parsedAmount(t)
+        let numVal = parsedNum ?? 0.0
+        let isPureNumber = parsedNum != nil && numVal >= 0
+            && !lower.contains("pot") && !lower.contains("nlh") && !lower.contains("plo")
         if isPureNumber && b.size.height < 0.06 {
             numberItems.append((val: numVal, box: b))
         } else if looksLikeSeatName(t)
@@ -1431,10 +1480,28 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
                 }
             }
         }
-        guard foundStack else { continue }
-        usedAsStack.insert(stackKey(closestNum))
-
         let badge = badgeForSeat(nameBox: nameItem.box, candidates: seatBadges)
+
+        // A nameplate needs a number under it to count as a seat, because that
+        // is what separates a player from interface text -- live captures
+        // offered "Play Next Game", "9 OUTS" and "V X/F" as players.
+        //
+        // An all-in badge is the same quality of evidence, and it has to be,
+        // because an all-in player is exactly the one whose number cannot be
+        // read: their stack is a lone "0", and the recogniser does not return
+        // single digits at this size. So the seat vanished at the one moment it
+        // mattered most. Live on 2026-09-01 hero held 3h2d in the big blind
+        // facing an all-in of 1,420,000 and was told to check, because with
+        // that seat gone the largest bet on the table was the big blind hero
+        // had already posted.
+        //
+        // Interface chrome does not carry a fold or all-in badge, so this
+        // widens what counts as a seat without reopening the door the number
+        // requirement closed.
+        guard foundStack || badge == "all-in" else { continue }
+        if foundStack {
+            usedAsStack.insert(stackKey(closestNum))
+        }
 
         players.append(ParsedSeat(
             seat_number: seatIndex(for: nameItem.box),

@@ -38,6 +38,10 @@ type StateStabilizer struct {
 	pendingHero     [2]Card
 	pendingHeroSeen int
 
+	// A board never shrinks within a hand, so a board that has gone is the next
+	// hand -- confirmed the same way, by surviving into the following frame.
+	pendingBoardClearSeen int
+
 	// Events observed but not yet taken. The stabiliser is where the action
 	// stream is derived, so it is the only place that knows an action is new
 	// rather than the same badge seen again; anything downstream would have to
@@ -274,6 +278,18 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		if len(st.Seats) == 0 {
 			st.Seats = append([]SeatState(nil), prev.Seats...)
 		}
+		// A showdown is where the hand record is built, and a record whose hero
+		// is the placeholder attributes the result to nobody.
+		if !seatedIn(st.Seats, st.HeroID) && seatedIn(st.Seats, prev.HeroID) {
+			st.HeroID = prev.HeroID
+		}
+		// The stake is a property of the table, not of the hand.
+		if st.SmallBlind == 0 {
+			st.SmallBlind = prev.SmallBlind
+		}
+		if st.BigBlind == 0 {
+			st.BigBlind = prev.BigBlind
+		}
 		s.currentHand = st
 		s.lastUpdateAt = now
 		return s.currentHand
@@ -288,11 +304,31 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		isNewHand = true
 	case prev.Street == StreetShowdown && raw.Street != StreetShowdown:
 		isNewHand = true
-	case len(prev.CommunityCards) > 0 && len(raw.CommunityCards) == 0 && raw.Pot < prev.Pot:
-		// The board was cleared and the pot shrank. Thresholds on the absolute
-		// pot size are deliberately avoided: they are stake-dependent and were
-		// wrong at anything but the stake they were tuned at.
-		isNewHand = true
+	case len(prev.CommunityCards) > 0 && len(raw.CommunityCards) == 0:
+		// The board was cleared. Thresholds on the absolute pot size are
+		// deliberately avoided: they are stake-dependent and were wrong at
+		// anything but the stake they were tuned at.
+		//
+		// A shrinking pot confirms it immediately. It is not required, though,
+		// and requiring it was a live freeze: a hand ended on the river with a
+		// pot of 8,920, the next hand's blinds and limps came to the same 8,920,
+		// and "less than" is false on equal numbers. The old hand stayed in
+		// progress -- hero had folded it, so the guard against advising a folded
+		// hand silenced the panel for the whole of the next one, while hero sat
+		// with a live decision and a running clock.
+		//
+		// Without the pot, the board clearing is confirmed the way every other
+		// transition here is confirmed: by surviving one more frame. That costs
+		// a frame against a vision dropout that reads no board at all, and a
+		// dropout is exactly what the confirmation is there to absorb.
+		if raw.Pot < prev.Pot {
+			isNewHand = true
+		} else {
+			s.pendingBoardClearSeen++
+			if s.pendingBoardClearSeen >= 2 {
+				isNewHand = true
+			}
+		}
 	case heroCardsBothKnown(prev.HeroCards) && heroCardsBothKnown(raw.HeroCards) && !sameHoleCards(prev.HeroCards, raw.HeroCards):
 		// Hero was dealt different cards, so this is the next hand -- but only
 		// once the same different cards have been seen twice.
@@ -322,6 +358,9 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 			s.pendingHeroSeen = 0
 		}
 	}
+	if len(raw.CommunityCards) > 0 {
+		s.pendingBoardClearSeen = 0
+	}
 
 	// A pot only grows within a hand, so a pot that shrinks means the next hand
 	// has begun. This is the only signal available when a hand ends before the
@@ -345,6 +384,7 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		s.pendingPotSeen = 0
 		s.pendingHero = [2]Card{}
 		s.pendingHeroSeen = 0
+		s.pendingBoardClearSeen = 0
 
 		// The hand that was in progress is now over. Handing it back is the
 		// only end-of-hand signal this pipeline has.
@@ -358,6 +398,16 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		s.mintHandID(st)
 		if st.Street == "" {
 			st.Street = streetForBoard(len(st.CommunityCards))
+		}
+
+		// Hero does not become a different person between hands at the same
+		// table. Without this the identity is rebuilt from the raw frame every
+		// deal, and the raw frame only names hero once the hole cards read --
+		// which is a beat or two into preflop, exactly where the chart matters
+		// most and where losing hero's position silently hands the decision to
+		// the expected-value comparison.
+		if !seatedIn(st.Seats, st.HeroID) && seatedIn(st.Seats, prev.HeroID) {
+			st.HeroID = prev.HeroID
 		}
 
 		// Badges already on the nameplates when the hand is recognised are
@@ -506,6 +556,8 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		Pot:            mergedPot,
 		CurrentBet:     raw.CurrentBet,
 		MinRaise:       raw.MinRaise,
+		SmallBlind:     raw.SmallBlind,
+		BigBlind:       raw.BigBlind,
 		CommunityCards: mergedBoard,
 		HeroID:         raw.HeroID,
 		HeroCards:      mergedHero,
@@ -522,7 +574,22 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 		mergedState.TableID = prev.TableID
 	}
 
-	if mergedState.HeroID == "" {
+	// The stake does not change between frames of a hand, and the title it is
+	// read from is not always readable. Measured over a recorded session, blinds
+	// resolved on 1028 frames out of 9788 -- nine frames in ten ran with no idea
+	// of the stake, and each one of those was a frame with no scale to size or
+	// classify anything by.
+	if mergedState.SmallBlind == 0 {
+		mergedState.SmallBlind = prev.SmallBlind
+	}
+	if mergedState.BigBlind == 0 {
+		mergedState.BigBlind = prev.BigBlind
+	}
+
+	// Hero's identity is sticky across frames, the same way the hand id is: the
+	// placeholder counts as no id at all rather than as a name, which is why
+	// the carry-forward below never used to fire.
+	if !seatedIn(mergedState.Seats, mergedState.HeroID) && seatedIn(mergedState.Seats, prev.HeroID) {
 		mergedState.HeroID = prev.HeroID
 	}
 
@@ -543,6 +610,36 @@ func (s *StateStabilizer) Reset() {
 // placeholderHandID is what the vision agent emits before a real hand id is
 // known; it must never be treated as a hand changing.
 const placeholderHandID = "live-hand"
+
+// placeholderHeroID is what the vision agent emits when it could not say which
+// seat is hero's; like the hand id placeholder it counts as no id at all.
+//
+// The screen reader names hero only on frames where hero's hole cards actually
+// read, because that is how it distinguishes sitting at a table from watching
+// one. Hero's chair does not move when hero's cards stop being legible, and
+// they stop constantly: a folded hand, a card mid-animation, a corner behind
+// the position badge. In the session of 2026-08-31 the placeholder arrived on
+// 79% of frames, and each one cost hero's position and hero's stack at once --
+// no seat matched, so the preflop chart had no opinion and the effective stack
+// was taken from whoever else was at the table, once reading 1,190,000 against
+// hero's real 68,000. Measured in the harness that is worth about 50 bb/100,
+// more than the other six screen-reader defects put together.
+const placeholderHeroID = "Hero"
+
+// seatedIn reports whether a player is at the table. Hero's identity is carried
+// between frames only while this holds, or hero would keep the name of whoever
+// used to sit in that chair.
+func seatedIn(seats []SeatState, id string) bool {
+	if id == "" || id == placeholderHeroID {
+		return false
+	}
+	for _, s := range seats {
+		if s.PlayerID == id {
+			return true
+		}
+	}
+	return false
+}
 
 func streetForBoard(cards int) Street {
 	switch {

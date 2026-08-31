@@ -67,7 +67,16 @@ type RunConfig struct {
 	// Warmup hands are played and discarded before recording, so that a
 	// strategy relying on reads is not measured over the orbit it spent
 	// gathering them.
-	Warmup  int
+	Warmup int
+	// Workers is the parallel width, defaulting to every core.
+	//
+	// It is also the memory knob, and that is not obvious from here: each
+	// worker holds a whole Result while it runs, and a Result keeps every bet
+	// size the strategy made, per street, for the hands it played. Width times
+	// hands times candidates is what is resident, so a run wide enough to fill
+	// eleven cores at a thousand hands a lineup across six candidates was
+	// killed outright rather than merely slowed. Lowering this is what fixes
+	// that; lowering the hand count would fix it by measuring less.
 	Workers int
 	Cfg     Config
 	// HeroStackBB, when set, gives hero a different stack from the field. The
@@ -124,6 +133,13 @@ type RunConfig struct {
 	// population. Used to ask "what does this strategy do against a table of
 	// regulars", which is a different question from "against the population".
 	Field []Opponent
+
+	// AllInEV scores a pot that went all-in with cards to come by the equity it
+	// had when the last chip went in, rather than by the card that came. The
+	// hand still plays out on the real runout and the stacks still move by what
+	// was really won; only the money the report is built from changes. See
+	// pkg/sim/allin_ev.go for why, and docs/HARNESS.md §3d.
+	AllInEV bool
 }
 
 // Report is everything the run measured.
@@ -139,6 +155,24 @@ type Result struct {
 	// Net per recorded hand, in big blinds, in a stable order: lineup-major,
 	// so the same index means the same deck for every candidate.
 	Nets []float64
+	// AdjNets is the same, with an all-in scored by the equity it had rather
+	// than by the card that came. Empty when the run was told not to adjust.
+	//
+	// Both are kept because the two questions want different ones, and the
+	// harness measured which is which. Adjusting cut the standard error on a
+	// candidate's own win rate by 11% -- 4.44 to 3.97 over 240,000 hands -- and
+	// widened the paired difference between two candidates by 8%, from 2.62 to
+	// 2.82.
+	//
+	// The reason is that the paired comparison already cancels the runout. When
+	// both candidates reach the same showdown on the same board their realised
+	// results are nearly identical and the difference collapses to almost
+	// nothing. Replacing each side with its own conditional expectation --
+	// taken at whatever street that candidate got the money in, which is not
+	// the same street for both -- throws that cancellation away.
+	//
+	// So the win rate is reported adjusted and the paired difference is not.
+	AdjNets []float64
 
 	Style   StyleReport
 	Buckets map[string]*Bucket
@@ -156,6 +190,9 @@ type Result struct {
 	// KnowledgeSum over decisions, for the average.
 	KnowledgeSum float64
 	Decisions    int
+	// Flips is how often the screen reader's noise changed this strategy's
+	// mind. Empty unless the candidate was seated with Noise.MeasureFlips.
+	Flips FlipReport
 
 	// Sessions is one entry per lineup when stacks are carried: what happened
 	// to hero's money over a whole sitting.
@@ -290,6 +327,7 @@ func Run(cfg RunConfig) Report {
 				continue
 			}
 			merged.Nets = append(merged.Nets, part.Nets...)
+			merged.AdjNets = append(merged.AdjNets, part.AdjNets...)
 			merged.Sizings = append(merged.Sizings, part.Sizings...)
 			if merged.SizingsBy == nil {
 				merged.SizingsBy = map[table.Street][]float64{}
@@ -300,6 +338,7 @@ func Run(cfg RunConfig) Report {
 			merged.NoAdvice += part.NoAdvice
 			merged.KnowledgeSum += part.KnowledgeSum
 			merged.Decisions += part.Decisions
+			merged.Flips.merge(part.Flips)
 			for k, v := range part.Phases {
 				if merged.Phases == nil {
 					merged.Phases = map[string]int{}
@@ -373,7 +412,10 @@ func runLineup(cfg RunConfig, lineup int, cand Candidate) *Result {
 	res := &Result{Label: cand.Label, Buckets: map[string]*Bucket{}}
 	res.Style.Actions = map[table.ActionType]int{}
 	res.Style.StreetActions = map[string]int{}
-	col := &collector{res: res, heroID: players[heroSeat].ID, bb: float64(cfg.Cfg.BigBlind)}
+	col := &collector{
+		res: res, heroID: players[heroSeat].ID,
+		bb: float64(cfg.Cfg.BigBlind), allInEV: cfg.AllInEV,
+	}
 
 	// Every agent that learns gets fed. Hero's tool shares the lineup tracker;
 	// a tool seated as an opponent brings its own, and must see the table too
@@ -466,6 +508,7 @@ func runLineup(cfg RunConfig, lineup int, cand Candidate) *Result {
 		res.Phases = t.Phases()
 		res.KnowledgeSum = t.MeanKnowledge() * float64(t.decisions)
 		res.Decisions = t.decisions
+		res.Flips = t.Flips()
 	}
 	return res
 }
@@ -517,6 +560,9 @@ type collector struct {
 	heroID    string
 	bb        float64
 	recording bool
+	// allInEV scores a pot that went all-in with cards to come by the equity it
+	// had rather than by the card that came. See allin_ev.go.
+	allInEV bool
 
 	// per-hand scratch
 	spots     map[string]bool
@@ -631,9 +677,22 @@ func (c *collector) OnHandEnd(r HandResult) {
 		c.reset()
 		return
 	}
+	// The realised chips decide the style flags: whether hero won this pot, and
+	// whether it was shown down, are facts about this hand. The money the report
+	// is built from is the all-in adjusted figure, which is the same number
+	// everywhere except on the runout of a pot that was already decided.
 	net := float64(r.Net[c.heroID]) / c.bb
+	money := net
+	if c.allInEV {
+		if adj, ok := r.AdjNet[c.heroID]; ok {
+			money = adj / c.bb
+		}
+	}
 	st := c.res
 	st.Nets = append(st.Nets, net)
+	if c.allInEV {
+		st.AdjNets = append(st.AdjNets, money)
+	}
 	st.Style.Hands++
 	if c.vpip {
 		st.Style.VPIPHands++
@@ -669,7 +728,7 @@ func (c *collector) OnHandEnd(r HandResult) {
 			st.Buckets[k] = b
 		}
 		b.Hands++
-		b.Net += net
+		b.Net += money
 	}
 	c.reset()
 }
@@ -702,18 +761,24 @@ func mergeStyle(dst *StyleReport, src StyleReport) {
 
 // BB100 is the win rate in big blinds per hundred hands, with the standard
 // error of that estimate.
+// BB100 is the win rate and its standard error.
+//
+// Measured on the all-in adjusted nets where the run produced them, because
+// this is the unpaired question -- what does this strategy win -- and there the
+// runout is pure noise with nothing to cancel it against. See Result.AdjNets.
 func (r *Result) BB100() (rate, stderr float64) {
-	n := float64(len(r.Nets))
+	nets := r.money()
+	n := float64(len(nets))
 	if n == 0 {
 		return 0, 0
 	}
 	var sum float64
-	for _, v := range r.Nets {
+	for _, v := range nets {
 		sum += v
 	}
 	mean := sum / n
 	var ss float64
-	for _, v := range r.Nets {
+	for _, v := range nets {
 		d := v - mean
 		ss += d * d
 	}
@@ -747,6 +812,48 @@ func (r *Result) PairedDiff(base *Result) (diff, stderr float64, ok bool) {
 	return mean * 100, sd / math.Sqrt(n) * 100, true
 }
 
+// money is the per-hand series the unpaired figures are built from: the all-in
+// adjusted nets when the run produced them, the realised ones otherwise.
+func (r *Result) money() []float64 {
+	if len(r.AdjNets) == len(r.Nets) && len(r.AdjNets) > 0 {
+		return r.AdjNets
+	}
+	return r.Nets
+}
+
+// Divergence is the share of hands on which this candidate and another ended up
+// with a different result, and how many that was.
+//
+// It is the number that says whether a run could ever have seen the change it
+// was measuring. The paired difference is exactly zero on every hand the two
+// candidates played alike, so those hands add nothing to the estimate and
+// nothing to its interval: the effective sample is not the hands played, it is
+// the hands they disagreed on. A change that touches one spot in a hundred
+// needs a run a hundred times longer to be seen at the same precision, and it
+// is much better to know that before the run than after it.
+//
+// It reads the results rather than the decisions, so it is available for any
+// pair of candidates at no cost. On identical decks, identical play produces an
+// identical net; a difference in the net means the hands went differently. The
+// converse does not hold -- two different lines can win the same amount -- so
+// this is a floor on the disagreement, which is the safe direction for a
+// warning about sample size.
+func (r *Result) Divergence(base *Result) (share float64, n int, ok bool) {
+	if base == nil || len(base.Nets) != len(r.Nets) || len(r.Nets) == 0 {
+		return 0, 0, false
+	}
+	mine, theirs := r.money(), base.money()
+	if len(mine) != len(theirs) {
+		mine, theirs = r.Nets, base.Nets
+	}
+	for i := range mine {
+		if math.Abs(mine[i]-theirs[i]) > 1e-9 {
+			n++
+		}
+	}
+	return float64(n) / float64(len(mine)), n, true
+}
+
 // LearningCurve is the win rate over the run, split into equal stretches of a
 // session.
 //
@@ -765,7 +872,7 @@ func (r *Result) LearningCurve(handsPerLineup, segments int) []float64 {
 	if per == 0 {
 		return nil
 	}
-	for i, v := range r.Nets {
+	for i, v := range r.money() {
 		seg := (i % handsPerLineup) / per
 		if seg >= segments {
 			seg = segments - 1
@@ -856,6 +963,10 @@ func (rep Report) Render() string {
 		c.Lineups, c.Hands, len(c.Candidates), c.Lineups*c.Hands*len(c.Candidates), c.Seats,
 		c.StackMinBB, c.StackMaxBB, readLevelName(c.Level))
 
+	if c.AllInEV {
+		b.WriteString("bb/100 считается по эквити олл-инов на момент, когда вошла последняя фишка;\n" +
+			"парная разница — по выпавшим ранаутам, она их и так гасит (docs/HARNESS.md §3d)\n\n")
+	}
 	if c.CarryStacks {
 		b.WriteString("stacks carried across each session; hero busting ends it, so the hand counts\n" +
 			"differ between candidates and the paired comparison is not available here.\n\n")
@@ -875,6 +986,11 @@ func (rep Report) Render() string {
 				}
 			}
 			line += fmt.Sprintf("   %+8.2f ± %5.2f%s", diff, dse, verdict)
+			if share, n, ok := r.Divergence(rep.Baseline); ok {
+				line += fmt.Sprintf("\n%-22s %s", "",
+					fmt.Sprintf("разошлись с базой на %.1f%% раздач (%d из %d)",
+						100*share, n, len(r.Nets)))
+			}
 		}
 		b.WriteString(line + "\n")
 	}
@@ -888,6 +1004,17 @@ func (rep Report) Render() string {
 			fmt.Fprintf(&b, "  no-advice %d", r.NoAdvice)
 		}
 		b.WriteString("\n")
+		if f := r.Flips; f.Decisions > 0 {
+			fmt.Fprintf(&b, "  noise changed the answer on %.1f%% of decisions (reversed %.1f%%), and the size on %.1f%% more\n",
+				100*f.ActionFlipRate(), 100*f.ReversalRate(), 100*f.SizingFlipRate())
+			b.WriteString("    defect            fired    answer changed on\n")
+			for _, d := range AllDefects {
+				if rate, ok := f.FlipRateGiven(d); ok {
+					fmt.Fprintf(&b, "    %-15s %6.1f%%  %15.1f%%\n",
+						d, 100*float64(f.FiredByDefect[d])/float64(f.Decisions), 100*rate)
+				}
+			}
+		}
 		if r.Decisions > 0 && len(r.Phases) > 0 {
 			fmt.Fprintf(&b, "  table known %.0f%% on average; decisions by phase:", 100*r.KnowledgeSum/float64(r.Decisions))
 			for _, name := range []string{"разведка", "применение", "давление"} {

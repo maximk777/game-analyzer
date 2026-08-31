@@ -252,6 +252,38 @@ func SituationOf(state table.HandState) Situation {
 		}
 	}
 
+	// Badges say who raised; money says whether anybody did. The two are needed
+	// together because a badge reports an action, not its size: a player who
+	// calls an all-in of ninety blinds wears the same "call" badge as a player
+	// who limps for one, and counted as a limper the pot came out unraised.
+	//
+	// Live on 2026-08-31 hero held 6c2d in the small blind facing an all-in of
+	// 188,440 with one caller. The all-in player's seat had been dropped, the
+	// caller's badge said "call", so the spot was charted as an unraised pot --
+	// where the small blind completes cheaply with almost anything -- and the
+	// tool advised calling off 184,800 with 11.5% equity against the 32.9% it
+	// had itself calculated as necessary.
+	//
+	// Money may only promote the situation, never demote it: the largest bet
+	// exceeding the big blind proves a raise happened, but says nothing about
+	// how many, so it can produce FacingRaise and never FacingThreeBet. Without
+	// a known big blind there is no scale and this does nothing, which is the
+	// same rule the wager reader follows -- a stake cannot be invented.
+	if raises == 0 && state.BigBlind > 0 {
+		var largest float64
+		for _, seat := range state.Seats {
+			if seat.PlayerID == state.HeroID || seat.IsFolded {
+				continue
+			}
+			if seat.CurrentBet > largest {
+				largest = seat.CurrentBet
+			}
+		}
+		if largest > state.BigBlind {
+			raises = 1
+		}
+	}
+
 	// Hero's own raise counts. Somebody raising over hero's open is a three-bet
 	// whether or not anybody else has raised, and the count of *other* people's
 	// raises cannot tell the two apart: one raise behind hero's open looks

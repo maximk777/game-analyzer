@@ -451,3 +451,96 @@ func TestEquityRealisation_DoesNotBiasTowardsShoving(t *testing.T) {
 			resp.PrimaryAction, resp.RecommendedAmount)
 	}
 }
+
+// Pocket eights, cutoff, 2000 to call into a pot of 4920 five-handed, 34 blinds
+// deep. The chart calls; the expected-value comparison folds, because it prices
+// the call as though the hand were about to be shown down -- 23% raw equity
+// against 29% pot odds -- with no implied odds and no allowance for folding
+// cheaply on the flops that miss.
+//
+// Both answers came out of the tool within three seconds of each other on
+// 2026-08-31 at NLH 1234677, and the difference between them was one thing: a
+// frame where the dealer button was not matched left every seat's position
+// empty, so preflop.HeroPosition failed, so chartedAction returned false, so
+// the chart never got its say. The hand ended as a bust.
+//
+// This pins both halves. The first is the behaviour that is wanted; the second
+// is what the missing position costs, and it is here so that a later change
+// that removes the chart's override cannot pass quietly.
+func TestPocketEights_ChartCalls_ButLosingThePositionFolds(t *testing.T) {
+	base := func() table.HandState {
+		return table.HandState{
+			HandID: "h", Street: table.StreetPreflop, HeroID: "hero",
+			Pot: 4920, CurrentBet: 2000, MinRaise: 4000,
+			HeroCards: [2]table.Card{
+				{Rank: 8, Suit: table.Hearts},
+				{Rank: 8, Suit: table.Diamonds},
+			},
+			Seats: []table.SeatState{
+				{PlayerID: "hero", Stack: 67940, Position: table.PosCO, IsActive: true},
+				{PlayerID: "v1", Stack: 199680, CurrentBet: 2000, Position: table.PosBTN, IsActive: true},
+				{PlayerID: "v2", Stack: 80000, CurrentBet: 1000, Position: table.PosSB, IsActive: true},
+				{PlayerID: "v3", Stack: 78000, CurrentBet: 2000, Position: table.PosBB, IsActive: true},
+				{PlayerID: "v4", Stack: 190000, Position: table.PosUTG, IsActive: true},
+			},
+		}
+	}
+
+	seated := CalculateAdvice(base(), equity.EquityResult{WinRate: 0.234}, nil)
+	if seated.PrimaryAction == table.ActionFold {
+		t.Errorf("folded pocket eights getting 2.5 to 1 with a position: %s %.0f -- %s",
+			seated.PrimaryAction, seated.RecommendedAmount, seated.Reasoning)
+	}
+
+	// The same spot as the screen reader reported it on the frames that missed
+	// the button: identical money, no position on any seat.
+	blind := base()
+	for i := range blind.Seats {
+		blind.Seats[i].Position = ""
+	}
+	unseated := CalculateAdvice(blind, equity.EquityResult{WinRate: 0.234}, nil)
+	if unseated.PrimaryAction == seated.PrimaryAction {
+		t.Skipf("losing the position no longer changes the answer (%s both ways); "+
+			"if that is deliberate, delete this half of the test", seated.PrimaryAction)
+	}
+	t.Logf("with a position: %s %.0f; without: %s %.0f",
+		seated.PrimaryAction, seated.RecommendedAmount,
+		unseated.PrimaryAction, unseated.RecommendedAmount)
+}
+
+// An open is two and a half big blinds, and the big blind has to come from
+// somewhere. It used to be inferred from the largest bet on the felt, with a
+// fallback of one chip when there was none -- so on any frame where the blinds
+// had already been swept into the pot, a chart open came out as "raise 5" at
+// blinds of 1000/2000. Seen live on 2026-08-31 with QcTc.
+func TestChartOpenIsSizedFromTheBlindNotFromWhateverIsOnTheFelt(t *testing.T) {
+	state := table.HandState{
+		HandID: "h", Street: table.StreetPreflop, HeroID: "hero",
+		Pot: 3000, CurrentBet: 0, BigBlind: 2000, SmallBlind: 1000,
+		HeroCards: [2]table.Card{
+			{Rank: 12, Suit: table.Clubs},
+			{Rank: 10, Suit: table.Clubs},
+		},
+		Seats: []table.SeatState{
+			{PlayerID: "hero", Stack: 68580, Position: table.PosCO, IsActive: true},
+			{PlayerID: "v1", Stack: 199680, Position: table.PosBTN, IsActive: true},
+			{PlayerID: "v2", Stack: 80000, Position: table.PosSB, IsActive: true},
+			{PlayerID: "v3", Stack: 78000, Position: table.PosBB, IsActive: true},
+		},
+	}
+
+	resp := CalculateAdvice(state, equity.EquityResult{WinRate: 0.42}, nil)
+
+	switch resp.PrimaryAction {
+	case table.ActionRaise, table.ActionBet, table.ActionAllIn:
+	default:
+		t.Skipf("chart did not open here (%s); the sizing rule is what is under test",
+			resp.PrimaryAction)
+	}
+	// Two and a half blinds is 5,000. Anything near a handful of chips means the
+	// stake was inferred as one again.
+	if resp.RecommendedAmount < state.BigBlind {
+		t.Errorf("opened for %.0f at a big blind of %.0f -- sized from no stake at all",
+			resp.RecommendedAmount, state.BigBlind)
+	}
+}

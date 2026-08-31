@@ -421,6 +421,31 @@ type Inputs struct {
 	// statistics rather than counted from observed actions. Modelled reads are
 	// capped far below counted ones: they inform the estimate, never carry it.
 	ReadModelled bool
+
+	// UseSizingPolicy takes the choice of *which* sizes exist away from the
+	// expected-value comparison and gives it to the board and the stack-to-pot
+	// ratio. See sizing.go. A switch only so the two can be measured against
+	// each other on the same decks.
+	UseSizingPolicy bool
+
+	// AllowSemiBluff opens the aggressive branch for a hand that is behind but
+	// has something to improve to, without requiring a counted read on every
+	// opponent.
+	//
+	// Without it the tool cannot bet at all below 50% equity unless it has
+	// counted every live opponent folding more than half the time -- which,
+	// live, is never, because the reads are empty for the first orbit and the
+	// table changes. It therefore never bluffs and never semi-bluffs, and the
+	// harness names the cost: checking back the turn when checked to is worth
+	// -1.64 big blinds a hand against -0.17 for a plain TAG, over three
+	// thousand hands.
+	//
+	// The relaxation is deliberately not "bet air". The baseline fold frequency
+	// is the complement of minimum defence -- an equilibrium reference, not a
+	// guess about this player -- and what opens the branch is having equity
+	// left when that reference turns out to be wrong: a draw, or a hand with
+	// outs. Barrelling with nothing stays shut behind a counted read.
+	AllowSemiBluff bool
 }
 
 // OpponentRead is what is known about one live opponent.
@@ -876,6 +901,20 @@ func Calculate(in Inputs) AdvisorResponse {
 		})
 	}
 
+	// Which sizes this spot allows at all. The equity handed to it is hero's
+	// against the strongest third of what is left -- roughly the part that
+	// continues against a real bet -- because a shove has to be answerable to
+	// the range that calls it and not to the range that folds.
+	spr := 0.0
+	if stacksKnown && pot > 0 {
+		spr = effectiveStack / pot
+	}
+	shoveEq := 0.0
+	if in.EquityVsTop != nil {
+		shoveEq = math.Min(math.Max(in.EquityVsTop(0.35), 0), 1)
+	}
+	policy := PolicyFor(state.Street, state.CommunityCards, spr, opponents, shoveEq)
+
 	var actions []ActionRecommendation
 
 	actions = append(actions, ActionRecommendation{
@@ -898,11 +937,20 @@ func Calculate(in Inputs) AdvisorResponse {
 			betAction = table.ActionRaise
 		}
 
-		actions = addSizing(actions, betAction, pot*0.33, "33% Pot")
-		actions = addSizing(actions, betAction, pot*0.66, "66% Pot")
-		actions = addSizing(actions, betAction, pot*1.0, "Pot")
-		if stacksKnown {
-			actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
+		if in.UseSizingPolicy {
+			for _, f := range policy.Fractions {
+				actions = addSizing(actions, betAction, pot*f, potLabel(f))
+			}
+			if stacksKnown && policy.AllIn {
+				actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
+			}
+		} else {
+			actions = addSizing(actions, betAction, pot*0.33, "33% Pot")
+			actions = addSizing(actions, betAction, pot*0.66, "66% Pot")
+			actions = addSizing(actions, betAction, pot*1.0, "Pot")
+			if stacksKnown {
+				actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
+			}
 		}
 	} else {
 		actions = append(actions, ActionRecommendation{
@@ -918,11 +966,24 @@ func Calculate(in Inputs) AdvisorResponse {
 		}
 
 		actions = addSizing(actions, table.ActionRaise, minRaise, "Min-Raise")
-		actions = addSizing(actions, table.ActionRaise, math.Max(toCall*2.5, minRaise), "2.5x")
-		actions = addSizing(actions, table.ActionRaise, math.Max(toCall+pot*0.66, minRaise), "66% Pot")
-		actions = addSizing(actions, table.ActionRaise, math.Max(pot+2.0*toCall, minRaise), "Pot")
-		if stacksKnown {
-			actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
+		if in.UseSizingPolicy {
+			// A raise to f of the pot is what goes in on top of the call, so
+			// the pot it is measured against is the one hero's call has already
+			// made: f = 1 is toCall + pot + toCall, the pot-sized raise.
+			for _, f := range policy.Fractions {
+				want := toCall + f*(pot+toCall)
+				actions = addSizing(actions, table.ActionRaise, math.Max(want, minRaise), potLabel(f))
+			}
+			if stacksKnown && policy.AllIn {
+				actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
+			}
+		} else {
+			actions = addSizing(actions, table.ActionRaise, math.Max(toCall*2.5, minRaise), "2.5x")
+			actions = addSizing(actions, table.ActionRaise, math.Max(toCall+pot*0.66, minRaise), "66% Pot")
+			actions = addSizing(actions, table.ActionRaise, math.Max(pot+2.0*toCall, minRaise), "Pot")
+			if stacksKnown {
+				actions = addSizing(actions, table.ActionAllIn, effectiveStack, "All-In")
+			}
 		}
 	}
 
@@ -977,7 +1038,15 @@ func Calculate(in Inputs) AdvisorResponse {
 	if toCall > 0 {
 		gateEquity = callEquity
 	}
-	aggressionAllowed := gateEquity >= 0.50 || countedReads
+	// A hand that is behind the range that would call, but not by much, and with
+	// cards to come. It is not a bluff and it is not a value bet; it is the
+	// thing between them, and refusing to price it at all is what turns the
+	// tool into a player who checks every turn it did not flop a hand on.
+	semiBluff := false
+	if in.AllowSemiBluff && in.EquityVsTop != nil && state.Street != table.StreetPreflop {
+		semiBluff = in.EquityVsTop(0.50) >= semiBluffEquity
+	}
+	aggressionAllowed := gateEquity >= 0.50 || countedReads || semiBluff
 
 	bestIdx := 0
 	bestEV := evFold
@@ -1046,7 +1115,7 @@ func Calculate(in Inputs) AdvisorResponse {
 			// Short stacks are not a special case: a chart open of two and a
 			// half blinds against a stack of ten is an all-in, and addSizing
 			// names it one.
-			if want := chartRaiseAmount(state, toCall, heroCurrentBet); want > 0 {
+			if want := chartRaiseAmount(state, toCall, heroCurrentBet, in.UseSizingPolicy); want > 0 {
 				actions = addSizing(actions, table.ActionRaise, want, "Chart Open")
 				if idx, ok := nearestRaise(actions, roundToTwoDecimals(cap(want))); ok {
 					bestIdx = idx
@@ -1143,6 +1212,12 @@ const bluffWorthwhileFold = 0.50
 // value, at a third-pot bet it withholds a fifth of one per cent, and at a
 // table that is fully read it withholds nothing at all.
 const darkHorseCaution = 0.20
+
+// semiBluffEquity is how much hero must have against the stronger half of the
+// opponents' range for a bet to be more than a bluff. It is roughly a flush
+// draw with one card to come, which is the weakest holding the reference
+// material will barrel: "only with hands that have meaningful outs".
+const semiBluffEquity = 0.30
 
 // tableKnowledge is how well the least-known live opponent is understood.
 //
@@ -1403,15 +1478,29 @@ func opponentModels(in Inputs, state table.HandState, opponents int, deepest flo
 // over two. The chart is a hundred-big-blind chart and these are the sizes it
 // assumes; a model that could work them out for itself would need to see the
 // streets they are played on.
-func chartRaiseAmount(state table.HandState, toCall, heroCurrentBet float64) float64 {
+func chartRaiseAmount(state table.HandState, toCall, heroCurrentBet float64, positional bool) float64 {
 	switch preflop.SituationOf(state) {
 	case preflop.FacingRaise:
+		if positional {
+			return threeBetAmount(state, toCall)
+		}
 		return 3.0 * toCall
 	case preflop.FacingThreeBet:
 		return 2.2 * toCall
 	default:
-		// Nobody has raised, so whatever is out there is the big blind.
-		bb := state.CurrentBet
+		// The stake, preferred from the table itself and inferred only when it
+		// was not read.
+		//
+		// Inferring it from the largest bet on the felt is right whenever there
+		// is one, and silently catastrophic when there is not: the fallback was
+		// a big blind of one chip, so an open of two and a half blinds came out
+		// as "raise 5" at blinds of 1000/2000. That is not a bad size, it is a
+		// number from a different game, and it appeared on any frame where the
+		// blinds had already been swept into the pot.
+		bb := state.BigBlind
+		if bb <= 0 {
+			bb = state.CurrentBet
+		}
 		if bb <= 0 {
 			bb = 1
 		}
@@ -1427,6 +1516,44 @@ func chartRaiseAmount(state table.HandState, toCall, heroCurrentBet float64) flo
 		}
 		return want
 	}
+}
+
+// threeBetAmount is what a three-bet costs.
+//
+// It was three times the raise, whoever hero was and whoever else was in the
+// pot. Two things are wrong with one number.
+//
+// Out of position a three-bet has to be bigger. The reference is three times
+// the open in position and around four out of it, and the reason is that the
+// hand will be played from the worse seat on every street after: the extra
+// blind buys a bigger share of the pot now, in exchange for the disadvantage
+// later.
+//
+// And a raise with callers behind it is not a three-bet at all, it is a
+// squeeze, and it is priced against a pot that already contains their money.
+// Three times an open into two callers leaves everybody a price they are happy
+// to pay -- which is the whole reason the squeeze works when it is sized
+// properly and loses money when it is not. The reference is one further raise
+// for each caller.
+func threeBetAmount(state table.HandState, toCall float64) float64 {
+	mult := 3.0
+	// In position or out of it, decided by hero's seat. The blinds act first on
+	// every street after this one, and no read is needed to know it.
+	switch heroPosition(state) {
+	case table.PosSB, table.PosBB:
+		mult = 4.0
+	}
+
+	callers := 0.0
+	for _, seat := range state.Seats {
+		if seat.PlayerID == state.HeroID || seat.IsFolded {
+			continue
+		}
+		if seat.LastAction == "call" {
+			callers++
+		}
+	}
+	return (mult + callers) * toCall
 }
 
 // nearestRaise is the aggressive option closest to an amount, which is how a

@@ -1,6 +1,6 @@
 SWIFT_SHARED := pkg/capture/table_vision.swift pkg/capture/card_templates.swift pkg/capture/rank_bitmap_templates.swift
 
-.PHONY: all vision assets ranks server ui app harness test test-race clean
+.PHONY: all vision assets ranks server ui app harness bench-guard test test-race clean
 
 all: assets vision
 
@@ -107,6 +107,23 @@ harness: bin/harness
 	bin/harness -hands $(HANDS) -lineups $(LINEUPS) -seed $(SEED) \
 		-candidates $(CANDIDATES) $(if $(FIELD),-field $(FIELD),) \
 		-stack-min 100 -stack-max 100
+
+# The same run, with a gate. Exits non-zero if GUARD has fallen more than two
+# combined standard errors below its last recorded run of the same shape.
+#
+# Every run appends a line to bench/results.jsonl -- the commit, whether the
+# tree was dirty, the configuration and the numbers -- so "did what I just
+# change move it" is answered against a record instead of by measuring the
+# baseline all over again. The ledger is committed on purpose: a measurement
+# nobody kept is a measurement that has to be taken twice.
+#
+#   make bench-guard GUARD=tool:stats
+GUARD ?= tool:stats
+
+bench-guard: bin/harness
+	bin/harness -hands $(HANDS) -lineups $(LINEUPS) -seed $(SEED) \
+		-candidates $(CANDIDATES) $(if $(FIELD),-field $(FIELD),) \
+		-stack-min 100 -stack-max 100 -guard $(GUARD)
 
 test:
 	go test ./...

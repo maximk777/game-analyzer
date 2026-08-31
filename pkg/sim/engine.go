@@ -137,6 +137,11 @@ type HandResult struct {
 	Showdown bool
 	// Net is each player's change in stack over the hand, blinds included.
 	Net map[string]Chips
+	// AdjNet is the same, with any all-in scored by the equity it had when the
+	// last chip went in rather than by the card that came. Nil when the hand
+	// needed no adjustment -- it was decided by folding, or the money went in
+	// on the river. See allin_ev.go for why this exists.
+	AdjNet map[string]float64
 	// Holes is what everyone was dealt, which only the harness may see.
 	Holes map[string][2]table.Card
 	// Positions is where everyone sat this hand.
@@ -258,6 +263,14 @@ type hand struct {
 	street     table.Street
 	history    []table.ActionRecord
 	id         string
+
+	// Where the betting ended with cards still to come, for the all-in
+	// adjusted accounting in allin_ev.go. The board and the deck position are
+	// taken before the rest is dealt, so the completions enumerated there are
+	// exactly the cards the runout was drawn from.
+	allInMarked bool
+	allInBoard  []table.Card
+	allInDeck   int
 }
 
 // PlayHand deals and settles one hand, returning what everybody won or lost.
@@ -317,6 +330,7 @@ func (t *Table) PlayHand() HandResult {
 		first = 0
 	}
 	h.bettingRound(first % n)
+	h.markAllIn()
 
 	for _, street := range []table.Street{table.StreetFlop, table.StreetTurn, table.StreetRiver} {
 		if h.livePlayers() < 2 {
@@ -334,8 +348,10 @@ func (t *Table) PlayHand() HandResult {
 			// Postflop the action starts to the left of the button.
 			h.bettingRound(1 % n)
 		}
+		h.markAllIn()
 	}
 
+	res.AdjNet = h.adjustedNets()
 	h.settle(&res)
 
 	for _, s := range h.seats {
@@ -706,12 +722,20 @@ func (h *hand) viewFor(s *seatState) table.HandState {
 	copy(hist, h.history)
 
 	return table.HandState{
-		HandID:         h.id,
-		TableID:        h.t.id,
-		Street:         h.street,
-		Pot:            h.t.unit(pot),
-		CurrentBet:     h.t.unit(h.currentBet),
-		MinRaise:       h.t.unit(minRaise),
+		HandID:     h.id,
+		TableID:    h.t.id,
+		Street:     h.street,
+		Pot:        h.t.unit(pot),
+		CurrentBet: h.t.unit(h.currentBet),
+		MinRaise:   h.t.unit(minRaise),
+		// The stake, which the screen reader gets from the window title and the
+		// engine has always known. Leaving it out was leaving two rules
+		// untested: the preflop spot is classified by money against the big
+		// blind, and a chart open is sized from it, and both fall silent when
+		// it is zero. So the harness was exercising neither, and each was
+		// covered only by the unit test that came with it.
+		SmallBlind:     h.t.unit(h.cfg.SmallBlind),
+		BigBlind:       h.t.unit(h.cfg.BigBlind),
 		CommunityCards: board,
 		HeroID:         s.p.ID,
 		HeroCards:      s.hole,
@@ -725,39 +749,10 @@ func (h *hand) viewFor(s *seatState) table.HandState {
 // settle builds the side pots and pays them out.
 func (h *hand) settle(res *HandResult) {
 	// Everything anybody put in, in layers. A player who folded still paid into
-	// the layers below whatever they reached.
-	levels := make([]Chips, 0, len(h.seats))
-	for _, s := range h.seats {
-		if s.total > 0 {
-			levels = append(levels, s.total)
-		}
-	}
-	sort.Slice(levels, func(i, j int) bool { return levels[i] < levels[j] })
-
-	var prev Chips
-	for i, lv := range levels {
-		if i > 0 && lv == levels[i-1] {
-			continue
-		}
-		var amount Chips
-		var eligible []*seatState
-		for _, s := range h.seats {
-			c := s.total
-			if c > lv {
-				c = lv
-			}
-			if c > prev {
-				amount += c - prev
-			}
-			if !s.folded && s.total >= lv {
-				eligible = append(eligible, s)
-			}
-		}
-		prev = lv
-		if amount <= 0 || len(eligible) == 0 {
-			continue
-		}
-		h.award(amount, eligible, res)
+	// the layers below whatever they reached. The same split settles the hand
+	// and prices the all-in adjustment, so it lives in one place.
+	for _, layer := range h.potLayers() {
+		h.award(layer.amount, layer.eligible, res)
 	}
 }
 

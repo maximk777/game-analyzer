@@ -33,7 +33,27 @@ const (
 	GapNoBoard        Gap = "no_board"          // postflop street with no board cards read
 	GapPlaceholderID  Gap = "placeholder_hand"  // hand id is still the vision placeholder
 	GapNoActionStream Gap = "no_action_history" // nothing to profile or review from
+
+	// GapDuplicateSeats is two seats reported at the same seat number, and
+	// GapImpossibleSeatCount more players than the table can hold.
+	//
+	// These were the most common defect in the session of 2026-08-31 and
+	// neither was named at all: seat numbers collided on 217 frames out of 220,
+	// and 61 frames put more than six players at a six-max table. One name came
+	// back six ways -- Rafidamage also as Rafk, aage, adge, nafidamage and
+	// Rafida -- and the interface button "Enter Amount" arrived as a player
+	// with a stack.
+	//
+	// The cost is not cosmetic: the count of live opponents is what multiway
+	// equity is computed against, and every extra ghost is also an unknown, so
+	// the stranger tax is charged for a player who does not exist.
+	GapDuplicateSeats      Gap = "duplicate_seats"       // two seats share a seat number
+	GapImpossibleSeatCount Gap = "impossible_seat_count" // more seats than the table holds
 )
+
+// maxSeats is what a table can hold. Six-max is the only layout this reads, and
+// a frame reporting more than this has invented somebody.
+const maxSeats = 6
 
 // SeatSnapshot is the per-player view, including the coefficients that drove
 // the advice. The UI shows these beside each player, so they are recorded in
@@ -313,6 +333,35 @@ func Build(state *table.HandState, advice *advisor.AdvisorResponse, tendencies m
 	}
 	if len(state.ActionHistory) == 0 {
 		gaps = append(gaps, GapNoActionStream)
+	}
+	// Seat numbers are how the parser keys a player between frames, so a
+	// collision does not merely duplicate a row: it merges two players into one
+	// history and loses whichever arrived first.
+	//
+	// Checked only when the field is in use. A state whose seats are all at
+	// number zero has not numbered them at all -- the harness builds states
+	// that way, and so do most tests -- and calling that a collision would
+	// report a defect on every well-formed frame that happens not to care about
+	// seat order.
+	numbered := false
+	for _, s := range state.Seats {
+		if s.SeatNumber != 0 {
+			numbered = true
+			break
+		}
+	}
+	if numbered {
+		seen := make(map[int]bool, len(state.Seats))
+		for _, s := range state.Seats {
+			if seen[s.SeatNumber] {
+				gaps = append(gaps, GapDuplicateSeats)
+				break
+			}
+			seen[s.SeatNumber] = true
+		}
+	}
+	if len(state.Seats) > maxSeats {
+		gaps = append(gaps, GapImpossibleSeatCount)
 	}
 
 	slices.Sort(gaps)
