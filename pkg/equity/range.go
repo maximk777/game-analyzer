@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"poker-game-analyzer/pkg/table"
 )
@@ -521,4 +522,43 @@ func (r Range) SampleComboMask(deadMask uint64, rng *rand.Rand) ([2]table.Card, 
 	}
 
 	return [2]table.Card{}, false
+}
+
+// handRank is every combo ordered by the preflop ranking, built once.
+var (
+	handRankOnce sync.Once
+	handRankIdx  map[uint64]int
+	handRankN    int
+)
+
+func buildHandRank() {
+	handRankIdx = make(map[uint64]int, 1326)
+	for _, handStr := range preflopHandRankings {
+		for _, c := range parseSingleToken(handStr) {
+			m := ComboToMask(c)
+			if _, seen := handRankIdx[m]; !seen {
+				handRankIdx[m] = len(handRankIdx)
+			}
+		}
+	}
+	handRankN = len(handRankIdx)
+}
+
+// HandPercentile is where a holding sits in the preflop ranking: 0 for aces,
+// approaching 1 for the worst hand in the deck.
+//
+// It is the same ordering ParseRange("topX%") cuts against, exposed so that a
+// simulated opponent can be given a range as a number -- "this player opens
+// 22% of hands" -- without building and searching a Range for every decision.
+// A hand outside the ranking (an unread card) comes back as 1.
+func HandPercentile(hole [2]table.Card) float64 {
+	handRankOnce.Do(buildHandRank)
+	if handRankN == 0 {
+		return 1
+	}
+	idx, ok := handRankIdx[ComboToMask(hole)]
+	if !ok {
+		return 1
+	}
+	return float64(idx) / float64(handRankN)
 }

@@ -63,14 +63,23 @@ type chartText struct {
 	call  string
 }
 
-// Opening ranges, roughly 15% under the gun widening to 42% on the button.
-// The big blind has no unopened spot: it can see the flop for nothing.
+// Opening ranges: 15% under the gun widening to 44% in the small blind. The big
+// blind has no unopened spot: it can see the flop for nothing.
+//
+// Those percentages used to be a claim in this comment and not a property of
+// the ranges below it. Measured, the ranges were half as wide as advertised --
+// 6.9% under the gun against the 15% stated, 26% on the button against 42% --
+// and the tool inherited every point of it: the harness put its VPIP at 13 in a
+// six-handed game, which is a nit. The gap was not a judgement anybody had made
+// and defended; it was a comment and a table that had drifted apart.
+//
+// TestChartWidths now pins each one, so the two cannot drift again.
 var charts = map[spot]chartText{
-	{table.PosUTG, Unopened}: {raise: "77+, ATs+, KQs, AQo+"},
-	{table.PosMP, Unopened}:  {raise: "66+, A9s+, KTs+, QTs+, JTs, AJo+, KQo"},
-	{table.PosCO, Unopened}:  {raise: "33+, A2s+, K9s+, Q9s+, J9s+, T9s, 98s, ATo+, KJo+"},
-	{table.PosBTN, Unopened}: {raise: "22+, A2s+, K5s+, Q8s+, J8s+, T8s, 98s, 87s, 76s, 65s, A8o+, KTo+, QTo+, JTo"},
-	{table.PosSB, Unopened}:  {raise: "22+, A2s+, K7s+, Q8s+, J8s+, T8s, 98s, 87s, 76s, 65s, A7o+, KTo+, QTo+, JTo"},
+	{table.PosUTG, Unopened}: {raise: "22+, A2s+, KTs+, QTs+, JTs, T9s, AJo+, KQo"},
+	{table.PosMP, Unopened}:  {raise: "22+, A2s+, K9s+, Q9s+, J9s+, T8s+, 98s, 87s, ATo+, KJo+"},
+	{table.PosCO, Unopened}:  {raise: "22+, A2s+, K7s+, Q8s+, J8s+, T8s+, 97s+, 86s+, 76s, 65s, 54s, A8o+, KTo+, QTo+, JTo, T9o"},
+	{table.PosBTN, Unopened}: {raise: "22+, A2s+, K2s+, Q4s+, J6s+, T6s+, 96s+, 85s+, 75s+, 64s+, 54s, A2o+, K9o+, Q9o+, J9o+, T9o, 98o"},
+	{table.PosSB, Unopened}:  {raise: "22+, A2s+, K2s+, Q2s+, J5s+, T6s+, 95s+, 85s+, 75s+, 64s+, 54s, A2o+, K8o+, Q9o+, J9o+, T9o, 98o"},
 
 	// Limped pots. The blinds are getting a price no opening range reflects, so
 	// completing is close to automatic and the chart's job is only to say which
@@ -120,9 +129,15 @@ var charts = map[spot]chartText{
 		raise: "TT+, AQs+, AKo",
 		call:  "22-99, AJs, ATs, KQs, QJs, JTs",
 	},
+	// The big blind is getting a price nobody else at the table is offered, and
+	// defending 23% of hands against a two-and-a-half-blind open leaves most of
+	// it on the table. Folding the big blind was the single largest line in the
+	// harness report -- one big blind a hand, six thousand hands out of eighty
+	// thousand -- and while some of that is unavoidable, a third of it was the
+	// chart being written for a tighter game than this one.
 	{table.PosBB, FacingRaise}: {
 		raise: "JJ+, AQs+, AKo",
-		call:  "22-TT, A2s+, K9s+, Q9s+, J9s+, T9s, 98s, 87s, 76s, 65s, A8o+, KJo+, QJo, JTo",
+		call:  "22-TT, A2s+, K5s+, Q7s+, J7s+, T7s+, 96s+, 86s+, 75s+, 64s+, 54s, A7o+, KTo+, QTo+, JTo, T9o",
 	},
 
 	// Facing a three-bet after opening. Position matters far less here than the
@@ -217,8 +232,16 @@ func Recommend(position table.Position, situation Situation, hole [2]table.Card)
 func SituationOf(state table.HandState) Situation {
 	raises := 0
 	limpers := 0
+	heroRaised := false
 	for _, seat := range state.Seats {
-		if seat.PlayerID == state.HeroID || seat.IsFolded {
+		if seat.PlayerID == state.HeroID {
+			switch seat.LastAction {
+			case "raise", "bet", "all-in":
+				heroRaised = true
+			}
+			continue
+		}
+		if seat.IsFolded {
 			continue
 		}
 		switch seat.LastAction {
@@ -227,6 +250,22 @@ func SituationOf(state table.HandState) Situation {
 		case "call":
 			limpers++
 		}
+	}
+
+	// Hero's own raise counts. Somebody raising over hero's open is a three-bet
+	// whether or not anybody else has raised, and the count of *other* people's
+	// raises cannot tell the two apart: one raise behind hero's open looks
+	// identical to one raise into a pot hero has not entered.
+	//
+	// Under the gun the difference was the whole spot. Hero opens first by
+	// definition, so a single raise ahead can only ever be a three-bet at hero
+	// -- and the chart has no entry for {UTG, facing a raise}, so the spot fell
+	// through to the raw expected-value comparison every time. Measured, the
+	// tool open-shoved under the gun seventy times over eighty thousand hands
+	// at forty big blinds a hand, which is the most expensive single line the
+	// harness has found.
+	if heroRaised && raises >= 1 {
+		return FacingThreeBet
 	}
 
 	switch {

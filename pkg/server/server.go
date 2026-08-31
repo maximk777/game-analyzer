@@ -15,10 +15,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"poker-game-analyzer/pkg/advice"
 	"poker-game-analyzer/pkg/advisor"
 	"poker-game-analyzer/pkg/audit"
 	"poker-game-analyzer/pkg/capture"
-	"poker-game-analyzer/pkg/equity"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
@@ -228,148 +228,38 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	}
 
 	// 3. Real-time Equity and Advisor Recommendation calculation
+	//
+	// The whole of it now lives in pkg/advice, because a second caller appeared
+	// that has to reach the same decision: the harness in pkg/sim, which plays
+	// the strategy out over whole hands and measures what it wins. What is left
+	// here is gathering the reads the profiler holds and handing them over.
 	var rec *advisor.AdvisorResponse
 	var auditReads map[string]map[string]float64
 	noAdvice := ""
 	if event.HandState != nil && !isHandEnd {
 		h := event.HandState
-		hasHeroCards := h.HeroCards[0].Rank > 0 && h.HeroCards[1].Rank > 0
-
-		// A player who has folded has no decision left. The fold badge on the
-		// nameplate is read, but nothing consulted it before advising: live,
-		// hero had folded and the HUD went on recommending an all-in, sized off
-		// another player's stack.
-		heroFolded := false
-		for _, seat := range h.Seats {
-			if seat.PlayerID == h.HeroID && h.HeroID != "" && seat.IsFolded {
-				heroFolded = true
-				break
-			}
+		reads := advice.Reads{
+			Tendencies: make(map[string]map[string]float64),
+			RangeWidth: make(map[string]float64),
 		}
-
-		// Advice only where there is a decision to make.
-		//
-		// Hero's own seat is not always among the ones read -- live, a frame
-		// listed two players of six -- so "has hero folded" cannot be answered
-		// from the seats alone, and the tool went on recommending a bet on a
-		// hand whose nameplate said FOLD. Whether the client is waiting on hero
-		// is a separate signal, it was being reported all along, and nothing
-		// read it.
-		switch {
-		case !hasHeroCards:
-			noAdvice = "Карты героя не прочитаны"
-		case heroFolded:
-			noAdvice = "Вы сбросили — решать нечего"
-		case !h.HeroCanAct():
-			noAdvice = "Не ваш ход"
-		}
-
-		if hasHeroCards && !heroFolded && h.HeroCanAct() {
-			var oppTendencies map[string]float64
-			seatReads := make(map[string]map[string]float64)
-
-			// One range per live opponent, always. Previously a range was only
-			// added for players with recorded stats, so with no history the
-			// list came out empty and equity was simulated against a single
-			// random hand -- no matter how many players were actually in the
-			// pot. Range width is a percentage of all hands: 100 means unknown.
-			var rangeWidths []float64
+		if s.prof != nil {
 			for _, seat := range h.Seats {
-				if seat.PlayerID == "" || seat.PlayerID == h.HeroID || !seat.IsActive || seat.IsFolded {
+				if seat.PlayerID == "" || seat.PlayerID == h.HeroID {
 					continue
 				}
-				width := 100.0
-				if s.prof != nil {
-					t := s.prof.GetPlayerTendencies(seat.PlayerID)
-					if len(t) > 0 {
-						seatReads[seat.PlayerID] = t
-					}
-					if oppTendencies == nil && len(t) > 0 {
-						oppTendencies = t
-					}
-					if stats := s.prof.GetStats(seat.PlayerID); stats != nil && stats.VPIP > 0 {
-						width = stats.VPIP
-					}
+				if t := s.prof.GetPlayerTendencies(seat.PlayerID); len(t) > 0 {
+					reads.Tendencies[seat.PlayerID] = t
 				}
-				rangeWidths = append(rangeWidths, width)
-			}
-			if len(rangeWidths) == 0 {
-				rangeWidths = []float64{100.0}
-			}
-
-			rangesAt := func(frac float64) []equity.Range {
-				out := make([]equity.Range, 0, len(rangeWidths))
-				for _, w := range rangeWidths {
-					narrowed := w * frac
-					if narrowed >= 100 {
-						out = append(out, equity.ParseRange("random"))
-						continue
-					}
-					if narrowed < 1 {
-						narrowed = 1
-					}
-					out = append(out, equity.ParseRange(fmt.Sprintf("top%.0f%%", narrowed)))
-				}
-				return out
-			}
-
-			// Sub-5ms fast Monte Carlo simulation
-			// The call decision is a threshold comparison against pot odds, and
-			// live it sat 0.4% from the line: at 3,000 iterations the sampling
-			// noise alone flipped the same state between call and fold from one
-			// frame to the next. More samples cost a few milliseconds.
-			eqResult := equity.SimulateEquity(h.HeroCards, h.CommunityCards, rangesAt(1.0), 12000)
-
-			// Equity against the part of the range that would call a given
-			// size, simulated rather than approximated. Cached per width because
-			// the advisor asks once per sizing option.
-			cache := make(map[int]float64, 8)
-			equityVsTop := func(frac float64) float64 {
-				if frac <= 0 {
-					return 0
-				}
-				if frac > 1 {
-					frac = 1
-				}
-				key := int(frac * 100)
-				if v, ok := cache[key]; ok {
-					return v
-				}
-				r := equity.SimulateEquity(h.HeroCards, h.CommunityCards, rangesAt(frac), 8000)
-				v := r.WinRate + r.TieRate*0.5
-				cache[key] = v
-				return v
-			}
-
-			// What one opponent's range already beats hero with, counted
-			// exactly rather than sampled. Equity says how often hero wins;
-			// this says what the losses are made of, and on a paired board
-			// those are not the same question.
-			var risk *equity.RiskProfile
-			if len(h.CommunityCards) >= 3 {
-				ranges := rangesAt(1.0)
-				widest := 0
-				for i := range ranges {
-					if len(ranges[i].Combos) > len(ranges[widest].Combos) {
-						widest = i
-					}
-				}
-				if len(ranges) > 0 {
-					r := equity.Risk(h.HeroCards, h.CommunityCards, ranges[widest])
-					risk = &r
+				if stats := s.prof.GetStats(seat.PlayerID); stats != nil && stats.VPIP > 0 {
+					reads.RangeWidth[seat.PlayerID] = stats.VPIP
 				}
 			}
-
-			advice := advisor.Calculate(advisor.Inputs{
-				State:         *h,
-				Equity:        eqResult,
-				OppTendencies: oppTendencies,
-				EquityVsTop:   equityVsTop,
-				Risk:          risk,
-			})
-			rec = &advice
-			auditReads = seatReads
 		}
+
+		res := advice.Evaluate(h, reads, advice.Options{})
+		rec = res.Recommendation
+		noAdvice = res.NoAdvice
+		auditReads = res.SeatReads
 	}
 
 	if lg := s.auditLogger(); lg != nil {

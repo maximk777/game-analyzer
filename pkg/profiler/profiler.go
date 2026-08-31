@@ -59,6 +59,9 @@ type playerAccumulator struct {
 	BetsCount             int
 	RaisesCount           int
 	CallsCount            int
+
+	// Counted fold frequencies. See folds.go for why these exist at all.
+	Faced facedCounts
 }
 
 func (a *playerAccumulator) toStats() storage.PlayerStats {
@@ -86,7 +89,7 @@ func (a *playerAccumulator) toStats() storage.PlayerStats {
 		af = float64(a.BetsCount + a.RaisesCount)
 	}
 
-	return storage.PlayerStats{
+	st := storage.PlayerStats{
 		PlayerID:   a.PlayerID,
 		PlayerName: a.PlayerName,
 		HandsCount: a.HandsCount,
@@ -95,6 +98,32 @@ func (a *playerAccumulator) toStats() storage.PlayerStats {
 		ThreeBet:   math.Round(threeBet*10) / 10,
 		AF:         math.Round(af*10) / 10,
 	}
+	// Fold frequencies are fractions, not percentages, because that is the
+	// range the advisor validates them against. They are left absent rather
+	// than zeroed when the sample is too small: zero means "never folds", which
+	// is the most dangerous thing this map can wrongly say.
+	if v, ok := foldRate(a.Faced.raiseFolded, a.Faced.raiseFaced); ok {
+		st.FoldToRaise, st.FoldToRaiseN = v, a.Faced.raiseFaced
+	}
+	if v, ok := foldRate(a.Faced.threeBetFold, a.Faced.threeBetFaced); ok {
+		st.FoldTo3Bet, st.FoldTo3BetN = v, a.Faced.threeBetFaced
+	}
+	if v, ok := foldRate(a.Faced.cbetFolded, a.Faced.cbetFaced); ok {
+		st.FoldToCBet, st.FoldToCBetN = v, a.Faced.cbetFaced
+	}
+	if v, ok := foldRate(a.Faced.betFolded, a.Faced.betFaced); ok {
+		st.FoldToBet, st.FoldToBetN = v, a.Faced.betFaced
+	}
+	if v, ok := foldRate(a.Faced.raiseFoldedPost, a.Faced.raiseFacedPost); ok {
+		st.FoldToRaisePost, st.FoldToRaisePostN = v, a.Faced.raiseFacedPost
+	}
+	if v, ok := foldRate(a.Faced.betFlop, a.Faced.betFlopSpots); ok {
+		st.BetFreqFlop, st.BetFreqFlopN = v, a.Faced.betFlopSpots
+	}
+	if v, ok := foldRate(a.Faced.betLate, a.Faced.betLateSpots); ok {
+		st.BetFreqLate, st.BetFreqLateN = v, a.Faced.betLateSpots
+	}
+	return st
 }
 
 // Profiler manages statistical accumulation and asynchronous LLM-driven opponent profiling.
@@ -260,6 +289,9 @@ func (p *Profiler) ProcessHandEnd(hand table.HandState) {
 		}
 	}
 
+	// Who was bet at, and what they did about it.
+	faced := facedAggression(hand.ActionHistory)
+
 	// Analyze actions per player
 	for _, act := range hand.ActionHistory {
 		m, ok := participating[act.PlayerID]
@@ -321,6 +353,22 @@ func (p *Profiler) ProcessHandEnd(hand table.HandState) {
 		accum.BetsCount += m.betsCount
 		accum.RaisesCount += m.raisesCount
 		accum.CallsCount += m.callsCount
+		if f, ok := faced[pID]; ok {
+			accum.Faced.raiseFaced += f.raiseFaced
+			accum.Faced.raiseFolded += f.raiseFolded
+			accum.Faced.threeBetFaced += f.threeBetFaced
+			accum.Faced.threeBetFold += f.threeBetFold
+			accum.Faced.cbetFaced += f.cbetFaced
+			accum.Faced.cbetFolded += f.cbetFolded
+			accum.Faced.betFaced += f.betFaced
+			accum.Faced.betFolded += f.betFolded
+			accum.Faced.raiseFacedPost += f.raiseFacedPost
+			accum.Faced.raiseFoldedPost += f.raiseFoldedPost
+			accum.Faced.betFlop += f.betFlop
+			accum.Faced.betFlopSpots += f.betFlopSpots
+			accum.Faced.betLate += f.betLate
+			accum.Faced.betLateSpots += f.betLateSpots
+		}
 
 		// Keep recent hand history
 		p.playerHistories[pID] = append(p.playerHistories[pID], hand)
@@ -352,6 +400,18 @@ func (p *Profiler) ProcessHandEnd(hand table.HandState) {
 			}
 
 			if shouldProfile {
+				// The debounce clock starts when the analysis is *scheduled*,
+				// not when it comes back.
+				//
+				// Starting it at completion made the rate limit a race: the
+				// worker cannot record the timestamp until it has the lock this
+				// loop is holding, so a run of hands processed back to back
+				// scheduled every one of them and the limit did nothing. The
+				// test for it passed or failed on how long the loop took, which
+				// is how a change to an unrelated statistic came to break it.
+				// Scheduling is also the thing worth limiting: an analysis
+				// already in flight is a cost already paid.
+				p.lastAnalyzedAt[pID] = time.Now()
 				playersToProfile = append(playersToProfile, pID)
 			}
 		}
@@ -420,13 +480,55 @@ func (p *Profiler) GetPlayerTendencies(playerID string) map[string]float64 {
 		tendencies["three_bet"] = stats.ThreeBet
 		tendencies["af"] = stats.AF
 		tendencies["hands_count"] = float64(stats.HandsCount)
+
+		// Counted fold frequencies, and the sample behind each. The advisor
+		// weights a read by how much of it there is, and until now the only
+		// count it could weight by was hands played -- which says nothing about
+		// how often anybody bet at this player.
+		if stats.FoldToRaiseN > 0 {
+			tendencies["fold_to_raise"] = stats.FoldToRaise
+			tendencies["fold_to_raise_n"] = float64(stats.FoldToRaiseN)
+		}
+		if stats.FoldTo3BetN > 0 {
+			tendencies["fold_to_3bet"] = stats.FoldTo3Bet
+			tendencies["fold_to_3bet_n"] = float64(stats.FoldTo3BetN)
+		}
+		if stats.FoldToCBetN > 0 {
+			tendencies["fold_to_cbet"] = stats.FoldToCBet
+			tendencies["fold_to_cbet_n"] = float64(stats.FoldToCBetN)
+		}
+		if stats.FoldToBetN > 0 {
+			tendencies["fold_to_bet"] = stats.FoldToBet
+			tendencies["fold_to_bet_n"] = float64(stats.FoldToBetN)
+		}
+		if stats.FoldToRaisePostN > 0 {
+			tendencies["fold_to_raise_post"] = stats.FoldToRaisePost
+			tendencies["fold_to_raise_post_n"] = float64(stats.FoldToRaisePostN)
+		}
+		if stats.BetFreqFlopN > 0 {
+			tendencies["bet_freq_flop"] = stats.BetFreqFlop
+			tendencies["bet_freq_flop_n"] = float64(stats.BetFreqFlopN)
+		}
+		if stats.BetFreqLateN > 0 {
+			tendencies["bet_freq_late"] = stats.BetFreqLate
+			tendencies["bet_freq_late_n"] = float64(stats.BetFreqLateN)
+		}
 	}
 
+	// The language model fills in only what was not counted. A counted
+	// frequency is an observation; a modelled one is an opinion formed from
+	// summary statistics, and where both exist the observation wins.
 	profile := p.GetProfile(playerID)
 	if profile != nil {
 		tendencies["bluff_frequency"] = profile.BluffFrequency
-		tendencies["fold_to_3bet"] = profile.FoldTo3Bet
-		tendencies["fold_to_cbet"] = profile.FoldToCBet
+		if _, ok := tendencies["fold_to_3bet"]; !ok {
+			tendencies["fold_to_3bet"] = profile.FoldTo3Bet
+			tendencies["modelled"] = 1
+		}
+		if _, ok := tendencies["fold_to_cbet"]; !ok {
+			tendencies["fold_to_cbet"] = profile.FoldToCBet
+			tendencies["modelled"] = 1
+		}
 	}
 
 	return tendencies

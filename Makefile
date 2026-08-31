@@ -1,6 +1,6 @@
 SWIFT_SHARED := pkg/capture/table_vision.swift pkg/capture/card_templates.swift pkg/capture/rank_bitmap_templates.swift
 
-.PHONY: all vision assets ranks server ui app test test-race clean
+.PHONY: all vision assets ranks server ui app harness test test-race clean
 
 all: assets vision
 
@@ -80,6 +80,34 @@ ui: bin/hud_panel
 app: vision
 	go run ./cmd/agent --port $(PORT) --open-hud
 
+# The harness: plays the advisor out over whole hands against simulated
+# opponents and reports what following it would have won.
+#
+#   make harness                     the standard run, against the population
+#   make harness FIELD=pro,pro,pro,pro,pro    against a table of regulars
+#   make harness HANDS=5000 LINEUPS=64        a longer, tighter measurement
+#
+# The first candidate is the baseline every other is compared against, hand by
+# hand on identical decks. See docs/HARNESS.md.
+HANDS ?= 2500
+LINEUPS ?= 32
+SEED ?= 1
+FIELD ?=
+CANDIDATES ?= pro,tool:stats,novice:stats@0.9
+
+# Built, not `go run`. A long run and an edit to the source overlap sooner or
+# later, and `go run` compiles at the moment it starts: two runs launched from
+# one command line then measure two different programs. That has already
+# happened once and the numbers looked plausible.
+bin/harness: $(shell find pkg cmd -name '*.go' 2>/dev/null)
+	@mkdir -p bin
+	go build -o $@ ./cmd/harness
+
+harness: bin/harness
+	bin/harness -hands $(HANDS) -lineups $(LINEUPS) -seed $(SEED) \
+		-candidates $(CANDIDATES) $(if $(FIELD),-field $(FIELD),) \
+		-stack-min 100 -stack-max 100
+
 test:
 	go test ./...
 
@@ -87,4 +115,4 @@ test-race:
 	go test -race ./...
 
 clean:
-	rm -f bin/mac_vision_agent bin/parse_image bin/diag_recorder bin/snap bin/hud_panel
+	rm -f bin/mac_vision_agent bin/parse_image bin/diag_recorder bin/snap bin/hud_panel bin/harness

@@ -22,6 +22,33 @@ type PlayerStats struct {
 	PFR        float64 `json:"pfr"`
 	ThreeBet   float64 `json:"three_bet"`
 	AF         float64 `json:"af"`
+
+	// Counted fold frequencies, as fractions, each with the number of
+	// occasions behind it. A zero count means the frequency was never measured,
+	// which is a different statement from a frequency of zero: the first says
+	// nothing is known, the second says this player never folds. Conflating
+	// them is how a model ends up bluffing into a station.
+	FoldToRaise  float64 `json:"fold_to_raise"`
+	FoldToRaiseN int     `json:"fold_to_raise_n"`
+	FoldTo3Bet   float64 `json:"fold_to_3bet"`
+	FoldTo3BetN  int     `json:"fold_to_3bet_n"`
+	FoldToCBet   float64 `json:"fold_to_cbet"`
+	FoldToCBetN  int     `json:"fold_to_cbet_n"`
+	FoldToBet    float64 `json:"fold_to_bet"`
+	FoldToBetN   int     `json:"fold_to_bet_n"`
+	// Facing a raise after the flop, kept apart from facing a bet because the
+	// two are answered very differently and the advisor needs the one that
+	// matches the action it is about to take.
+	FoldToRaisePost  float64 `json:"fold_to_raise_post"`
+	FoldToRaisePostN int     `json:"fold_to_raise_post_n"`
+
+	// How often the player bets when nothing is owed, per street. It is the
+	// width of the range they bet with, and it is what prices hero's call
+	// against this player rather than against a theoretical one.
+	BetFreqFlop  float64 `json:"bet_freq_flop"`
+	BetFreqFlopN int     `json:"bet_freq_flop_n"`
+	BetFreqLate  float64 `json:"bet_freq_late"`
+	BetFreqLateN int     `json:"bet_freq_late_n"`
 }
 
 // LLMProfile represents qualitative and exploitative profile data generated for a player.

@@ -655,3 +655,31 @@ body.hud-body {
 /* The combination count is what makes the share checkable rather than something
    to be taken on trust, so it is shown -- quietly. */
 .risk-combos { text-align: right; font-variant-numeric: tabular-nums; color: rgba(255, 255, 255, 0.32); }
+
+/* How much the tool knows about the table, and therefore how hard it is
+   playing. Three states rather than a number alone, because "разведка" says
+   what to expect of the advice and "38%" does not. */
+.hud-phase-badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+}
+.hud-phase-badge.phase-scout {
+    color: #9aa4b2;
+    background: rgba(154, 164, 178, 0.12);
+    border-color: rgba(154, 164, 178, 0.30);
+}
+.hud-phase-badge.phase-apply {
+    color: #e0b341;
+    background: rgba(224, 179, 65, 0.12);
+    border-color: rgba(224, 179, 65, 0.32);
+}
+.hud-phase-badge.phase-press {
+    color: #43c98b;
+    background: rgba(67, 201, 139, 0.14);
+    border-color: rgba(67, 201, 139, 0.36);
+}

@@ -1,6 +1,7 @@
 package preflop
 
 import (
+	"poker-game-analyzer/pkg/equity"
 	"testing"
 
 	"poker-game-analyzer/pkg/table"
@@ -156,5 +157,61 @@ func TestSituationOf_DistinguishesLimpersFromRaises(t *testing.T) {
 	state.Seats[2].LastAction = ""
 	if got := SituationOf(state); got != Unopened {
 		t.Errorf("nobody in: got %s, want %s", got, Unopened)
+	}
+}
+
+// The width of every chart, pinned.
+//
+// The comment above the charts used to state percentages that the ranges did
+// not have: 15% under the gun against 6.9% actual, 42% on the button against
+// 26%. Nobody had decided to play half as many hands as the file said; the two
+// had simply drifted, and the tool played the drift. A percentage in a comment
+// is a wish. This is the same statement as a test.
+//
+// The tolerance is two points, which is as tight as a range built out of whole
+// hand classes can be held.
+func TestChartWidths(t *testing.T) {
+	all := equity.ParseRange("random")
+	const combos = 1326.0
+
+	width := func(pos table.Position, sit Situation) (raise, total float64) {
+		var r, c int
+		for _, hole := range all.Combos {
+			a, ok := Recommend(pos, sit, hole)
+			if !ok {
+				continue
+			}
+			switch a {
+			case Raise:
+				r++
+			case Call:
+				c++
+			}
+		}
+		return float64(r) / combos * 100, float64(r+c) / combos * 100
+	}
+
+	cases := []struct {
+		pos       table.Position
+		sit       Situation
+		wantRaise float64
+		wantTotal float64
+	}{
+		{table.PosUTG, Unopened, 15, 15},
+		{table.PosMP, Unopened, 19, 19},
+		{table.PosCO, Unopened, 28, 28},
+		{table.PosBTN, Unopened, 42, 42},
+		{table.PosSB, Unopened, 44, 44},
+		{table.PosBB, FacingRaise, 3, 31},
+	}
+	for _, c := range cases {
+		r, total := width(c.pos, c.sit)
+		if diff := r - c.wantRaise; diff > 2 || diff < -2 {
+			t.Errorf("%s %s: raises %.1f%% of hands, documented as %.0f%%", c.pos, c.sit, r, c.wantRaise)
+		}
+		if diff := total - c.wantTotal; diff > 2 || diff < -2 {
+			t.Errorf("%s %s: plays %.1f%% of hands, documented as %.0f%%", c.pos, c.sit, total, c.wantTotal)
+		}
+		t.Logf("%-3s %-14s raise %5.1f%%  play %5.1f%%", c.pos, c.sit, r, total)
 	}
 }

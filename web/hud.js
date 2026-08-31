@@ -18,6 +18,7 @@
         hudWidget: document.getElementById("hudWidget"),
         hudStatusDot: document.getElementById("hudStatusDot"),
         hudStatusText: document.getElementById("hudStatusText"),
+        hudPhaseBadge: document.getElementById("hudPhaseBadge"),
         hudStreetBadge: document.getElementById("hudStreetBadge"),
         hudPotBadge: document.getElementById("hudPotBadge"),
         
@@ -298,6 +299,23 @@
         if (!rec) {
             clearAdvisorRecommendation(reason);
             return;
+        }
+
+        // How well the table is understood, and therefore how hard the tool is
+        // playing. A user needs to see this: the same hand is advised
+        // differently against a table of strangers and a table it has watched
+        // for two hundred hands, and without the badge that difference looks
+        // like the tool changing its mind.
+        if (elements.hudPhaseBadge) {
+            const phase = rec.phase || "разведка";
+            const known = Math.round((rec.table_knowledge || 0) * 100);
+            const cls = phase === "давление" ? "phase-press"
+                : phase === "применение" ? "phase-apply" : "phase-scout";
+            elements.hudPhaseBadge.className = `hud-phase-badge ${cls}`;
+            elements.hudPhaseBadge.textContent = `${phase} ${known}%`;
+            elements.hudPhaseBadge.title =
+                `Стол изучен на ${known}% по наименее известному сопернику. ` +
+                `Пока он не изучен, крупные ставки против него оцениваются с запасом.`;
         }
 
         const act = (rec.primary_action || "check").toLowerCase();

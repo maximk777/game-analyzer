@@ -17,6 +17,20 @@ type EquityResult struct {
 }
 
 func SimulateEquity(hero [2]table.Card, board []table.Card, opponentRanges []Range, iterations int) EquityResult {
+	return SimulateEquityRNG(hero, board, opponentRanges, iterations, rand.New(rand.NewSource(time.Now().UnixNano())))
+}
+
+// SimulateEquityRNG is SimulateEquity with the randomness supplied.
+//
+// It exists because a harness that plays a hundred thousand hands has to be
+// able to play the same hundred thousand hands again. Seeding inside the
+// function made every equity call depend on the wall clock, so the same board
+// could produce a call one run and a fold the next, and no change to the
+// strategy could be told apart from that noise.
+//
+// The rng is not safe for concurrent use, so a caller running tables in
+// parallel gives each one its own.
+func SimulateEquityRNG(hero [2]table.Card, board []table.Card, opponentRanges []Range, iterations int, rng *rand.Rand) EquityResult {
 	start := time.Now()
 	if iterations <= 0 {
 		iterations = 10000
@@ -54,8 +68,6 @@ func SimulateEquity(hero [2]table.Card, board []table.Card, opponentRanges []Ran
 	if boardNeeded < 0 {
 		boardNeeded = 0
 	}
-
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	wins := 0
 	ties := 0

@@ -51,6 +51,17 @@ type AdvisorResponse struct {
 	// Risk is what beats hero right now, counted rather than sampled, so the
 	// interface can show the losing cases instead of only the winning share.
 	Risk *equity.RiskProfile `json:"risk,omitempty"`
+
+	// TableKnowledge is how well the least-known live opponent is understood,
+	// from 0 for a stranger to 1 for somebody there is a full read on. It is
+	// the least-known one and not the average on purpose: one player nobody has
+	// a line on makes the whole pot dangerous, whatever is known about the
+	// rest.
+	TableKnowledge float64 `json:"table_knowledge"`
+	// Phase is TableKnowledge said in words, for the interface: the tool plays
+	// carefully while it is learning the table and presses when it has learnt
+	// it, and a user should be able to see which of those is happening.
+	Phase string `json:"phase"`
 }
 
 // committedCallNarrowing is how much narrower a calling range is against a bet
@@ -303,21 +314,42 @@ func bettorRangeFraction(bet, potIncludingBet float64) float64 {
 	return math.Min(math.Max(frac, 0.05), 1)
 }
 
-// observedFoldRate returns the opponent fold tendency relevant to the street,
-// and whether one was actually available. It never invents a default: a bluff
-// recommended on fabricated fold equity is worse than no recommendation.
-func observedFoldRate(street table.Street, t map[string]float64) (float64, bool) {
+// observedFoldRate returns the opponent fold tendency relevant to the action
+// hero is about to take, and whether one was actually available. It never
+// invents a default: a bluff recommended on fabricated fold equity is worse
+// than no recommendation.
+//
+// Which tendency is relevant depends on whether hero is betting or raising, and
+// getting that wrong was expensive. A player folds to half the bets aimed at
+// them and to a small fraction of the raises, because by the time they are
+// facing a raise they have already put money in with something. The model
+// priced hero's own flop raises off fold-to-a-bet, concluded that raising
+// folded out half the field, and raised. Measured against a table of strong
+// opponents that single substitution turned +3.5 bb/100 into -5.8, and the
+// report named the spot outright: raising into a bet on the flop, fifteen big
+// blinds a hand.
+//
+// There is no falling back from one to the other. Without a read that describes
+// the action hero is taking there is no read, and the aggressive branch stays
+// shut -- which is the conservative answer and the correct one.
+func observedFoldRate(street table.Street, t map[string]float64, heroRaising bool) (float64, bool) {
 	if t == nil {
 		return 0, false
 	}
 	var keys []string
-	switch street {
-	case table.StreetPreflop:
-		keys = []string{"fold_to_3bet", "fold_to_raise", "fold_to_cbet"}
-	case table.StreetFlop:
-		keys = []string{"fold_to_cbet", "fold_to_bet", "fold_to_raise"}
+	switch {
+	case heroRaising && street == table.StreetPreflop:
+		// Hero is reraising, so what matters is how they answer a reraise.
+		keys = []string{"fold_to_3bet"}
+	case heroRaising:
+		keys = []string{"fold_to_raise_post"}
+	case street == table.StreetPreflop:
+		// Hero is opening; the opponent will be facing a raise.
+		keys = []string{"fold_to_raise", "fold_to_3bet"}
+	case street == table.StreetFlop:
+		keys = []string{"fold_to_cbet", "fold_to_bet"}
 	default:
-		keys = []string{"fold_to_bet", "fold_to_cbet", "fold_to_raise"}
+		keys = []string{"fold_to_bet", "fold_to_cbet"}
 	}
 	for _, k := range keys {
 		if v, ok := t[k]; ok && v >= 0 && v <= 1 {
@@ -368,6 +400,20 @@ type Inputs struct {
 	// one that is 88% because the other 12% is a full house.
 	Risk *equity.RiskProfile
 
+	// Opponents is what is known about each live opponent separately.
+	//
+	// One read for the whole table was the previous shape, and it is wrong in
+	// the place it matters most. Fold equity is the product of everybody
+	// folding, so a pot with a nit and a station in it is not the same as a pot
+	// with two of either -- and the model was being handed whichever of them
+	// happened to be found first and told to raise it to the power of two. The
+	// station is the one that decides whether a bluff works, and the old shape
+	// could not see him.
+	//
+	// Empty falls back to OppTendencies, ReadHands and ReadModelled applied to
+	// every opponent alike, which is exactly what the code did before.
+	Opponents []OpponentRead
+
 	// ReadHands is how many hands the tendencies in OppTendencies were counted
 	// over. Zero means they were not counted at all.
 	ReadHands int
@@ -375,6 +421,21 @@ type Inputs struct {
 	// statistics rather than counted from observed actions. Modelled reads are
 	// capped far below counted ones: they inform the estimate, never carry it.
 	ReadModelled bool
+}
+
+// OpponentRead is what is known about one live opponent.
+type OpponentRead struct {
+	PlayerID string
+	// Tendencies is the same shape profiler.GetPlayerTendencies returns.
+	Tendencies map[string]float64
+	// Hands is the counted sample behind the tendencies, and Modelled marks
+	// tendencies the language model produced rather than counted. Together they
+	// decide how far the estimate may move -- see readWeight.
+	Hands    int
+	Modelled bool
+	// Stack is what this opponent has left, which decides how much a bet of a
+	// given size actually costs them.
+	Stack float64
 }
 
 // CalculateAdvice is the compatibility entry point for callers that have no
@@ -445,6 +506,8 @@ func Calculate(in Inputs) AdvisorResponse {
 
 	winEq := eq.WinRate + eq.TieRate*0.5
 
+	var hasReads bool
+
 	opponents, deepestOpponent := liveOpponents(state)
 	if opponents < 1 {
 		opponents = 1
@@ -465,14 +528,18 @@ func Calculate(in Inputs) AdvisorResponse {
 
 	stacksKnown := effectiveStack > 0
 	heroPos := heroPosition(state)
-	observedFold, hasReads := observedFoldRate(state.Street, oppTendencies)
-	weight := 0.0
-	if hasReads {
-		weight = readWeight(in.ReadHands, in.ReadModelled)
-	}
-	// A read too weak to move the estimate is not a read.
-	if weight <= 0 {
-		hasReads = false
+
+	// One model per live opponent. Each folds at their own rate, feels the bet
+	// against their own stack, and is believed to the extent their own sample
+	// justifies.
+	// Whether hero's aggression would be a bet or a raise decides which read
+	// describes it, and it is settled by whether anything is owed.
+	models := opponentModels(in, state, opponents, deepestOpponent, toCall > 0)
+	hasReads = false
+	for _, m := range models {
+		if m.weight > 0 {
+			hasReads = true
+		}
 	}
 
 	// evRaise is the EV of putting in `raiseTo` total, with `opponents` players
@@ -483,11 +550,24 @@ func Calculate(in Inputs) AdvisorResponse {
 	// already counted in pot. Modelling the callers is what the previous
 	// formula omitted: it assumed exactly one, so a 5-way pot and a heads-up
 	// pot produced byte-identical advice.
-	evRaise := func(raiseTo float64) (ev float64, allFold float64) {
+	evRaiseAt := func(pot, toCall, raiseTo float64) (ev float64, allFold float64) {
 		if raiseTo <= 0 {
 			return 0, 0
 		}
-		f := foldFrequencyAtDepth(raiseTo-toCall, pot, observedFold, weight, deepestOpponent)
+		// Everybody has to fold for the bet to win the pot uncontested, and
+		// they fold at their own rates: the chance of that is the product, not
+		// a single rate raised to a power. `f` below is the average, which is
+		// what the range-narrowing needs -- how much of a typical opponent's
+		// range continues.
+		bet := raiseTo - toCall
+		allFoldProduct := 1.0
+		fSum := 0.0
+		for _, m := range models {
+			fi := foldFrequencyAtDepth(bet, pot, m.observed, m.weight, m.stack)
+			allFoldProduct *= fi
+			fSum += fi
+		}
+		f := fSum / float64(len(models))
 
 		// Minimum defence frequency is a bluff-catching rule, and it describes
 		// a defender who still has something to defend with: streets left to
@@ -574,7 +654,7 @@ func Calculate(in Inputs) AdvisorResponse {
 			}
 			callShare *= 1 - committedCallNarrowing*finality
 		}
-		allFold = math.Pow(f, float64(opponents))
+		allFold = allFoldProduct
 
 		expectedCallers := float64(opponents) * (1 - f)
 		contested := 1 - allFold
@@ -603,6 +683,41 @@ func Calculate(in Inputs) AdvisorResponse {
 		return allFold*pot + contested*evCalled, allFold
 	}
 
+	// evRaise is the EV of a wager in the situation actually in front of hero.
+	// evRaiseAt is the same calculation asked about a hypothetical one, which
+	// is what the trap below needs: what a raise would be worth if this
+	// opponent bets after hero checks.
+	evRaise := func(raiseTo float64) (float64, float64) {
+		return evRaiseAt(pot, toCall, raiseTo)
+	}
+
+	// How well the table is understood, and what that costs.
+	//
+	// A player nobody has a read on is not a neutral opponent, they are an
+	// unknown one, and the two are different things to put a stack in against.
+	// The equilibrium baseline the model falls back to is a reasonable average
+	// over strategies; it is not a description of the person in that seat, who
+	// might be a rock or might be a maniac, and the spread between those is
+	// exactly the money at risk. Sitting down at a fresh table -- or having
+	// somebody get up and a stranger take the chair -- should make the tool
+	// careful, and it did not: an unread opponent produced the same advice as a
+	// thoroughly read average one.
+	//
+	// The charge is quadratic in how much of the stack is going in, which is
+	// the shape wanted: a third of a pot against a stranger costs almost
+	// nothing, and a shove against one costs a fifth of the stack in modelled
+	// value. It disappears entirely once the table is known, which is what
+	// turns "play carefully while learning" and "press once you have learnt"
+	// into one continuous rule instead of two modes with a switch between them.
+	knowledge := tableKnowledge(models)
+	caution := func(amount float64) float64 {
+		if !stacksKnown || effectiveStack <= 0 || amount <= 0 || knowledge >= 1 {
+			return 0
+		}
+		share := math.Min(amount/effectiveStack, 1)
+		return darkHorseCaution * (1 - knowledge) * share * amount
+	}
+
 	evFold := 0.0
 
 	// Equity for the call decision is measured against the range that actually
@@ -621,6 +736,24 @@ func Calculate(in Inputs) AdvisorResponse {
 	callRangeFraction := 1.0
 	if toCall > 0 && state.Street != table.StreetPreflop && in.EquityVsTop != nil {
 		callRangeFraction = bettorRangeFraction(toCall, pot)
+		// And then: how often does *this* player bet?
+		//
+		// The equilibrium figure above is a statement about how wide a range
+		// has to be to make a bet of that size balanced. It is not a statement
+		// about the person who just bet. Someone betting nine flops in ten is
+		// betting nearly everything they hold, and hero's hand is far better
+		// against that than the sizing suggests; someone betting three in ten
+		// has a range hero is far behind. Priced off the equilibrium alone the
+		// tool folded to the first and called the second, which is backwards
+		// and is where "he studies them and then goes after them" has to
+		// actually happen.
+		//
+		// The read is blended, never substituted, by the same weight rule as
+		// everything else: a frequency counted over twelve flops moves the
+		// estimate a little and cannot become it.
+		if f, w, ok := bettorBetFrequency(in, state); ok {
+			callRangeFraction = math.Min(math.Max(callRangeFraction*(1-w)+f*w, 0.05), 1)
+		}
 		callEquity = math.Min(math.Max(in.EquityVsTop(callRangeFraction), 0), 1)
 	}
 
@@ -636,8 +769,73 @@ func Calculate(in Inputs) AdvisorResponse {
 		// Checking sees the next card; how much of the equity survives to be
 		// shown down depends on position and on how many players are still in.
 		evCall = winEq * callRealisation * pot
+
+		// And sometimes checking is worth a great deal more than that, because
+		// somebody bets into it.
+		//
+		// This is the trap, and it is the first thing in the model that looks
+		// past the action in front of it. Until now a check was priced as
+		// giving up on the pot: equity times what is already in it. Nothing in
+		// that expression contains the money a check-raise wins, so slowplaying
+		// and inducing were not merely played badly, they were invisible --
+		// there was no term for them. A hand strong enough to raise a bet that
+		// has not happened yet was always better off betting, whatever the
+		// opponent was going to do.
+		//
+		// What makes it computable now is the read the profiler counts: how
+		// often this player bets when they are checked to. With that, a check
+		// is a branch -- they check behind and the hand goes to the next card,
+		// or they bet and hero gets the same decision with more money in the
+		// middle -- and both halves are things the model can already price.
+		//
+		// It stays entirely off without the read. There is no equilibrium
+		// figure for "how often does an unknown player bet when checked to"
+		// that is worth trapping on, and inventing one would be exactly the
+		// fabricated-fold-equity mistake in a new place.
+		if state.Street != table.StreetPreflop && in.EquityVsTop != nil {
+			if pAny, fBettor, w, ok := checkedToBetFrequency(in, state); ok {
+				bet := trapBetSize * pot
+				if stacksKnown && bet > effectiveStack {
+					bet = effectiveStack
+				}
+				trapPot := pot + bet
+
+				// Hero's equity against the range that would do the betting.
+				// A player who bets four flops in five is betting nearly
+				// everything they hold, and that is the whole of why trapping
+				// them is profitable.
+				betEq := math.Min(math.Max(in.EquityVsTop(fBettor), 0), 1)
+
+				// The best answer to that bet: give it up, pay it, or raise it.
+				// Folding is the floor, so the branch can never be worth less
+				// than nothing.
+				answer := 0.0
+				if v := betEq*callRealisation*(trapPot+bet) - bet; v > answer {
+					answer = v
+				}
+				for _, size := range []float64{2 * bet, 2*bet + 0.66*pot, effectiveStack} {
+					if size <= 0 {
+						continue
+					}
+					if stacksKnown && size > effectiveStack {
+						size = effectiveStack
+					}
+					if ev, _ := evRaiseAt(trapPot, bet, size); ev > answer {
+						answer = ev
+					}
+				}
+
+				trap := (1-pAny)*evCall + pAny*answer
+				// Weighted by how much of a read is behind it, like every other
+				// read in this file: a frequency counted over a dozen flops
+				// moves the estimate and cannot become it.
+				evCall = (1-w)*evCall + w*trap
+			}
+		}
 	} else {
 		evCall = callEquity*callRealisation*(pot+toCall) - toCall
+		// Paying off a stranger is the same risk as betting into one.
+		evCall -= caution(toCall)
 	}
 
 	cap := func(v float64) float64 {
@@ -668,6 +866,7 @@ func Calculate(in Inputs) AdvisorResponse {
 			}
 		}
 		ev, fe := evRaise(amount)
+		ev -= caution(amount)
 		return append(actions, ActionRecommendation{
 			Action:      act,
 			Amount:      amount,
@@ -733,8 +932,52 @@ func Calculate(in Inputs) AdvisorResponse {
 	// nothing about, is a guess dressed as a calculation. A modelled tendency
 	// does not open the bluff branch either: it may size a value bet, but it
 	// may not be the reason to put money in with a losing hand.
-	countedReads := hasReads && !in.ReadModelled && in.ReadHands > 0
-	aggressionAllowed := winEq >= 0.50 || countedReads
+	// A bluff is only priced when every player who could call it has been
+	// counted, and only when what was counted says bluffing works.
+	//
+	// The first half was there and the second was missing, and the second is
+	// the one that costs money. Knowing an opponent is not a reason to bluff
+	// them; it is a reason to bluff them *if they fold*. As written, any
+	// counted read opened the aggressive branch -- including a read saying the
+	// player never folds anything -- and the tool duly started betting into
+	// stations. Measured against every field: the read-driven version's raises
+	// earned less than the read-free version's in every single spot the report
+	// broke out, on the flop, on the turn, checked to and facing a bet.
+	//
+	// What makes a bluff work is folding *above* what the price demands. Facing
+	// a pot-sized bet an opponent must continue with half their range, so a
+	// player folding more than half of it is paying for the bluff and a player
+	// folding less is charging for it. That is the line, it is not a tuned
+	// constant, and it comes straight out of the same minimum-defence
+	// arithmetic the fold model is built on.
+	countedReads := true
+	for _, m := range models {
+		if !m.counted || m.observed <= bluffWorthwhileFold {
+			countedReads = false
+			break
+		}
+	}
+
+	// Which equity opens the aggressive branch depends on whether somebody has
+	// already bet.
+	//
+	// Facing a bet, the range hero is up against is not the opponent's whole
+	// range -- it is the part of it that bet, and the call decision already
+	// knows that: callEquity is measured against exactly that slice. The gate
+	// on raising was measured against everything. So the tool would decline to
+	// call a bet on narrowed equity and then raise it on the un-narrowed
+	// figure, which is not a strategy, it is two different opinions about the
+	// same range in one decision.
+	//
+	// The harness put a number on it. Raising into a bet on the flop lost the
+	// tool sixteen big blinds a hand across three hundred and sixty hands,
+	// where a competent opponent in the same spot made four -- twenty big
+	// blinds a hand of difference, and the largest single entry in the report.
+	gateEquity := winEq
+	if toCall > 0 {
+		gateEquity = callEquity
+	}
+	aggressionAllowed := gateEquity >= 0.50 || countedReads
 
 	bestIdx := 0
 	bestEV := evFold
@@ -783,7 +1026,33 @@ func Calculate(in Inputs) AdvisorResponse {
 	// is taken from the chart.
 	chartAction, charted := chartedAction(state)
 	if charted {
-		if idx, ok := matchChartAction(actions, chartAction, toCall); ok {
+		if chartAction == preflop.Raise {
+			// A chart that says "raise" means the raise that chart is written
+			// for -- an open of two and a half big blinds at a hundred deep --
+			// and not whichever size the expected-value comparison likes best.
+			//
+			// It was the latter, and the comparison always likes the biggest
+			// one: fold equity rises with size, so an open-shove of a hundred
+			// big blinds "wins" a pot of one and a half almost every time and
+			// scores higher than an open. Measured against a table of strong
+			// opponents that is what the tool did with its best hands, at the
+			// ninety-ninth percentile of its bet sizes: sixty-six times the
+			// pot, preflop, with aces. It is the same blindness that produced
+			// the postflop overbets -- a one-street model choosing between
+			// sizes whose whole difference is what happens on the streets after
+			// -- and the chart is exactly the outside knowledge that settles
+			// it.
+			//
+			// Short stacks are not a special case: a chart open of two and a
+			// half blinds against a stack of ten is an all-in, and addSizing
+			// names it one.
+			if want := chartRaiseAmount(state, toCall, heroCurrentBet); want > 0 {
+				actions = addSizing(actions, table.ActionRaise, want, "Chart Open")
+				if idx, ok := nearestRaise(actions, roundToTwoDecimals(cap(want))); ok {
+					bestIdx = idx
+				}
+			}
+		} else if idx, ok := matchChartAction(actions, chartAction, toCall); ok {
 			bestIdx = idx
 		}
 	}
@@ -824,6 +1093,8 @@ func Calculate(in Inputs) AdvisorResponse {
 		PrimaryAction:     primaryAct.Action,
 		RecommendedAmount: primaryAct.Amount,
 		Reasoning:         reasoning,
+		TableKnowledge:    roundToTwoDecimals(knowledge),
+		Phase:             phaseName(knowledge),
 		EffectiveStack:    roundToTwoDecimals(effectiveStack),
 		Opponents:         opponents,
 		HasReads:          hasReads,
@@ -831,6 +1102,348 @@ func Calculate(in Inputs) AdvisorResponse {
 		CallEquity:        callEquity,
 		Risk:              in.Risk,
 	}
+}
+
+// foldSampleSize is how many times the fold frequency now in use was actually
+// observed. Keyed the same way observedFoldRate keys its lookup, with "_n"
+// appended, because the count belongs to the frequency and not to the player.
+func foldSampleSize(street table.Street, t map[string]float64, heroRaising bool) (int, bool) {
+	var keys []string
+	switch {
+	case heroRaising && street == table.StreetPreflop:
+		keys = []string{"fold_to_3bet_n"}
+	case heroRaising:
+		keys = []string{"fold_to_raise_post_n"}
+	case street == table.StreetPreflop:
+		keys = []string{"fold_to_raise_n", "fold_to_3bet_n"}
+	case street == table.StreetFlop:
+		keys = []string{"fold_to_cbet_n", "fold_to_bet_n"}
+	default:
+		keys = []string{"fold_to_bet_n", "fold_to_cbet_n"}
+	}
+	for _, k := range keys {
+		if v, ok := t[k]; ok && v > 0 {
+			return int(v), true
+		}
+	}
+	return 0, false
+}
+
+// bluffWorthwhileFold is how often an opponent has to fold before bluffing them
+// is worth doing at all: the equilibrium continuation frequency against a
+// pot-sized bet. Below it they are defending correctly or better, and a bluff
+// is buying nothing.
+const bluffWorthwhileFold = 0.50
+
+// darkHorseCaution is the share of a full commitment set aside for not knowing
+// who is on the other side of it.
+//
+// Stated, not derived, and the shape matters more than the number: at a shove
+// against a table of strangers it withholds a fifth of the stack in modelled
+// value, at a third-pot bet it withholds a fifth of one per cent, and at a
+// table that is fully read it withholds nothing at all.
+const darkHorseCaution = 0.20
+
+// tableKnowledge is how well the least-known live opponent is understood.
+//
+// The minimum and not the average, because that is what being at a table with
+// one stranger is actually like: whatever is known about the other four, the
+// pot can still end up heads-up against the person nobody has a line on. It is
+// the same reasoning that closes the bluffing branch unless every opponent has
+// been counted.
+func tableKnowledge(models []oppModel) float64 {
+	if len(models) == 0 {
+		return 0
+	}
+	least := 1.0
+	for _, m := range models {
+		// The same shrinkage readWeight uses, normalised so that a fully
+		// counted opponent reads as one rather than as the weight cap.
+		k := readWeight(m.hands, false) / maxMeasuredWeight
+		if k > 1 {
+			k = 1
+		}
+		if k < least {
+			least = k
+		}
+	}
+	return least
+}
+
+// phaseName is table knowledge in words, for the interface.
+func phaseName(k float64) string {
+	switch {
+	case k < 0.34:
+		return "разведка"
+	case k < 0.75:
+		return "применение"
+	default:
+		return "давление"
+	}
+}
+
+// trapBetSize is the bet a checked-to opponent is assumed to make, as a
+// fraction of the pot. Stated, not derived: two thirds is the standard size
+// across every population anybody has measured, and the branch is not sensitive
+// to it -- what decides whether trapping is right is how *often* they bet, not
+// how much.
+const trapBetSize = 0.66
+
+// checkedToBetFrequency is how likely it is that somebody bets if hero checks.
+//
+// Two numbers come back and they are different questions. pAny is the chance
+// that any live opponent bets, which is what weights the branch; fBettor is the
+// betting frequency of the player most likely to be doing it, which is how wide
+// the range hero would be facing. In a heads-up pot they are the same.
+//
+// Opponents with no counted read contribute nothing to either. That makes the
+// estimate conservative -- the trap is undervalued at a table of strangers,
+// which is the right direction to be wrong in.
+func checkedToBetFrequency(in Inputs, state table.HandState) (pAny, fBettor, weight float64, ok bool) {
+	if len(in.Opponents) == 0 {
+		return 0, 0, 0, false
+	}
+	live := map[string]bool{}
+	for _, seat := range state.Seats {
+		if seat.PlayerID != state.HeroID && !seat.IsFolded && seat.IsActive {
+			live[seat.PlayerID] = true
+		}
+	}
+
+	key, countKey := "bet_freq_late", "bet_freq_late_n"
+	if state.Street == table.StreetFlop {
+		key, countKey = "bet_freq_flop", "bet_freq_flop_n"
+	}
+
+	noneBets := 1.0
+	found := false
+	for _, o := range in.Opponents {
+		if !live[o.PlayerID] {
+			continue
+		}
+		f, has := o.Tendencies[key]
+		if !has || f < 0 || f > 1 {
+			continue
+		}
+		n := 0
+		if v, okN := o.Tendencies[countKey]; okN {
+			n = int(v)
+		}
+		modelled := o.Modelled
+		if v, okM := o.Tendencies["modelled"]; okM && v > 0 {
+			modelled = true
+		}
+		w := readWeight(n, modelled)
+		if w <= 0 {
+			continue
+		}
+		found = true
+		noneBets *= 1 - f
+		if f > fBettor {
+			fBettor = f
+			weight = w
+		}
+	}
+	if !found {
+		return 0, 0, 0, false
+	}
+	return 1 - noneBets, fBettor, weight, true
+}
+
+// bettorBetFrequency is how often the player who just bet takes that action
+// when nothing is owed, and how far the model may move towards it.
+//
+// The bettor is the live opponent whose chips on the felt match the bet hero is
+// facing. When several match -- a bet and a call of it -- the last one to have
+// acted aggressively is the one whose range is being priced, so the badge
+// decides it.
+func bettorBetFrequency(in Inputs, state table.HandState) (freq, weight float64, ok bool) {
+	if len(in.Opponents) == 0 {
+		return 0, 0, false
+	}
+	bettor := ""
+	for _, seat := range state.Seats {
+		if seat.PlayerID == state.HeroID || seat.IsFolded {
+			continue
+		}
+		if seat.CurrentBet+1e-9 < state.CurrentBet {
+			continue
+		}
+		switch seat.LastAction {
+		case "bet", "raise", "all-in":
+			bettor = seat.PlayerID
+		}
+	}
+	if bettor == "" {
+		return 0, 0, false
+	}
+
+	key, countKey := "bet_freq_late", "bet_freq_late_n"
+	if state.Street == table.StreetFlop {
+		key, countKey = "bet_freq_flop", "bet_freq_flop_n"
+	}
+	for _, o := range in.Opponents {
+		if o.PlayerID != bettor {
+			continue
+		}
+		f, has := o.Tendencies[key]
+		if !has || f < 0 || f > 1 {
+			return 0, 0, false
+		}
+		n := 0
+		if v, okN := o.Tendencies[countKey]; okN {
+			n = int(v)
+		}
+		modelled := o.Modelled
+		if v, okM := o.Tendencies["modelled"]; okM && v > 0 {
+			modelled = true
+		}
+		w := readWeight(n, modelled)
+		if w <= 0 {
+			return 0, 0, false
+		}
+		return f, w, true
+	}
+	return 0, 0, false
+}
+
+// oppModel is one live opponent as the fold-equity model sees them.
+type oppModel struct {
+	observed float64
+	weight   float64
+	stack    float64
+	counted  bool
+	// hands is how many hands this opponent has been watched for, whatever
+	// statistics happen to have come out of them.
+	//
+	// It is deliberately not the same as weight. Weight says how far a
+	// particular fold frequency may move the estimate and is zero when that
+	// frequency was never counted; hands says how much of a stranger this
+	// person still is, which is a different question and the one that decides
+	// how carefully to play. Taking the first for the second put the tool
+	// permanently in reconnaissance whenever fold frequencies were not being
+	// collected -- which is the ordinary case.
+	hands int
+}
+
+// opponentModels builds one model per live opponent.
+//
+// With Inputs.Opponents supplied, each is read on its own terms. Without it the
+// single OppTendencies read is applied to every seat alike and the deepest
+// opponent's stack stands in for all of them, which is what the code did
+// before this existed and is kept so that the older entry points behave as they
+// always have.
+func opponentModels(in Inputs, state table.HandState, opponents int, deepest float64, heroRaising bool) []oppModel {
+	if len(in.Opponents) > 0 {
+		out := make([]oppModel, 0, len(in.Opponents))
+		for _, o := range in.Opponents {
+			m := oppModel{stack: o.Stack, hands: o.Hands}
+			if m.stack <= 0 {
+				m.stack = deepest
+			}
+			if n, ok := o.Tendencies["hands_count"]; ok && n > float64(m.hands) {
+				m.hands = int(n)
+			}
+			observed, has := observedFoldRate(state.Street, o.Tendencies, heroRaising)
+			if has {
+				hands := o.Hands
+				modelled := o.Modelled
+				// A tendency the language model supplied is an opinion, and it
+				// is marked as one whether or not the caller said so.
+				if v, ok := o.Tendencies["modelled"]; ok && v > 0 {
+					modelled = true
+				}
+				// The sample that matters is how many times this player was
+				// actually bet at, not how many hands they were dealt. A
+				// regular can sit for two hundred hands and have faced four
+				// raises, and weighting the read by two hundred says the four
+				// are a fact.
+				if n, ok := foldSampleSize(state.Street, o.Tendencies, heroRaising); ok {
+					hands = n
+				} else if n, ok := o.Tendencies["hands_count"]; ok && hands == 0 && n > 0 {
+					hands = int(n)
+				}
+				if w := readWeight(hands, modelled); w > 0 {
+					m.observed = observed
+					m.weight = w
+					m.counted = !modelled && hands > 0
+				}
+			}
+			out = append(out, m)
+		}
+		return out
+	}
+
+	observed, has := observedFoldRate(state.Street, in.OppTendencies, heroRaising)
+	weight := 0.0
+	if has {
+		weight = readWeight(in.ReadHands, in.ReadModelled)
+	}
+	counted := weight > 0 && !in.ReadModelled && in.ReadHands > 0
+	if weight <= 0 {
+		observed = 0
+	}
+	hands := in.ReadHands
+	if n, ok := in.OppTendencies["hands_count"]; ok && n > float64(hands) {
+		hands = int(n)
+	}
+	out := make([]oppModel, opponents)
+	for i := range out {
+		out[i] = oppModel{observed: observed, weight: weight, stack: deepest, counted: counted, hands: hands}
+	}
+	return out
+}
+
+// chartRaiseAmount is the size the preflop chart means by "raise", as chips
+// added now.
+//
+// These are the standard shapes at a hundred big blinds and they are stated,
+// not derived: an open of two and a half blinds with one more for every limper
+// already in, a three-bet of three times what is owed, a four-bet of a little
+// over two. The chart is a hundred-big-blind chart and these are the sizes it
+// assumes; a model that could work them out for itself would need to see the
+// streets they are played on.
+func chartRaiseAmount(state table.HandState, toCall, heroCurrentBet float64) float64 {
+	switch preflop.SituationOf(state) {
+	case preflop.FacingRaise:
+		return 3.0 * toCall
+	case preflop.FacingThreeBet:
+		return 2.2 * toCall
+	default:
+		// Nobody has raised, so whatever is out there is the big blind.
+		bb := state.CurrentBet
+		if bb <= 0 {
+			bb = 1
+		}
+		limpers := 0.0
+		for _, seat := range state.Seats {
+			if seat.PlayerID != state.HeroID && !seat.IsFolded && seat.LastAction == "call" {
+				limpers++
+			}
+		}
+		want := (2.5+limpers)*bb - heroCurrentBet
+		if want < toCall {
+			want = toCall
+		}
+		return want
+	}
+}
+
+// nearestRaise is the aggressive option closest to an amount, which is how a
+// wanted size is turned into one of the sizes actually on offer -- the list is
+// capped by the effective stack and de-duplicated, so the amount asked for is
+// not always among them.
+func nearestRaise(actions []ActionRecommendation, amount float64) (int, bool) {
+	best, bestGap := -1, math.Inf(1)
+	for i, a := range actions {
+		switch a.Action {
+		case table.ActionRaise, table.ActionBet, table.ActionAllIn:
+			if gap := math.Abs(a.Amount - amount); gap < bestGap {
+				best, bestGap = i, gap
+			}
+		}
+	}
+	return best, best >= 0
 }
 
 // chartedAction consults the preflop charts. They answer only when the street
