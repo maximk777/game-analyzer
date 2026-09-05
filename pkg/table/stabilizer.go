@@ -2,10 +2,12 @@ package table
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // StateStabilizer maintains a smoothed, monotonically consistent table state across noisy/glitchy video frames.
@@ -745,6 +747,37 @@ func placeholderName(s string) bool {
 	return strings.HasPrefix(s, "player-") || strings.HasPrefix(s, "Player ")
 }
 
+// betterName picks the more plausible of two readings of one nameplate,
+// keeping what is already held when neither is better.
+//
+// This is a heuristic, and it fails where a real name is mostly punctuation.
+// The alternative it replaced -- keep whatever was read first -- failed on
+// every frame where the first read caught a half-drawn table, which is more
+// often.
+func betterName(held, fresh string) string {
+	switch {
+	case placeholderName(fresh):
+		return held
+	case placeholderName(held):
+		return fresh
+	case plausibility(fresh) > plausibility(held):
+		return fresh
+	default:
+		return held
+	}
+}
+
+// plausibility counts what a nameplate is made of.
+func plausibility(s string) int {
+	var n int
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			n++
+		}
+	}
+	return n
+}
+
 // numbered reports whether a frame numbers its seats. A state whose seats all
 // sit at zero has not numbered them at all.
 func numbered(seats []SeatState) bool {
@@ -804,17 +837,17 @@ func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 				merged.Stack = p.Stack
 			}
 			// The nameplate is read by OCR, and the same chair comes back as
-			// "ruddy16923342", "$mt:mk$A$:1$" and "R" on consecutive frames.
-			// Players do not change chairs inside a hand, so a name that has
-			// already been read for this seat is kept and a later reading is
-			// treated as a misread rather than a new person. A placeholder
-			// yields to anything real, which is how the first good read lands.
-			if placeholderName(r.PlayerID) || (!placeholderName(p.PlayerID) && r.PlayerID != p.PlayerID) {
-				merged.PlayerID = p.PlayerID
-			}
-			if placeholderName(r.PlayerName) || (!placeholderName(p.PlayerName) && r.PlayerName != p.PlayerName) {
-				merged.PlayerName = p.PlayerName
-			}
+			// "ruddy16923342", then "A", then "$:$$CmA$A::". Players do not
+			// change chairs inside a hand, so these are readings of one name
+			// and the best of them is kept.
+			//
+			// Best means the most letters and digits: the failures seen are a
+			// truncation to the first glyph and a spray of punctuation, and
+			// both lose to a full nameplate on that count. Keeping the first
+			// reading instead locked in whatever was on screen while the table
+			// was still drawing.
+			merged.PlayerID = betterName(p.PlayerID, r.PlayerID)
+			merged.PlayerName = betterName(p.PlayerName, r.PlayerName)
 			// A badge that flickers out for a frame must not un-fold a player:
 			// folding is not undone within a hand.
 			if r.LastAction == "" && p.LastAction != "" {
@@ -854,6 +887,15 @@ func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 			continue
 		}
 		res = append(res, p)
+	}
+
+	// Seat order is the order they are drawn in, so it has to be the same on
+	// every frame. Built from the raw frame with the carried-forward seats
+	// appended, a chair the recogniser missed for one frame jumped to the
+	// bottom of the panel and back again on the next -- with six chairs and a
+	// frame every few dozen milliseconds, the whole list moved constantly.
+	if byNumber {
+		sort.SliceStable(res, func(i, j int) bool { return res[i].SeatNumber < res[j].SeatNumber })
 	}
 
 	return res

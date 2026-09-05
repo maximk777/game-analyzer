@@ -106,16 +106,49 @@ func TestMergeSeatsStillPreservesWhatItShould(t *testing.T) {
 	}
 }
 
-// Players do not change chairs inside a hand, so a nameplate that reads
-// differently on the next frame is a misread, not a new person. Keyed by seat
-// alone, the garbled reading used to overwrite the good one.
-func TestMergeSeatsKeepsTheNameItAlreadyRead(t *testing.T) {
-	prev := numberedSeats("ruddy16923342", "mamayazareyzil")
-	raw := numberedSeats("$mt:mk$A$:1$", "R")
+// These are the readings the panel actually showed for one table: a full
+// nameplate, a truncation to the first glyph, and a spray of punctuation.
+func TestMergeSeatsKeepsTheBestReadingOfANameplate(t *testing.T) {
+	prev := numberedSeats("ruddy16923342", "Mule1827", "J4zzy")
+	raw := numberedSeats("A", "$:$$CmA$A::", "J")
 
 	got := mergeSeats(prev, raw)
-	if got[0].PlayerID != "ruddy16923342" || got[1].PlayerID != "mamayazareyzil" {
-		t.Fatalf("garbled names overwrote good ones: %q, %q", got[0].PlayerID, got[1].PlayerID)
+	for i, want := range []string{"ruddy16923342", "Mule1827", "J4zzy"} {
+		if got[i].PlayerID != want {
+			t.Errorf("seat %d reads %q, want %q", i+1, got[i].PlayerID, want)
+		}
+	}
+}
+
+// A first reading caught while the table was still drawing must not lock the
+// seat for the rest of the hand.
+func TestMergeSeatsImprovesOnATruncatedFirstReading(t *testing.T) {
+	state := numberedSeats("A")
+	state = mergeSeats(state, numberedSeats("ruddy16923342"))
+	if state[0].PlayerID != "ruddy16923342" {
+		t.Fatalf("a fuller reading should win: %q", state[0].PlayerID)
+	}
+	// And once it is held, noise does not take it back.
+	state = mergeSeats(state, numberedSeats("$:$$"))
+	if state[0].PlayerID != "ruddy16923342" {
+		t.Fatalf("noise took the name back: %q", state[0].PlayerID)
+	}
+}
+
+func TestBetterName(t *testing.T) {
+	cases := []struct{ held, fresh, want string }{
+		{"ruddy16923342", "A", "ruddy16923342"},
+		{"A", "ruddy16923342", "ruddy16923342"},
+		{"Mule1827", "$:$$CmA$A::", "Mule1827"},
+		{"player-3", "J4zzy", "J4zzy"},
+		{"J4zzy", "player-3", "J4zzy"},
+		{"J4zzy", "", "J4zzy"},
+		{"TomSkyWalker", "TomSkyWalker", "TomSkyWalker"},
+	}
+	for _, c := range cases {
+		if got := betterName(c.held, c.fresh); got != c.want {
+			t.Errorf("betterName(%q, %q) = %q, want %q", c.held, c.fresh, got, c.want)
+		}
 	}
 }
 
@@ -138,5 +171,27 @@ func TestMergeSeatsSurvivesANameplateThatWentBlank(t *testing.T) {
 	got := mergeSeats(prev, raw)
 	if got[0].PlayerID != "Pororoka" {
 		t.Fatalf("the name was lost: %+v", got[0])
+	}
+}
+
+// Seat order is the order the panel draws them in, so it has to be the same on
+// every frame. A chair the recogniser missed used to be appended at the end
+// and jump back into place on the next frame.
+func TestMergeSeatsKeepsAStableOrder(t *testing.T) {
+	full := numberedSeats("a", "b", "c", "d")
+	missing := []SeatState{full[0], full[2], full[3]} // seat 2 not read this frame
+
+	got := mergeSeats(full, missing)
+	if len(got) != 4 {
+		t.Fatalf("%d seats, want four", len(got))
+	}
+	for i, s := range got {
+		if s.SeatNumber != i+1 {
+			nums := make([]int, len(got))
+			for j, x := range got {
+				nums[j] = x.SeatNumber
+			}
+			t.Fatalf("seats came back as %v, want them in order", nums)
+		}
 	}
 }
