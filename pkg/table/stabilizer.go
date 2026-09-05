@@ -515,7 +515,15 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 	// is adopted. That costs one frame of latency and makes a spike harmless.
 	mergedPot := prev.Pot
 	switch {
-	case raw.Pot > 0 && prev.Pot == 0:
+	case raw.Pot == 0:
+		// The pot was not read on this frame. That is not a reading of a
+		// smaller pot, so it must not throw away the candidate a previous frame
+		// put up. Nine frames in a hundred come back with no pot at all, and
+		// they used to land here and reset the count: a candidate that needed
+		// two frames to be believed lost the first one to any blank frame in
+		// between, so the displayed pot could sit at the blinds for a whole
+		// hand while the felt filled up.
+	case prev.Pot == 0:
 		mergedPot = raw.Pot
 	case raw.Pot > prev.Pot:
 		if potsAgree(raw.Pot, s.pendingPot) {
@@ -935,7 +943,7 @@ func (s *StateStabilizer) confirmStacks(prevSeats, merged []SeatState) []SeatSta
 			s.pendingStack[k], s.pendingStackSeen[k] = 0, 0
 		case raw == settled[k]:
 			s.pendingStack[k], s.pendingStackSeen[k] = 0, 0
-		case stacksAgree(raw, s.pendingStack[k]):
+		case s.pendingStackSeen[k] > 0 && stacksAgree(raw, s.pendingStack[k]):
 			// Seen twice, so it is a change rather than a misreading.
 			s.pendingStack[k], s.pendingStackSeen[k] = 0, 0
 		default:
@@ -949,8 +957,14 @@ func (s *StateStabilizer) confirmStacks(prevSeats, merged []SeatState) []SeatSta
 
 // stacksAgree reports whether two readings are the same figure. Money is read
 // off a nameplate, so the last cent is not always the same twice.
+//
+// Zero is a figure like any other. It is what an all-in player's nameplate
+// shows, and refusing to compare it meant a stack could never be confirmed
+// down to nothing: a player who shoved kept the chips they had a frame earlier
+// for the rest of the session, so every effective-stack figure counted money
+// that was already in the middle.
 func stacksAgree(a, b float64) bool {
-	if a <= 0 || b <= 0 {
+	if a < 0 || b < 0 {
 		return false
 	}
 	diff := a - b

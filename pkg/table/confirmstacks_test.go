@@ -79,3 +79,33 @@ func TestStacksAgreeWithinACent(t *testing.T) {
 		t.Error("different figures must not agree")
 	}
 }
+
+// A player who moves all in shows a nameplate reading zero. Zero used to be
+// refused as a comparison, so the reading could never be confirmed and the
+// seat kept the chips it held a frame earlier for the rest of the session.
+func TestConfirmStacksBelievesAnAllIn(t *testing.T) {
+	s := &StateStabilizer{}
+	prev := []SeatState{stacked(1, 181.84)}
+
+	got := s.confirmStacks(prev, []SeatState{stacked(1, 0)})
+	if got[0].Stack != 181.84 {
+		t.Fatalf("one zero is not yet proof of an all-in: %.2f", got[0].Stack)
+	}
+
+	got = s.confirmStacks(prev, []SeatState{stacked(1, 0)})
+	if got[0].Stack != 0 {
+		t.Fatalf("a zero seen twice is an all-in: %.2f", got[0].Stack)
+	}
+}
+
+// Zero is the pending value of a seat nothing has been proposed for yet, so a
+// first reading of zero must not be mistaken for a second one.
+func TestConfirmStacksDoesNotTakeAFirstZeroAsConfirmed(t *testing.T) {
+	s := &StateStabilizer{}
+	prev := []SeatState{stacked(1, 181.84), stacked(2, 90.72)}
+
+	got := s.confirmStacks(prev, []SeatState{stacked(1, 0), stacked(2, 90.72)})
+	if got[0].Stack != 181.84 {
+		t.Fatalf("the very first zero was taken as confirmed: %.2f", got[0].Stack)
+	}
+}
