@@ -72,6 +72,7 @@ type Server struct {
 	lastSentMu sync.Mutex
 
 	roiConfig       vision.ROIConfig
+	roiPath         string
 	roiMu           sync.RWMutex
 	snapshotData    []byte
 	snapshotType    string
@@ -90,6 +91,7 @@ func NewServer(cache *storage.MemoryCache, db *storage.SQLiteDB, prof *profiler.
 		hub:             hub,
 		mux:             http.NewServeMux(),
 		roiConfig:       vision.DefaultCoinPoker6MaxROI(),
+		roiPath:         roiConfigPath(),
 		windowsProvider: capture.ListAllWindows,
 		stabilizer:      table.NewStateStabilizer(),
 		upgrader: websocket.Upgrader{
@@ -618,11 +620,57 @@ func (s *Server) GetSnapshot() ([]byte, string) {
 	return out, s.snapshotType
 }
 
-// SetROIConfig updates the active table Region of Interest layout.
-func (s *Server) SetROIConfig(cfg vision.ROIConfig) {
+// SetROIConfig updates the active table layout and keeps it.
+//
+// Calibration is done by hand against one client's layout, so it has to
+// survive the process that took it. A layout that cannot be written is still
+// applied: the operator has calibrated, and refusing to use it because it
+// could not be filed would be the wrong way round.
+func (s *Server) SetROIConfig(cfg vision.ROIConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	s.roiMu.Lock()
-	defer s.roiMu.Unlock()
 	s.roiConfig = cfg
+	path := s.roiPath
+	s.roiMu.Unlock()
+
+	if path == "" {
+		return nil
+	}
+	return vision.SaveROIConfig(path, cfg)
+}
+
+// LoadROIConfig applies the saved calibration, if there is one.
+//
+// Reports what it did so a start-up line can say which layout is in use: the
+// built-in one and a hand-made one behave very differently, and until now
+// there was no way to tell them apart from the outside.
+func (s *Server) LoadROIConfig() (path string, loaded bool, err error) {
+	s.roiMu.RLock()
+	path = s.roiPath
+	s.roiMu.RUnlock()
+	if path == "" {
+		return "", false, nil
+	}
+	cfg, found, err := vision.LoadROIConfig(path)
+	if err != nil || !found {
+		return path, false, err
+	}
+	s.roiMu.Lock()
+	s.roiConfig = cfg
+	s.roiMu.Unlock()
+	return path, true, nil
+}
+
+// roiConfigPath is where calibrations are kept, or empty when this machine
+// will not say where its configuration lives.
+func roiConfigPath() string {
+	p, err := vision.ROIConfigPath()
+	if err != nil {
+		return ""
+	}
+	return p
 }
 
 // GetROIConfig returns the active table Region of Interest layout.
@@ -677,7 +725,12 @@ func (s *Server) handleSetROI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.SetROIConfig(cfg)
+	// A layout that cannot read a table is refused here rather than accepted
+	// and discovered later as an empty board and nameless players.
+	if err := s.SetROIConfig(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(cfg)

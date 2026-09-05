@@ -65,6 +65,16 @@ func main() {
 	// 5. Initialize Server & Hub
 	srv := server.NewServer(cache, db, prof)
 
+	// The built-in layout and a hand-made one behave very differently, and
+	// there was no way to tell from the outside which was in use.
+	if path, loaded, err := srv.LoadROIConfig(); err != nil {
+		log.Printf("table layout at %s could not be read, using the built-in one: %v", path, err)
+	} else if loaded {
+		log.Printf("table layout loaded from %s", path)
+	} else {
+		log.Printf("no saved table layout at %s, using the built-in one; calibrate to replace it", path)
+	}
+
 	// 6. Mount static web assets
 	if *webDirFlag != "" {
 		if _, err := os.Stat(*webDirFlag); err == nil {

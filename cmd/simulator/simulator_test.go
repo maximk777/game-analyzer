@@ -45,10 +45,10 @@ func TestSimulator_EndToEndIntegration(t *testing.T) {
 	defer wsConn.Close()
 
 	var (
-		mu              sync.Mutex
-		receivedStates  int
-		receivedRecs    int
-		receivedEvents  int
+		mu             sync.Mutex
+		receivedStates int
+		receivedRecs   int
+		receivedEvents int
 	)
 
 	wsCtx, wsCancel := context.WithCancel(context.Background())
