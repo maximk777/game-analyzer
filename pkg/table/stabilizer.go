@@ -43,6 +43,14 @@ type StateStabilizer struct {
 	// hand -- confirmed the same way, by surviving into the following frame.
 	pendingBoardClearSeen int
 
+	// Stacks were the one number with no confirmation at all: the only guard
+	// was not to overwrite with a zero, so every misread went straight to the
+	// panel and the figures jumped from frame to frame. A stack moves when
+	// money moves, which is not on every frame, so a new figure has to survive
+	// one more frame before it is believed -- the same rule the pot has had.
+	pendingStack     map[string]float64
+	pendingStackSeen map[string]int
+
 	// Events observed but not yet taken. The stabiliser is where the action
 	// stream is derived, so it is the only place that knows an action is new
 	// rather than the same badge seen again; anything downstream would have to
@@ -524,6 +532,7 @@ func (s *StateStabilizer) Stabilize(raw *HandState) *HandState {
 
 	// 5. Merge Seats / Players (Retain player names and stacks)
 	mergedSeats := mergeSeats(prev.Seats, raw.Seats)
+	mergedSeats = s.confirmStacks(prev.Seats, mergedSeats)
 
 	// 6. Determine Street from the merged board, but never move backwards
 	// within a hand. Vision can miss a board card for a frame; demoting turn
@@ -848,6 +857,65 @@ func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 	}
 
 	return res
+}
+
+// confirmStacks holds a seat's stack until a new figure repeats.
+//
+// A stack that reads differently on every frame is being misread, not spent:
+// money moves on an action, not on a repaint. The cost is one frame of lag on
+// a real change, which is what the pot already pays for the same reason.
+func (s *StateStabilizer) confirmStacks(prevSeats, merged []SeatState) []SeatState {
+	if s.pendingStack == nil {
+		s.pendingStack = make(map[string]float64)
+		s.pendingStackSeen = make(map[string]int)
+	}
+	byNumber := numbered(prevSeats) || numbered(merged)
+	key := func(x SeatState) string {
+		if byNumber {
+			return "#" + strconv.Itoa(x.SeatNumber)
+		}
+		return x.PlayerID
+	}
+
+	settled := make(map[string]float64, len(prevSeats))
+	known := make(map[string]bool, len(prevSeats))
+	for _, p := range prevSeats {
+		settled[key(p)] = p.Stack
+		known[key(p)] = p.Stack > 0
+	}
+
+	for i := range merged {
+		k := key(merged[i])
+		raw := merged[i].Stack
+		switch {
+		case !known[k]:
+			// Nothing settled yet, so the first figure read is what there is.
+			s.pendingStack[k], s.pendingStackSeen[k] = 0, 0
+		case raw == settled[k]:
+			s.pendingStack[k], s.pendingStackSeen[k] = 0, 0
+		case stacksAgree(raw, s.pendingStack[k]):
+			// Seen twice, so it is a change rather than a misreading.
+			s.pendingStack[k], s.pendingStackSeen[k] = 0, 0
+		default:
+			s.pendingStack[k] = raw
+			s.pendingStackSeen[k]++
+			merged[i].Stack = settled[k]
+		}
+	}
+	return merged
+}
+
+// stacksAgree reports whether two readings are the same figure. Money is read
+// off a nameplate, so the last cent is not always the same twice.
+func stacksAgree(a, b float64) bool {
+	if a <= 0 || b <= 0 {
+		return false
+	}
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= 0.01
 }
 
 func cloneHandState(h *HandState) *HandState {
