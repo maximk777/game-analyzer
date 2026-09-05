@@ -2,6 +2,7 @@ package table
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -726,6 +727,17 @@ func actionFromBadge(badge string) ActionType {
 	}
 }
 
+// numbered reports whether a frame numbers its seats. A state whose seats all
+// sit at zero has not numbered them at all.
+func numbered(seats []SeatState) bool {
+	for _, s := range seats {
+		if s.SeatNumber != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 	if len(rawSeats) == 0 {
 		return prevSeats
@@ -734,12 +746,20 @@ func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 		return rawSeats
 	}
 
-	// Keyed by player id, with the display name as a fallback. Keying on the
-	// name alone meant a seat whose name had not been read carried nothing
-	// forward, so anything the merge is meant to preserve -- stacks, fold
-	// state, revealed cards -- was dropped for exactly the seats that needed
-	// it most.
+	// Keyed by seat number wherever the frame carries one, because that is
+	// what identifies a chair between frames: the nameplate is read by OCR and
+	// the same player arrives as "ruddy16923342", "P:m:mRm$A$:1" and "mmo:" on
+	// three consecutive frames. Keyed on the name, each misreading was a new
+	// player, and since an unseen seat is carried forward, six players grew
+	// into twelve and never shrank.
+	//
+	// Names remain the key when nothing is numbered: the harness and most
+	// tests build states that way, and there a name is all there is.
+	byNumber := numbered(prevSeats) || numbered(rawSeats)
 	seatKey := func(s SeatState) string {
+		if byNumber {
+			return "#" + strconv.Itoa(s.SeatNumber)
+		}
 		if s.PlayerID != "" && s.PlayerID != "Player" {
 			return s.PlayerID
 		}
@@ -792,6 +812,9 @@ func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 		}
 	}
 
+	// A carried-forward seat keeps the number it had, so it cannot come back
+	// as a second chair on the next frame.
+	//
 	// Players do not leave the table in the middle of a hand. A nameplate the
 	// recogniser missed for one frame used to drop the player from the state
 	// entirely, and since the live opponent count now drives both the equity
