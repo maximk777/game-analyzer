@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,6 +63,13 @@ type Server struct {
 	stabilizer *table.StateStabilizer
 	auditLog   *audit.Logger
 	mu         sync.Mutex
+
+	// What was last sent for each table. Vision delivers a frame every few
+	// dozen milliseconds and most of them say exactly what the one before
+	// said; broadcasting each one made the panel redraw constantly, which is
+	// what "the whole screen jumps" is.
+	lastSent   map[string]string
+	lastSentMu sync.Mutex
 
 	roiConfig       vision.ROIConfig
 	roiMu           sync.RWMutex
@@ -274,6 +283,14 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	// 4. WebSocket broadcast
 	now := time.Now().UnixMilli()
 
+	// A frame that says what the last one said is not news. The panel is
+	// redrawn from these messages, so sending them anyway is what makes it
+	// flicker; nothing downstream loses anything by not hearing the same
+	// thing twice.
+	if s.alreadySent(tableID, event.HandState, rec, noAdvice) {
+		return rec, nil
+	}
+
 	s.hub.BroadcastToTable(tableID, WSMessage{
 		Type:      WSMsgEvent,
 		TableID:   tableID,
@@ -308,6 +325,40 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	})
 
 	return rec, nil
+}
+
+// alreadySent reports whether this table has just been told exactly this, and
+// records it when it has not.
+//
+// The fingerprint covers what the panel draws: the state and the advice. A
+// timestamp is deliberately not part of it, because the time a frame arrived
+// is the one thing that differs on every frame and nothing on screen shows it.
+func (s *Server) alreadySent(tableID string, state *table.HandState,
+	rec *advisor.AdvisorResponse, noAdvice string,
+) bool {
+	shot, err := json.Marshal(struct {
+		State    *table.HandState         `json:"state"`
+		Rec      *advisor.AdvisorResponse `json:"rec"`
+		NoAdvice string                   `json:"no_advice"`
+	}{state, rec, noAdvice})
+	if err != nil {
+		// Unable to tell, so say it is new: a redundant frame costs a redraw,
+		// a dropped one costs the panel being wrong.
+		return false
+	}
+	sum := sha256.Sum256(shot)
+	fingerprint := hex.EncodeToString(sum[:])
+
+	s.lastSentMu.Lock()
+	defer s.lastSentMu.Unlock()
+	if s.lastSent == nil {
+		s.lastSent = make(map[string]string)
+	}
+	if s.lastSent[tableID] == fingerprint {
+		return true
+	}
+	s.lastSent[tableID] = fingerprint
+	return false
 }
 
 // IngestLiveState updates the table state in cache, runs Monte Carlo equity and Advisor recommendation calculations, and broadcasts the state update over WebSocket.
