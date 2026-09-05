@@ -113,6 +113,20 @@ enum TableGeometry {
     // card clips the glyph on another. The border thickness is measured per
     // card instead -- see readCardSlot.
     static let indexSize = CGSize(width: 0.38, height: 0.60)
+
+    /// Nameplate centres for the six seats, clockwise from hero at the bottom,
+    /// in Vision's bottom-left normalized space. Measured across the three
+    /// captures in testdata, where the same seat lands within 0.05 of these
+    /// while neighbouring seats are 0.35 apart -- room enough that the nearest
+    /// anchor is the right one even when the window is a different size.
+    static let seatAnchors: [CGPoint] = [
+        CGPoint(x: 0.50, y: 0.13),   // bottom centre, always hero
+        CGPoint(x: 0.88, y: 0.34),   // lower right
+        CGPoint(x: 0.86, y: 0.71),   // upper right
+        CGPoint(x: 0.50, y: 0.79),   // top centre
+        CGPoint(x: 0.13, y: 0.71),   // upper left
+        CGPoint(x: 0.10, y: 0.34)    // lower left
+    ]
 }
 
 // MARK: - Bitmap helpers
@@ -1504,7 +1518,7 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
         }
 
         players.append(ParsedSeat(
-            seat_number: seatIndex(for: nameItem.box),
+            seat_number: -1,
             player_id: nameItem.name,
             player_name: nameItem.name,
             stack: stackVal,
@@ -1516,6 +1530,11 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
             cards: []
         ))
         seatBoxes.append(nameItem.box)
+    }
+    // Numbered together rather than one at a time, because a seat number is
+    // only worth anything if no two seats share one.
+    for (i, number) in assignSeatNumbers(seatBoxes).enumerated() {
+        players[i].seat_number = number
     }
     // One RGBA conversion of the frame, shared by every geometric search.
     // Each search used to convert the whole image again -- four times a frame,
@@ -1799,7 +1818,11 @@ func looksLikeSeatName(_ t: String) -> Bool {
     let badges = ["all-in", "all in", "allin", "straddle", "sitting out",
                   "quick join", "ouick join", "join", "play next", "app health",
                   "helpdesk", "waiting", "deciding", "next game", "buy in",
-                  "buy-in", "rebuy", "add chips", "outs"]
+                  "buy-in", "rebuy", "add chips", "outs",
+                  // The word the client prints on a seat nobody is in. It only
+                  // failed to become a player because no chip count sits under
+                  // it; a bet chip read nearby is all it would take.
+                  "empty"]
     for badge in badges where lower.contains(badge) { return false }
 
     // A nickname carries letters. Strings that are only digits, separators and
@@ -2344,8 +2367,56 @@ func seatOrderKey(_ box: CGRect) -> Double {
     return angle < 0 ? angle + 2 * .pi : angle
 }
 
-func seatIndex(for box: CGRect) -> Int {
-    let key = seatOrderKey(box)
-    let idx = Int((key / (2 * .pi)) * 6.0)
-    return min(max(idx, 0), 5)
+/// Seat numbers for a frame's nameplates: one per box, all distinct.
+///
+/// Seat number is the identity a player keeps between frames, so two things
+/// have to hold and neither held before.
+///
+/// It has to be stable. The old rule cut the circle into six equal sectors
+/// starting at straight down, which put the boundary exactly on the hero
+/// nameplate at the bottom of the table. Hero sits a hair either side of centre
+/// from one recognition to the next, so hero's own seat number alternated
+/// between 0 and 5 frame by frame, and every consumer keyed by seat number saw
+/// hero leave the table and a stranger sit down, ten times a second.
+///
+/// It has to be unique. Equal sectors also do not describe the table: the felt
+/// is a wide oval, so the four side seats sit far from the 60-degree marks.
+/// Measured on the three captures in testdata, the seats fall at 0, 70, 120,
+/// 180, 240 and 290 degrees, which equal sectors collapse onto four numbers --
+/// upper-right shares with lower-right, upper-left with top-centre -- while two
+/// numbers are never issued at all. Two players holding one seat number is
+/// worse than a wrong number: they overwrite each other, so a name, a stack and
+/// an action all flip between two players every frame.
+///
+/// So each nameplate is matched to the nearest of six measured anchors, and an
+/// anchor is spent once. Anything beyond a sixth seat is numbered past the end
+/// rather than made to share, which leaves the frame visibly unreadable instead
+/// of quietly wrong.
+func assignSeatNumbers(_ boxes: [CGRect]) -> [Int] {
+    let anchors = TableGeometry.seatAnchors
+    var pairs: [(box: Int, anchor: Int, dist: Double)] = []
+    for (b, box) in boxes.enumerated() {
+        for (a, anchor) in anchors.enumerated() {
+            let dx = Double(box.midX - anchor.x)
+            let dy = Double(box.midY - anchor.y)
+            pairs.append((b, a, dx * dx + dy * dy))
+        }
+    }
+    // Closest match first, so a nameplate sitting squarely on its anchor claims
+    // it before one that is merely nearby.
+    pairs.sort { $0.dist == $1.dist ? ($0.box, $0.anchor) < ($1.box, $1.anchor) : $0.dist < $1.dist }
+
+    var seats = [Int](repeating: -1, count: boxes.count)
+    var takenAnchor = [Bool](repeating: false, count: anchors.count)
+    for p in pairs where seats[p.box] < 0 && !takenAnchor[p.anchor] {
+        seats[p.box] = p.anchor
+        takenAnchor[p.anchor] = true
+    }
+
+    var overflow = anchors.count
+    for i in seats.indices where seats[i] < 0 {
+        seats[i] = overflow
+        overflow += 1
+    }
+    return seats
 }
