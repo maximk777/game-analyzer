@@ -105,3 +105,38 @@ func TestMergeSeatsStillPreservesWhatItShould(t *testing.T) {
 		t.Error("cards stay revealed once shown")
 	}
 }
+
+// Players do not change chairs inside a hand, so a nameplate that reads
+// differently on the next frame is a misread, not a new person. Keyed by seat
+// alone, the garbled reading used to overwrite the good one.
+func TestMergeSeatsKeepsTheNameItAlreadyRead(t *testing.T) {
+	prev := numberedSeats("ruddy16923342", "mamayazareyzil")
+	raw := numberedSeats("$mt:mk$A$:1$", "R")
+
+	got := mergeSeats(prev, raw)
+	if got[0].PlayerID != "ruddy16923342" || got[1].PlayerID != "mamayazareyzil" {
+		t.Fatalf("garbled names overwrote good ones: %q, %q", got[0].PlayerID, got[1].PlayerID)
+	}
+}
+
+// The first real reading has to land, or a seat stays a placeholder forever.
+func TestMergeSeatsTakesTheFirstRealName(t *testing.T) {
+	prev := []SeatState{{SeatNumber: 1, PlayerID: "player-1", PlayerName: "Player 1", IsActive: true}}
+	raw := []SeatState{{SeatNumber: 1, PlayerID: "Pororoka", PlayerName: "Pororoka", IsActive: true}}
+
+	got := mergeSeats(prev, raw)
+	if got[0].PlayerID != "Pororoka" || got[0].PlayerName != "Pororoka" {
+		t.Fatalf("a placeholder should yield to a real name: %+v", got[0])
+	}
+}
+
+// A nameplate that fails to read must not undo the one that did.
+func TestMergeSeatsSurvivesANameplateThatWentBlank(t *testing.T) {
+	prev := numberedSeats("Pororoka")
+	raw := []SeatState{{SeatNumber: 1, IsActive: true}}
+
+	got := mergeSeats(prev, raw)
+	if got[0].PlayerID != "Pororoka" {
+		t.Fatalf("the name was lost: %+v", got[0])
+	}
+}

@@ -727,6 +727,15 @@ func actionFromBadge(badge string) ActionType {
 	}
 }
 
+// placeholderName reports whether a nameplate says nothing: unread, or the
+// stand-in the parser writes when it could not read one.
+func placeholderName(s string) bool {
+	if s == "" || s == "Player" {
+		return true
+	}
+	return strings.HasPrefix(s, "player-") || strings.HasPrefix(s, "Player ")
+}
+
 // numbered reports whether a frame numbers its seats. A state whose seats all
 // sit at zero has not numbered them at all.
 func numbered(seats []SeatState) bool {
@@ -785,8 +794,17 @@ func mergeSeats(prevSeats, rawSeats []SeatState) []SeatState {
 			if r.Stack == 0 && p.Stack > 0 {
 				merged.Stack = p.Stack
 			}
-			if r.PlayerID == "" || r.PlayerID == "Player" {
+			// The nameplate is read by OCR, and the same chair comes back as
+			// "ruddy16923342", "$mt:mk$A$:1$" and "R" on consecutive frames.
+			// Players do not change chairs inside a hand, so a name that has
+			// already been read for this seat is kept and a later reading is
+			// treated as a misread rather than a new person. A placeholder
+			// yields to anything real, which is how the first good read lands.
+			if placeholderName(r.PlayerID) || (!placeholderName(p.PlayerID) && r.PlayerID != p.PlayerID) {
 				merged.PlayerID = p.PlayerID
+			}
+			if placeholderName(r.PlayerName) || (!placeholderName(p.PlayerName) && r.PlayerName != p.PlayerName) {
+				merged.PlayerName = p.PlayerName
 			}
 			// A badge that flickers out for a frame must not un-fold a player:
 			// folding is not undone within a hand.
