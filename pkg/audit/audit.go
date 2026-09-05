@@ -10,6 +10,7 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -228,6 +229,32 @@ func primaryAmount(rec Record) float64 {
 
 // Build assembles a record from the state the engine actually worked with,
 // deriving the gap list rather than trusting a caller to remember them.
+// Unreadable reports why a state cannot be advised on, or an empty string when
+// it can.
+//
+// Six-max is the only layout this reads, so more players than that is not a
+// hard hand: it is a frame the parser got wrong. Advice computed from one is
+// worse than no advice, because it looks like advice and changes on every
+// frame the misread changes.
+func Unreadable(state *table.HandState) string {
+	if state == nil {
+		return "no state"
+	}
+	if len(state.Seats) > maxSeats {
+		return fmt.Sprintf("%d seats read at a table that holds %d", len(state.Seats), maxSeats)
+	}
+	live := 0
+	for _, s := range state.Seats {
+		if s.PlayerID != "" && s.PlayerID != state.HeroID && s.IsActive && !s.IsFolded {
+			live++
+		}
+	}
+	if live > maxSeats-1 {
+		return fmt.Sprintf("%d live opponents read at a table that holds %d", live, maxSeats-1)
+	}
+	return ""
+}
+
 func Build(state *table.HandState, advice *advisor.AdvisorResponse, tendencies map[string]map[string]float64) Record {
 	rec := Record{Timestamp: time.Now()}
 	if state == nil {

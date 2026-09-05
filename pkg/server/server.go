@@ -236,7 +236,12 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 	var rec *advisor.AdvisorResponse
 	var auditReads map[string]map[string]float64
 	noAdvice := ""
-	if event.HandState != nil && !isHandEnd {
+	if reason := audit.Unreadable(event.HandState); reason != "" && !isHandEnd {
+		// A misread frame is withheld rather than advised on. The panel keeps
+		// whatever it last had and says why, which is steadier than advice
+		// recomputed from a table that was not there.
+		noAdvice = "state not readable: " + reason
+	} else if event.HandState != nil && !isHandEnd {
 		h := event.HandState
 		reads := advice.Reads{
 			Tendencies: make(map[string]map[string]float64),
