@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,7 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 		// keeping them: an unknown suffix is an error, and an error is how a
 		// long-running comparison ends at the first candidate.
 		sizingPolicy, semiBluff, defend, wide := false, false, false, false
+		wideScale := 0.0
 		for again := true; again; {
 			again = false
 			for _, gone := range []string{"+ranges", "+capped", "+polar"} {
@@ -91,8 +93,20 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 			// "+wide" holds opponents to the width the marked cards say they
 			// really have, rather than the width the model reasoned its way to.
 			// See advice.CalibratedShape and docs/STRATEGY.md §5a.
-			if s, ok := strings.CutSuffix(suffix, "+wide"); ok {
-				wide, suffix, again = true, s, true
+			//
+			// An optional number sets the postflop scale: "+wide1.4". It is a
+			// suffix rather than a flag so that several scales can be compared
+			// in one run, off the same decks. That matters more than it looks:
+			// the difference between two scales is then paired, and the whole
+			// reason §5 needed 640,000 hands per candidate is that unpaired
+			// differences at this size sit inside the noise.
+			if i := strings.LastIndex(suffix, "+wide"); i >= 0 {
+				rest := suffix[i+len("+wide"):]
+				if rest == "" {
+					wide, wideScale, suffix, again = true, 0, suffix[:i], true
+				} else if v, err := strconv.ParseFloat(rest, 64); err == nil && v > 0 {
+					wide, wideScale, suffix, again = true, v, suffix[:i], true
+				}
 			}
 		}
 		if suffix == "" {
@@ -123,7 +137,10 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 		shape := advice.Shape{}
 		if wide {
 			shape = advice.CalibratedShape()
-			if wideScaleOverride > 0 {
+			switch {
+			case wideScale > 0:
+				shape.PostflopScale = wideScale
+			case wideScaleOverride > 0:
 				shape.PostflopScale = wideScaleOverride
 			}
 		}

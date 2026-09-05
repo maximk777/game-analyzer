@@ -380,4 +380,3 @@ func TestWebSocket_HubClose(t *testing.T) {
 	hub.BroadcastToTable("tbl-closed", WSMessage{Type: WSMsgPing})
 	hub.BroadcastAll(WSMessage{Type: WSMsgPing})
 }
-

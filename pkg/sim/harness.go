@@ -89,6 +89,11 @@ type RunConfig struct {
 	// eleven cores at a thousand hands a lineup across six candidates was
 	// killed outright rather than merely slowed. Lowering this is what fixes
 	// that; lowering the hand count would fix it by measuring less.
+	//
+	// The candidate count multiplies it, and that is the easy way to walk into
+	// this: two candidates at 20,000 hands across 32 lineups runs fine on an
+	// 18 GB machine with all eleven cores, and the same run with four
+	// candidates was killed. Adding a candidate to a sweep is not free.
 	Workers int
 	Cfg     Config
 	// HeroStackBB, when set, gives hero a different stack from the field. The

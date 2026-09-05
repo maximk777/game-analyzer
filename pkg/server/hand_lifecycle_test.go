@@ -88,7 +88,7 @@ func TestProcessEvent_NoAdviceAfterHeroFolds(t *testing.T) {
 			// The client is waiting on hero, which is the only condition under
 			// which there is a decision to advise about.
 			IsHeroTurn: true,
-			HeroCards:      [2]table.Card{hero[0], hero[1]},
+			HeroCards:  [2]table.Card{hero[0], hero[1]},
 			Seats: []table.SeatState{
 				{PlayerID: "hero", PlayerName: "hero", Stack: 153200, IsActive: true, IsFolded: folded},
 				{PlayerID: "villain", PlayerName: "villain", Stack: 301607, IsActive: true},
