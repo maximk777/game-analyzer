@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"poker-game-analyzer/pkg/advice"
+	"poker-game-analyzer/pkg/calib"
 	"poker-game-analyzer/pkg/sim"
 )
 
@@ -29,7 +30,7 @@ import (
 // play the identical decks, and the difference between knowing nothing about
 // the opponents and knowing their fold frequencies is measured directly rather
 // than across two runs with their own variance.
-func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips bool) (sim.Candidate, error) {
+func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips bool, wideScaleOverride float64) (sim.Candidate, error) {
 	// A "/noise" segment says what the screen reader does to the state before
 	// the tool sees it. Without one the tool decides on the engine's own state,
 	// which is how every run before this existed and is not how the tool plays.
@@ -70,7 +71,7 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 		// and still means what it meant. Removing them would be worse than
 		// keeping them: an unknown suffix is an error, and an error is how a
 		// long-running comparison ends at the first candidate.
-		sizingPolicy, semiBluff, defend := false, false, false
+		sizingPolicy, semiBluff, defend, wide := false, false, false, false
 		for again := true; again; {
 			again = false
 			for _, gone := range []string{"+ranges", "+capped", "+polar"} {
@@ -86,6 +87,12 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 			}
 			if s, ok := strings.CutSuffix(suffix, "+defend"); ok {
 				defend, suffix, again = true, s, true
+			}
+			// "+wide" holds opponents to the width the marked cards say they
+			// really have, rather than the width the model reasoned its way to.
+			// See advice.CalibratedShape and docs/STRATEGY.md §5a.
+			if s, ok := strings.CutSuffix(suffix, "+wide"); ok {
+				wide, suffix, again = true, s, true
 			}
 		}
 		if suffix == "" {
@@ -113,7 +120,14 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 		if hasNoise {
 			label = name + "/" + noiseSpec
 		}
-		return sim.Candidate{Label: label, New: func(seed int64, tr *sim.Tracker) sim.Agent {
+		shape := advice.Shape{}
+		if wide {
+			shape = advice.CalibratedShape()
+			if wideScaleOverride > 0 {
+				shape.PostflopScale = wideScaleOverride
+			}
+		}
+		return sim.Candidate{Label: label, Shape: shape, New: func(seed int64, tr *sim.Tracker) sim.Agent {
 			opt := sim.HarnessOptions(rand.New(rand.NewSource(seed)))
 			if iters > 0 {
 				opt.Iterations = iters
@@ -124,6 +138,7 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 			opt.SizingPolicy = sizingPolicy
 			opt.SemiBluff = semiBluff
 			opt.Defend = defend
+			opt.Shape = shape
 			tool := sim.NewTool(label, tr, level, opt)
 			tool.Noise = noise
 			if novice {
@@ -230,6 +245,9 @@ func main() {
 		carry      = flag.Bool("session", false, "carry stacks across the hands of a session instead of resetting each hand, and report the trajectory: whether the money grew and how often it busted")
 		allInEV    = flag.Bool("allin-ev", true, "score a pot that went all-in with cards to come by the equity it had when the last chip went in, instead of by the card that came. The hand still plays out for real; only the reported money changes")
 		ledger     = flag.String("ledger", "bench/results.jsonl", "append the run to this file and compare against the last run of the same shape; empty disables it")
+		wideScale  = flag.Float64("wide-scale", 0, "override how much +wide widens the postflop range; 0 uses the calibrated 1.9. Exists to sweep it: the width came out right at 1.9 but the opponent is not uniform inside it, so the best number for a decision may be smaller than the best number for a histogram")
+		calibrate  = flag.Bool("calib", false, "mark the opponent range model against the cards actually dealt, instead of only against the money. Reports where the model put the opponent and where they really were; see docs/HARNESS.md §3e")
+		calibMin   = flag.Int("calib-min", 200, "smallest spot the calibration report will print")
 		guard      = flag.String("guard", "", "exit non-zero if this candidate is more than two combined standard errors below its last recorded run of the same shape")
 	)
 	flag.Parse()
@@ -252,6 +270,7 @@ func main() {
 		BuyIns:      *buyIns,
 		SeatChurn:   *churn,
 		AllInEV:     *allInEV,
+		Calib:       *calibrate,
 	}
 	cfg.Cfg.PotHidesStreetBets = *potHidden
 
@@ -260,7 +279,7 @@ func main() {
 		if name == "" {
 			continue
 		}
-		c, err := candidateByName(name, level, *iters, *vsTop, *flips)
+		c, err := candidateByName(name, level, *iters, *vsTop, *flips, *wideScale)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -284,6 +303,16 @@ func main() {
 	start := time.Now()
 	rep := sim.Run(cfg)
 	fmt.Print(rep.Render())
+
+	// Calibration is reported per candidate, because two candidates that differ
+	// in how they model an opponent are exactly the pair worth comparing here.
+	for _, r := range rep.Results {
+		if r.Calib == nil {
+			continue
+		}
+		fmt.Printf("\n=== %s: the range model against the cards dealt ===\n\n", r.Label)
+		calib.Render(os.Stdout, r.Calib.Buckets(), *calibMin)
+	}
 	fmt.Printf("\nrun took %s\n", time.Since(start).Round(time.Millisecond))
 
 	if *ledger == "" {

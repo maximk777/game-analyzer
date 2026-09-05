@@ -70,6 +70,11 @@ type Options struct {
 	// See advisor.Inputs.CommittedCallsAreFree. Measured at -0.56 ± 0.89 -- no
 	// effect -- and off by default.
 	Defend bool
+
+	// Shape tunes how wide an opponent's range is held to be. The zero value is
+	// the model as it stands; advice.CalibratedShape() is what marking it
+	// against dealt cards says it should be. See ranges.go.
+	Shape Shape
 }
 
 // How an opponent's range is modelled is no longer a switch.
@@ -178,7 +183,7 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 		// What they have done this hand, which is a fact about this hand and
 		// not about the player, and so is available whether or not anybody has
 		// ever seen them before.
-		width = RangeWidthFor(*h, seat, vpip, hasVPIP)
+		width = RangeWidthFor(*h, seat, vpip, hasVPIP, opt.Shape)
 		rangeWidths = append(rangeWidths, width)
 
 		// Each opponent is modelled separately. Whether the model is allowed to

@@ -91,6 +91,64 @@ const (
 	callNarrowing  = 0.85
 )
 
+// Shape is the tunable part of the opponent range model: how wide a range is
+// once there is a board, and how much each action narrows it.
+//
+// It exists because these numbers were finally measured rather than reasoned
+// about. Marking the model against the cards the engine dealt -- 218,953
+// decisions, docs/STRATEGY.md §5a -- says the postflop half of it is about
+// twice as tight as the opponents really are, and that a raise, the one action
+// the model narrows hardest on, is the one it gets most wrong.
+type Shape struct {
+	// PostflopScale multiplies the width once the flop is out. One is the model
+	// as it stood before that measurement.
+	PostflopScale float64
+	// Bet, Raise and Call are what one such action does to a range.
+	Bet, Raise, Call float64
+}
+
+// DefaultShape is the model as measured in docs/STRATEGY.md §5.
+func DefaultShape() Shape {
+	return Shape{
+		PostflopScale: 1,
+		Bet:           betNarrowing,
+		Raise:         raiseNarrowing,
+		Call:          callNarrowing,
+	}
+}
+
+// CalibratedShape is what the marked cards say those numbers should be.
+//
+// Read off the table in docs/STRATEGY.md §5a. The width at the first postflop
+// decision came out at 21% against a real 40%, which is the scale. The
+// narrowing factors are the ratios the opponents' real ranges moved by:
+// 36/40 after a bet and 32/40 after a raise.
+//
+// A call measured at 40/40 -- no narrowing at all. That is left at 0.95 rather
+// than 1.0 deliberately: "a call tells you nothing about a range" is a stronger
+// claim than the sample behind it supports, and the direction is what this
+// change is testing. If it wins, that constant is worth measuring on its own.
+func CalibratedShape() Shape {
+	return Shape{PostflopScale: 1.9, Bet: 0.90, Raise: 0.80, Call: 0.95}
+}
+
+func (s Shape) orDefault() Shape {
+	d := DefaultShape()
+	if s.PostflopScale <= 0 {
+		s.PostflopScale = d.PostflopScale
+	}
+	if s.Bet <= 0 {
+		s.Bet = d.Bet
+	}
+	if s.Raise <= 0 {
+		s.Raise = d.Raise
+	}
+	if s.Call <= 0 {
+		s.Call = d.Call
+	}
+	return s
+}
+
 // typicalVPIP is the share of hands a competent 6-max regular enters with. A
 // read is applied as a ratio to this, so a station's open is wider than a nit's
 // open and neither replaces the positional figure outright.
@@ -268,7 +326,7 @@ func preflopWidth(seat table.SeatState, st preflopStatement) float64 {
 
 // postflopNarrowing is what this player's actions after the flop have done to
 // their range, as a multiplier.
-func postflopNarrowing(h table.HandState, seat table.SeatState) float64 {
+func postflopNarrowing(h table.HandState, seat table.SeatState, shape Shape) float64 {
 	if len(h.ActionHistory) == 0 {
 		return 1
 	}
@@ -289,13 +347,13 @@ func postflopNarrowing(h table.HandState, seat table.SeatState) float64 {
 		switch a.Action {
 		case table.ActionBet, table.ActionRaise, table.ActionAllIn:
 			if facingBet {
-				factor *= raiseNarrowing
+				factor *= shape.Raise
 			} else {
-				factor *= betNarrowing
+				factor *= shape.Bet
 			}
 			facingBet = false
 		case table.ActionCall:
-			factor *= callNarrowing
+			factor *= shape.Call
 			facingBet = false
 		}
 	}
@@ -316,7 +374,8 @@ func looseness(vpip float64, known bool) float64 {
 // RangeWidthFor is how wide one opponent's holding still is, as a percentage of
 // all starting hands, given everything observed about this hand and whatever is
 // known about the player.
-func RangeWidthFor(h table.HandState, seat table.SeatState, vpip float64, known bool) float64 {
+func RangeWidthFor(h table.HandState, seat table.SeatState, vpip float64, known bool, shape Shape) float64 {
+	shape = shape.orDefault()
 	st := readStatement(h, seat)
 	w := preflopWidth(seat, st)
 
@@ -326,7 +385,13 @@ func RangeWidthFor(h table.HandState, seat table.SeatState, vpip float64, known 
 	if st.entered || seat.Position == table.PosBB {
 		w *= looseness(vpip, known)
 	}
-	w *= postflopNarrowing(h, seat)
+	// The scale applies only once there is a board. Before the flop the model
+	// measured right -- 81% assigned against 88% needed -- and widening a part
+	// that is already correct would be changing it for the sake of one number.
+	if h.Street != table.StreetPreflop && h.Street != "" {
+		w *= shape.PostflopScale
+	}
+	w *= postflopNarrowing(h, seat, shape)
 
 	return clamp(w, narrowestWidth, 100)
 }

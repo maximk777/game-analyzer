@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 
+	"poker-game-analyzer/pkg/advice"
+	"poker-game-analyzer/pkg/calib"
 	"poker-game-analyzer/pkg/table"
 )
 
@@ -44,6 +46,10 @@ type Candidate struct {
 	// New builds a fresh instance. The tracker is the one watching this run, so
 	// a strategy that wants opponent reads can take them from it.
 	New func(seed int64, tr *Tracker) Agent
+	// Shape is the opponent range model this candidate runs, which -calib needs
+	// in order to mark the belief the candidate actually held. The zero value
+	// means the default model.
+	Shape advice.Shape
 }
 
 // RunConfig describes the whole experiment.
@@ -64,6 +70,12 @@ type RunConfig struct {
 	StackMinBB, StackMaxBB float64
 	// Level is how much the tool is told about its opponents.
 	Level ReadLevel
+	// Calib marks the opponent range model against the cards actually dealt,
+	// rather than against the money the hand made. See pkg/sim/calibrate.go and
+	// docs/HARNESS.md §3e. Off by default: it ranks a range on the board twice
+	// per opponent per decision, which is a real cost on a long run and buys
+	// nothing when the question is a win rate.
+	Calib bool
 	// Warmup hands are played and discarded before recording, so that a
 	// strategy relying on reads is not measured over the orbit it spent
 	// gathering them.
@@ -152,6 +164,9 @@ type Report struct {
 // Result is one candidate's record.
 type Result struct {
 	Label string
+	// Calib is what the range model claimed and what was really held, when the
+	// run was asked for it. Nil otherwise.
+	Calib *calib.Set
 	// Net per recorded hand, in big blinds, in a stable order: lineup-major,
 	// so the same index means the same deck for every candidate.
 	Nets []float64
@@ -326,6 +341,12 @@ func Run(cfg RunConfig) Report {
 			if part == nil {
 				continue
 			}
+			if part.Calib != nil {
+				if merged.Calib == nil {
+					merged.Calib = calib.NewSet()
+				}
+				merged.Calib.Merge(part.Calib)
+			}
 			merged.Nets = append(merged.Nets, part.Nets...)
 			merged.AdjNets = append(merged.AdjNets, part.AdjNets...)
 			merged.Sizings = append(merged.Sizings, part.Sizings...)
@@ -420,7 +441,18 @@ func runLineup(cfg RunConfig, lineup int, cand Candidate) *Result {
 	// Every agent that learns gets fed. Hero's tool shares the lineup tracker;
 	// a tool seated as an opponent brings its own, and must see the table too
 	// or it plays every hand as though it had just sat down.
-	observers := rebuildObservers(nil, col, players, tracker)
+	//
+	// The calibrator rides along with the collector so that both survive a
+	// reseat: rebuildObservers drops everything it is not handed again.
+	var feed Observer = col
+	if cfg.Calib {
+		cal := NewCalibrator(players[heroSeat].ID, func(st table.HandState) advice.Reads {
+			return trackerReads(tracker, st, cfg.Level)
+		}, cand.Shape)
+		res.Calib = cal.Set
+		feed = multiObserver{col, cal}
+	}
+	observers := rebuildObservers(nil, feed, players, tracker)
 	tb.SetObserver(observers)
 
 	buyIns := cfg.BuyIns
@@ -463,7 +495,7 @@ func runLineup(cfg RunConfig, lineup int, cand Candidate) *Result {
 			}
 			stacks[seat] = players[seat].Stack
 			tb.Reseat(seat, players[seat])
-			observers = rebuildObservers(observers, col, players, tracker)
+			observers = rebuildObservers(observers, feed, players, tracker)
 			tb.SetObserver(observers)
 		}
 		for s := 0; s < cfg.Seats; s++ {

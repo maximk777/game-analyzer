@@ -104,7 +104,7 @@ func TestRangeWidthFromAction(t *testing.T) {
 					s = st
 				}
 			}
-			got := RangeWidthFor(h, s, 0, false)
+			got := RangeWidthFor(h, s, 0, false, Shape{})
 			if math.Abs(got-c.want) > 0.01 {
 				t.Fatalf("width = %.2f, want %.2f", got, c.want)
 			}
@@ -126,7 +126,7 @@ func TestPostflopNarrowing(t *testing.T) {
 	}
 	s := h.Seats[0]
 
-	open := RangeWidthFor(h, s, 0, false)
+	open := RangeWidthFor(h, s, 0, false, Shape{})
 	if math.Abs(open-43) > 0.01 {
 		t.Fatalf("button open = %.2f, want 43", open)
 	}
@@ -135,7 +135,7 @@ func TestPostflopNarrowing(t *testing.T) {
 	betting.ActionHistory = append(append([]table.ActionRecord{}, h.ActionHistory...),
 		act("hero", table.StreetFlop, table.ActionCheck, 0),
 		act("btn", table.StreetFlop, table.ActionBet, 4))
-	afterBet := RangeWidthFor(betting, s, 0, false)
+	afterBet := RangeWidthFor(betting, s, 0, false, Shape{})
 	if math.Abs(afterBet-43*betNarrowing) > 0.01 {
 		t.Fatalf("after a c-bet = %.2f, want %.2f", afterBet, 43*betNarrowing)
 	}
@@ -144,7 +144,7 @@ func TestPostflopNarrowing(t *testing.T) {
 	raising.ActionHistory = append(append([]table.ActionRecord{}, h.ActionHistory...),
 		act("hero", table.StreetFlop, table.ActionBet, 4),
 		act("btn", table.StreetFlop, table.ActionRaise, 14))
-	afterRaise := RangeWidthFor(raising, s, 0, false)
+	afterRaise := RangeWidthFor(raising, s, 0, false, Shape{})
 	if math.Abs(afterRaise-43*raiseNarrowing) > 0.01 {
 		t.Fatalf("after a raise = %.2f, want %.2f", afterRaise, 43*raiseNarrowing)
 	}
@@ -163,9 +163,9 @@ func TestReadScalesWidth(t *testing.T) {
 	}
 	s := h.Seats[0]
 
-	unknown := RangeWidthFor(h, s, 0, false)
-	nit := RangeWidthFor(h, s, 12, true)
-	station := RangeWidthFor(h, s, 48, true)
+	unknown := RangeWidthFor(h, s, 0, false, Shape{})
+	nit := RangeWidthFor(h, s, 12, true, Shape{})
+	station := RangeWidthFor(h, s, 48, true, Shape{})
 
 	if !(nit < unknown && unknown < station) {
 		t.Fatalf("nit %.1f < unknown %.1f < station %.1f does not hold", nit, unknown, station)
@@ -187,8 +187,8 @@ func TestWidthFromChipsWithoutHistory(t *testing.T) {
 		},
 	}
 
-	opener := RangeWidthFor(h, h.Seats[0], 0, false)
-	threeBettor := RangeWidthFor(h, h.Seats[1], 0, false)
+	opener := RangeWidthFor(h, h.Seats[0], 0, false, Shape{})
+	threeBettor := RangeWidthFor(h, h.Seats[1], 0, false, Shape{})
 
 	if math.Abs(opener-27) > 0.01 {
 		t.Fatalf("cutoff open from chips = %.2f, want 27", opener)
@@ -203,9 +203,9 @@ func TestWidthFromChipsWithoutHistory(t *testing.T) {
 func TestUnknownStaysWide(t *testing.T) {
 	h := table.HandState{
 		Street: table.StreetPreflop, SmallBlind: 1, BigBlind: 2, HeroID: "hero",
-		Seats:  []table.SeatState{seat("mp", table.PosMP, 0)},
+		Seats: []table.SeatState{seat("mp", table.PosMP, 0)},
 	}
-	if got := RangeWidthFor(h, h.Seats[0], 0, false); got != unknownWidth {
+	if got := RangeWidthFor(h, h.Seats[0], 0, false, Shape{}); got != unknownWidth {
 		t.Fatalf("width = %.2f, want %.2f", got, unknownWidth)
 	}
 }
@@ -218,13 +218,13 @@ func TestPostflopWithoutHistoryReadsThePot(t *testing.T) {
 		Street: table.StreetFlop, SmallBlind: 1, BigBlind: 2, HeroID: "hero", Pot: 12,
 		Seats: []table.SeatState{seat("x", table.PosCO, 0)},
 	}
-	if got := RangeWidthFor(raised, raised.Seats[0], 0, false); got != raisedPotWidth {
+	if got := RangeWidthFor(raised, raised.Seats[0], 0, false, Shape{}); got != raisedPotWidth {
 		t.Fatalf("width in a raised pot = %.2f, want %.2f", got, raisedPotWidth)
 	}
 
 	limped := raised
 	limped.Pot = 4
-	if got := RangeWidthFor(limped, limped.Seats[0], 0, false); got != limpWidth {
+	if got := RangeWidthFor(limped, limped.Seats[0], 0, false, Shape{}); got != limpWidth {
 		t.Fatalf("width in an unraised pot = %.2f, want %.2f", got, limpWidth)
 	}
 }
@@ -241,13 +241,72 @@ func TestCallerIsNotAnOpener(t *testing.T) {
 		},
 	}
 
-	opener := RangeWidthFor(h, h.Seats[0], 0, false)
-	caller := RangeWidthFor(h, h.Seats[1], 0, false)
+	opener := RangeWidthFor(h, h.Seats[0], 0, false, Shape{})
+	caller := RangeWidthFor(h, h.Seats[1], 0, false, Shape{})
 
 	if math.Abs(opener-27) > 0.01 {
 		t.Fatalf("cutoff open = %.2f, want 27", opener)
 	}
 	if math.Abs(caller-coldCallWidth) > 0.01 {
 		t.Fatalf("big blind defending = %.2f, want %.2f", caller, coldCallWidth)
+	}
+}
+
+// coldCaller is a player who called an open before the flop: the commonest
+// postflop opponent there is, and the spot the calibration found worst.
+func coldCaller() (table.HandState, table.SeatState) {
+	s := seat("v", table.PosCO, 0)
+	h := table.HandState{
+		Street: table.StreetPreflop, SmallBlind: 1, BigBlind: 2, HeroID: "hero",
+		Seats: []table.SeatState{s},
+		ActionHistory: []table.ActionRecord{
+			act("btn", table.StreetPreflop, table.ActionRaise, 6),
+			act("v", table.StreetPreflop, table.ActionCall, 6),
+		},
+	}
+	return h, s
+}
+
+// The zero Shape has to mean "the model as it was", because every existing
+// caller passes one and none of them is asking for a change.
+func TestShape_ZeroValueIsTheOldModel(t *testing.T) {
+	h, s := coldCaller()
+	if got, want := RangeWidthFor(h, s, 0, false, Shape{}),
+		RangeWidthFor(h, s, 0, false, DefaultShape()); got != want {
+		t.Errorf("zero Shape gave %v, the default gave %v", got, want)
+	}
+}
+
+// The calibrated shape widens opponents after the flop and leaves them alone
+// before it: marking the model against dealt cards found the preflop half
+// right -- 81% assigned against 88% needed -- and only the postflop half wrong.
+func TestShape_CalibratedWidensOnlyAfterTheFlop(t *testing.T) {
+	h, s := coldCaller()
+
+	pre := RangeWidthFor(h, s, 0, false, DefaultShape())
+	preWide := RangeWidthFor(h, s, 0, false, CalibratedShape())
+	if pre != preWide {
+		t.Errorf("preflop width moved from %v to %v; it was measured correct", pre, preWide)
+	}
+
+	flop := h
+	flop.Street = table.StreetFlop
+	narrow := RangeWidthFor(flop, s, 0, false, DefaultShape())
+	wide := RangeWidthFor(flop, s, 0, false, CalibratedShape())
+	if wide <= narrow {
+		t.Errorf("postflop width %v is not wider than %v", wide, narrow)
+	}
+	if ratio := wide / narrow; ratio < 1.5 || ratio > 2.5 {
+		t.Errorf("postflop width moved by %.2fx; the measurement said about 1.9", ratio)
+	}
+}
+
+// A raise is where the model was most wrong -- 9% assigned against 32% needed --
+// so the calibrated shape has to narrow least on exactly that action.
+func TestShape_CalibratedNarrowsLeastOnARaise(t *testing.T) {
+	d, c := DefaultShape(), CalibratedShape()
+	if !(c.Raise/d.Raise > c.Bet/d.Bet && c.Bet/d.Bet > c.Call/d.Call) {
+		t.Errorf("the correction is not largest on a raise: raise %v->%v, bet %v->%v, call %v->%v",
+			d.Raise, c.Raise, d.Bet, c.Bet, d.Call, c.Call)
 	}
 }
