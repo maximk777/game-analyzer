@@ -41,6 +41,12 @@ func SimulateEquityRNG(hero [2]table.Card, board []table.Card, opponentRanges []
 		numOpponents = 1
 		opponentRanges = []Range{ParseRange("random")}
 	}
+	// The deck is the real limit: hero holds two, the board takes five, and
+	// each opponent two more. Asked for more than fits, there is no hand to
+	// simulate and no number worth returning.
+	if maxOpponents := (52 - 2 - 5) / 2; numOpponents > maxOpponents {
+		return EquityResult{ElapsedMs: float64(time.Since(start).Microseconds()) / 1000}
+	}
 
 	for i := range opponentRanges {
 		if len(opponentRanges[i].masks) != len(opponentRanges[i].Combos) {
@@ -74,7 +80,11 @@ func SimulateEquityRNG(hero [2]table.Card, board []table.Card, opponentRanges []
 	losses := 0
 	validSamples := 0
 
-	var oppCombos [10][2]table.Card
+	// One slot per opponent rather than a fixed ten. The old array was an
+	// undeclared limit: a live read that invented an eleventh player took the
+	// server down with an index panic, which is a poor way to learn that the
+	// table was misread.
+	oppCombos := make([][2]table.Card, numOpponents)
 	var fullBoard [5]table.Card
 	for i, b := range board {
 		if i < 5 {
