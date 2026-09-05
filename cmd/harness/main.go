@@ -60,20 +60,32 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 		// "+ranges" narrows each opponent's range by what they did this hand
 		// rather than holding it at their VPIP. A switch only so the two can
 		// be measured on the same decks -- see pkg/advice/ranges.go.
-		// "+sizing" lets the board and the stack-to-pot ratio decide which bet
-		// sizes exist -- see pkg/advisor/sizing.go. Both suffixes may be worn
-		// at once: tool:stats+ranges+sizing.
-		actionRanges, sizingPolicy, semiBluff := false, false, false
+		// Suffixes name the parts of the strategy that are still switches.
+		// Several may be worn at once: tool:stats+sizing+bluff.
+		//
+		// "+ranges", "+capped" and "+polar" were three of them and are the
+		// strategy now -- measured together at +4.05 and +6.39 bb/100 over 1.28
+		// million hands, see docs/STRATEGY.md §5. They are accepted and ignored,
+		// rather than rejected, so that a command written yesterday still runs
+		// and still means what it meant. Removing them would be worse than
+		// keeping them: an unknown suffix is an error, and an error is how a
+		// long-running comparison ends at the first candidate.
+		sizingPolicy, semiBluff, defend := false, false, false
 		for again := true; again; {
 			again = false
-			if s, ok := strings.CutSuffix(suffix, "+ranges"); ok {
-				actionRanges, suffix, again = true, s, true
+			for _, gone := range []string{"+ranges", "+capped", "+polar"} {
+				if s, ok := strings.CutSuffix(suffix, gone); ok {
+					suffix, again = s, true
+				}
 			}
 			if s, ok := strings.CutSuffix(suffix, "+sizing"); ok {
 				sizingPolicy, suffix, again = true, s, true
 			}
 			if s, ok := strings.CutSuffix(suffix, "+bluff"); ok {
 				semiBluff, suffix, again = true, s, true
+			}
+			if s, ok := strings.CutSuffix(suffix, "+defend"); ok {
+				defend, suffix, again = true, s, true
 			}
 		}
 		if suffix == "" {
@@ -109,9 +121,9 @@ func candidateByName(name string, level sim.ReadLevel, iters, vsTop int, flips b
 			if vsTop > 0 {
 				opt.VsTopIterations = vsTop
 			}
-			opt.ActionRanges = actionRanges
 			opt.SizingPolicy = sizingPolicy
 			opt.SemiBluff = semiBluff
+			opt.Defend = defend
 			tool := sim.NewTool(label, tr, level, opt)
 			tool.Noise = noise
 			if novice {
@@ -288,7 +300,13 @@ func main() {
 	}
 	fmt.Print(compareToPrevious(entry, prev))
 	if entry.Dirty {
-		fmt.Println("журнал: дерево грязное — эта строка не приписана коммиту")
+		fmt.Println("журнал: дерево было грязным при сборке — эта строка не приписана коммиту")
+	}
+	// The binary is what measured; the tree is what you would read if you went
+	// looking for the code. When they differ, they are two different programs.
+	if tree := treeState(); tree != "" && entry.Commit != "" && tree != entry.Commit {
+		fmt.Printf("журнал: ВНИМАНИЕ — бинарник собран из %s, а в дереве %s. Мерили не то, что лежит рядом; пересоберите (make harness)\n",
+			entry.Commit, tree)
 	}
 	if *guard != "" {
 		bad, msg := regressed(entry, prev, *guard)

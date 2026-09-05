@@ -12,6 +12,7 @@
 package advice
 
 import (
+	"math"
 	"math/rand"
 	"time"
 
@@ -53,25 +54,41 @@ type Options struct {
 	// live path wants and what a harness cannot use.
 	Rng *rand.Rand
 
-	// ActionRanges narrows each opponent's range by what they have done this
-	// hand -- position, the raises they made, the streets they continued on --
-	// instead of holding it at their VPIP for the whole hand and at the whole
-	// deck when nothing is known about them. See ranges.go.
-	//
-	// It is a switch only so that the two can be measured against each other on
-	// the same decks. See docs/HARNESS.md.
-	ActionRanges bool
-
 	// SizingPolicy decides which bet sizes exist in a spot from the board and
 	// the stack-to-pot ratio, rather than letting the one-street expected-value
 	// comparison pick from a fixed list it systematically overprices the top of.
-	// See pkg/advisor/sizing.go. A switch for the same reason.
+	// See pkg/advisor/sizing.go. Measured at -2.5 bb/100 and off by default.
 	SizingPolicy bool
 
 	// SemiBluff lets a hand with outs bet without a counted read on every
-	// opponent at the table. See advisor.Inputs.AllowSemiBluff.
+	// opponent at the table. See advisor.Inputs.AllowSemiBluff. Measured twice
+	// against the population at -6.5 and -9.4 bb/100, and off by default.
 	SemiBluff bool
+
+	// Defend lifts the unknown-opponent charge from a call as that call commits
+	// the stack: there are no streets left for the unknown to be dangerous in.
+	// See advisor.Inputs.CommittedCallsAreFree. Measured at -0.56 ± 0.89 -- no
+	// effect -- and off by default.
+	Defend bool
 }
+
+// How an opponent's range is modelled is no longer a switch.
+//
+// Narrowing it by what they did this hand, putting a lid on the part of it that
+// calls, and shaping the part of it that bets were three separate experiments,
+// and separately they were worth +1.07, -3.34 and -1.33 big blinds per hundred
+// hands: two of the three looked like losses. Together they are worth +4.05 and
+// +6.39 on two seeds over 1.28 million hands, both beyond three standard
+// errors.
+//
+// They are one repair in three pieces, which is why. Once the opponent's range
+// is the width a real range is, the model can see that it overcalls -- and it
+// stops, and then it underbets instead, because the callers it imagines still
+// contain the hands that would have raised. Taking that lid off is what turns
+// the folding back into betting. Either half alone moves the strategy to a
+// worse place than it started.
+//
+// So they are the strategy now, not an option on it. docs/STRATEGY.md §5.
 
 const (
 	liveIterations      = 12000
@@ -161,9 +178,7 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 		// What they have done this hand, which is a fact about this hand and
 		// not about the player, and so is available whether or not anybody has
 		// ever seen them before.
-		if opt.ActionRanges {
-			width = RangeWidthFor(*h, seat, vpip, hasVPIP)
-		}
+		width = RangeWidthFor(*h, seat, vpip, hasVPIP)
 		rangeWidths = append(rangeWidths, width)
 
 		// Each opponent is modelled separately. Whether the model is allowed to
@@ -223,6 +238,18 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 		return out
 	}
 
+	bandAt := func(lo, hi float64) []equity.Range {
+		out := make([]equity.Range, len(baseRanges))
+		for i := range baseRanges {
+			if !ranked[i] {
+				rankings[i] = equity.RankOnBoard(h.HeroCards, h.CommunityCards, baseRanges[i])
+				ranked[i] = true
+			}
+			out[i] = rankings[i].Band(lo, hi)
+		}
+		return out
+	}
+
 	cache := make(map[int]float64, 8)
 	equityVsTop := func(frac float64) float64 {
 		if frac <= 0 {
@@ -238,6 +265,47 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 		r := equity.SimulateEquityRNG(h.HeroCards, h.CommunityCards, narrowedAt(frac), vsTopIters, rng)
 		v := r.WinRate + r.TieRate*0.5
 		cache[key] = v
+		return v
+	}
+
+	// Equity against a slice that has a lid on it as well as a floor -- the
+	// range that called rather than the range that continued. See
+	// equity.BoardRanking.Band.
+	bandCache := make(map[[2]int]float64, 8)
+	equityVsBand := func(lo, hi float64) float64 {
+		lo, hi = math.Max(lo, 0), math.Min(hi, 1)
+		if hi <= lo {
+			return equityVsTop(hi)
+		}
+		key := [2]int{int(lo * 100), int(hi * 100)}
+		if v, ok := bandCache[key]; ok {
+			return v
+		}
+		r := equity.SimulateEquityRNG(h.HeroCards, h.CommunityCards, bandAt(lo, hi), vsTopIters, rng)
+		v := r.WinRate + r.TieRate*0.5
+		bandCache[key] = v
+		return v
+	}
+
+	// Equity against a range shaped like one that bet: its top and its bottom,
+	// with the middle -- the hands that would have checked -- left out.
+	polarCache := make(map[[2]int]float64, 8)
+	equityVsPolar := func(value, bluff float64) float64 {
+		key := [2]int{int(value * 100), int(bluff * 100)}
+		if v, ok := polarCache[key]; ok {
+			return v
+		}
+		out := make([]equity.Range, len(baseRanges))
+		for i := range baseRanges {
+			if !ranked[i] {
+				rankings[i] = equity.RankOnBoard(h.HeroCards, h.CommunityCards, baseRanges[i])
+				ranked[i] = true
+			}
+			out[i] = rankings[i].Polar(value, bluff)
+		}
+		r := equity.SimulateEquityRNG(h.HeroCards, h.CommunityCards, out, vsTopIters, rng)
+		v := r.WinRate + r.TieRate*0.5
+		polarCache[key] = v
 		return v
 	}
 
@@ -270,6 +338,9 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 		UseSizingPolicy: opt.SizingPolicy,
 		AllowSemiBluff:  opt.SemiBluff,
 	}
+	in.EquityVsBand = equityVsBand
+	in.EquityVsPolar = equityVsPolar
+	in.CommittedCallsAreFree = opt.Defend
 
 	advice := advisor.Calculate(in)
 	return Result{Recommendation: &advice, SeatReads: seatReads}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -74,24 +75,55 @@ type ledgerResult struct {
 	Hands         int     `json:"hands"`
 }
 
-// gitState is the commit the run measured, and whether anything was uncommitted
-// at the time. A number from a dirty tree is not attributable to a commit, and
-// saying so is the whole reason the field exists.
-func gitState() (commit string, dirty bool) {
-	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
-	if err != nil {
+// buildState is the commit **this binary was built from**, and whether the tree
+// was dirty when it was built.
+//
+// Read out of the binary rather than off the working tree, and the difference
+// is not academic. `go build` compiles when it is invoked, so a binary can be
+// older than the source beside it -- and asking git afterwards then records a
+// commit the measurement was never made from. That is a lie in a file kept
+// specifically so that numbers can be trusted later.
+//
+// It happened here within an hour of the ledger being written: a run was
+// launched against a binary built before the flag it was passed existed. That
+// one announced itself, because the flag was rejected. The one that does not
+// announce itself is the run whose numbers are merely stale, and this is what
+// catches it.
+//
+// Go stamps the revision into the binary by itself, so nothing has to be passed
+// at build time and there is nothing to forget.
+func buildState() (commit string, dirty bool) {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
 		return "", false
 	}
-	commit = strings.TrimSpace(string(out))
-	st, err := exec.Command("git", "status", "--porcelain").Output()
-	if err != nil {
-		return commit, false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			commit = s.Value
+			if len(commit) > 7 {
+				commit = commit[:7]
+			}
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
 	}
-	return commit, len(strings.TrimSpace(string(st))) > 0
+	return commit, dirty
+}
+
+// treeState is the commit in the working tree right now, for comparison. When
+// it differs from what the binary was built from, the binary is stale and every
+// number it just produced describes a program that is no longer on disk.
+func treeState() string {
+	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func buildEntry(rep sim.Report, cfg ledgerConfig) ledgerEntry {
-	commit, dirty := gitState()
+	commit, dirty := buildState()
 	e := ledgerEntry{
 		At:     time.Now().UTC().Format(time.RFC3339),
 		Commit: commit,

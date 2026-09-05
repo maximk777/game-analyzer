@@ -428,6 +428,41 @@ type Inputs struct {
 	// each other on the same decks.
 	UseSizingPolicy bool
 
+	// EquityVsBand is hero's equity against the part of the opponents' range
+	// between two strength fractions, strongest first. Optional; nil keeps the
+	// old model, in which the range that calls a bet is the strongest slice of
+	// whatever continues.
+	//
+	// That model has no lid on it, and a calling range does. The hands that beat
+	// a bet raise it, so what calls is the middle: strong enough to pay, not
+	// strong enough to charge. Told the callers are the very top, every bet hero
+	// considers is priced against a caller no real caller can be, and thin value
+	// is never worth taking -- measured against the population, the tool bet the
+	// river 273 times where a competent opponent bet it 1731 times off the same
+	// decks.
+	//
+	// The lid comes off as the room to raise does. Facing a bet that takes their
+	// stack there is no raise to make, so everything that continues calls and
+	// the strongest slice is exactly right; the same is true on the river once
+	// the bet is for everything. See cappedRaiseShare.
+	EquityVsBand func(lo, hi float64) float64
+
+	// EquityVsPolar is hero's equity against a range made of its strongest
+	// `value` and its weakest `bluff`, with the middle left out. Optional.
+	//
+	// It is what a range that bet actually looks like, and the reason it
+	// matters is that the missing middle is not missing at random: leaving the
+	// bluffs out of the set hero is measured against is leaving out the only
+	// part of it hero beats. Priced as a top slice, a river bet is called far
+	// less often than the price demands.
+	//
+	// The value-to-bluff split is not a constant; see bluffShareOfBet.
+	EquityVsPolar func(value, bluff float64) float64
+
+	// CommittedCallsAreFree lifts the unknown-opponent charge from a call in
+	// proportion to how completely that call ends the hand. See callFinality.
+	CommittedCallsAreFree bool
+
 	// AllowSemiBluff opens the aggressive branch for a hand that is behind but
 	// has something to improve to, without requiring a counted read on every
 	// opponent.
@@ -638,8 +673,27 @@ func Calculate(in Inputs) AdvisorResponse {
 		// four-big-blind stack stopped shoving -- which is the whole strategy
 		// with that hand. The same rule already governs bettorRangeFraction on
 		// the call side, for the same reason.
+		// How completely this bet ends the hand, from nought to one. It decides
+		// two separate things below -- how narrow the calling range is, and
+		// whether it has a lid on it -- and they are the same fact seen from
+		// two sides, so it is worked out once.
+		simulated := in.EquityVsTop != nil || in.EquityVsBand != nil
+		finality := 0.0
+		if simulated {
+			callerStack := deepestOpponent
+			if callerStack <= 0 {
+				callerStack = effectiveStack
+			}
+			if callerStack > 0 {
+				finality = math.Min(raiseTo/callerStack, 1)
+			}
+			if state.Street == table.StreetRiver || state.Street == table.StreetShowdown {
+				finality = 1
+			}
+		}
+
 		callShare := 1 - f
-		if in.EquityVsTop != nil {
+		if simulated {
 			// How completely this bet ends the hand. A bet that takes the
 			// caller's stack ends it, and so does any bet on the river --
 			// there are no cards to come either way. Both are the same fact,
@@ -666,17 +720,6 @@ func Calculate(in Inputs) AdvisorResponse {
 			// were never folding, and the advice came out the same as it would
 			// between equal stacks. "As though we were sitting on level terms"
 			// is exactly what it was doing.
-			callerStack := deepestOpponent
-			if callerStack <= 0 {
-				callerStack = effectiveStack
-			}
-			finality := 0.0
-			if callerStack > 0 {
-				finality = math.Min(raiseTo/callerStack, 1)
-			}
-			if state.Street == table.StreetRiver || state.Street == table.StreetShowdown {
-				finality = 1
-			}
 			callShare *= 1 - committedCallNarrowing*finality
 		}
 		allFold = allFoldProduct
@@ -689,10 +732,17 @@ func Calculate(in Inputs) AdvisorResponse {
 		callersGivenContested := expectedCallers / contested
 
 		callEq := 0.0
-		if in.EquityVsTop != nil {
+		switch {
+		case in.EquityVsBand != nil:
+			// The callers are what continues minus what raises. `finality` is
+			// already the measure of how much room to raise is left, so the lid
+			// closes as the bet gets smaller and lifts entirely on a shove.
+			lid := cappedRaiseShare * (1 - finality) * callShare
+			callEq = math.Min(math.Max(in.EquityVsBand(lid, lid+callShare), 0), 1)
+		case in.EquityVsTop != nil:
 			// The callers are the strongest `callShare` of the range.
 			callEq = math.Min(math.Max(in.EquityVsTop(callShare), 0), 1)
-		} else {
+		default:
 			callEq = fallbackEquityWhenCalled(winEq, f)
 		}
 
@@ -780,6 +830,16 @@ func Calculate(in Inputs) AdvisorResponse {
 			callRangeFraction = math.Min(math.Max(callRangeFraction*(1-w)+f*w, 0.05), 1)
 		}
 		callEquity = math.Min(math.Max(in.EquityVsTop(callRangeFraction), 0), 1)
+
+		// And the shape of it, where the shape is knowable. A betting range is
+		// the hands that beat a call and the hands that cannot win without one:
+		// the top and the bottom, not the top alone.
+		if in.EquityVsPolar != nil && state.Street == table.StreetRiver {
+			bluffs := bluffShareOfBet(toCall, pot-toCall)
+			value := callRangeFraction * (1 - bluffs)
+			bluff := callRangeFraction * bluffs
+			callEquity = math.Min(math.Max(in.EquityVsPolar(value, bluff), 0), 1)
+		}
 	}
 
 	// Continuing without committing the stack does not realise the whole of a
@@ -859,8 +919,28 @@ func Calculate(in Inputs) AdvisorResponse {
 		}
 	} else {
 		evCall = callEquity*callRealisation*(pot+toCall) - toCall
-		// Paying off a stranger is the same risk as betting into one.
-		evCall -= caution(toCall)
+		// Paying off a stranger is the same risk as betting into one -- but
+		// only for as long as there is a hand left to play against them.
+		//
+		// The charge exists because an unknown opponent is not an average one:
+		// the spread between the rock and the maniac in that seat is real money,
+		// and it is spent over the streets still to come. A call that puts the
+		// last chip in has no streets still to come. What happens next is the
+		// cards being turned over, and how well the player in that seat plays a
+		// turn cannot reach it.
+		//
+		// Charged anyway, it is a tax on defending. At twenty per cent of the
+		// amount owed, a river all-in priced at pot odds of a third needs forty
+		// per cent equity to call -- so hero folds a hand the price says to
+		// call, every time, against anybody it has no read on. Live, that is
+		// every hand of the first orbit. The harness names the spot: folding
+		// the river with the pot bigger than the stack cost 35.9 big blinds a
+		// hand where a plain tight-aggressive bot lost 31.3.
+		charge := caution(toCall)
+		if in.CommittedCallsAreFree {
+			charge *= 1 - callFinality(state.Street, toCall, effectiveStack)
+		}
+		evCall -= charge
 	}
 
 	cap := func(v float64) float64 {
@@ -1212,6 +1292,47 @@ const bluffWorthwhileFold = 0.50
 // value, at a third-pot bet it withholds a fifth of one per cent, and at a
 // table that is fully read it withholds nothing at all.
 const darkHorseCaution = 0.20
+
+// bluffShareOfBet is how much of a betting range is bluffs, at a bet of `bet`
+// into a pot of `potBefore`.
+//
+// It is derived, not stated. A caller facing a bet of b into p is indifferent
+// when the bluffs in the betting range are exactly b/(p+2b) of it -- that is
+// the split which makes calling and folding worth the same, and it is the split
+// a bettor with a balanced range uses. It reproduces every figure the reference
+// material quotes: a third-pot bet is four parts value to one bluff, a half-pot
+// three to one, a pot-sized bet two to one, a double-pot overbet three to two.
+//
+// Bigger bets carry more bluffs, which is the direction that matters and the
+// one a fixed ratio cannot express.
+func bluffShareOfBet(bet, potBefore float64) float64 {
+	if bet <= 0 || potBefore <= 0 {
+		return 0
+	}
+	return bet / (potBefore + 2*bet)
+}
+
+// callFinality is how completely paying this price ends the hand, from nought
+// to one. It is the same fact as the finality that narrows a calling range,
+// asked about hero's call instead of about an opponent's.
+func callFinality(street table.Street, toCall, effectiveStack float64) float64 {
+	if street == table.StreetRiver || street == table.StreetShowdown {
+		return 1
+	}
+	if effectiveStack <= 0 {
+		return 0
+	}
+	return math.Min(math.Max(toCall/effectiveStack, 0), 1)
+}
+
+// cappedRaiseShare is how much of a continuing range raises rather than calls,
+// and so is not in the range that calls.
+//
+// Stated, not derived, and deliberately modest: equilibrium check-raising
+// frequencies against a flop bet run around a sixth of what continues, wider
+// against a small size and narrower against a large one. The point is that the
+// lid exists at all, not that this particular number is exact.
+const cappedRaiseShare = 0.16
 
 // semiBluffEquity is how much hero must have against the stronger half of the
 // opponents' range for a bet to be more than a bluff. It is roughly a flush

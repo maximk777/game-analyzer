@@ -112,3 +112,64 @@ func TestPreflopFallsBackToTheRanking(t *testing.T) {
 		}
 	}
 }
+
+// A band is a slice of the ordering, and Band(0, x) is Top(x) by construction.
+func TestBandIsTopFromZero(t *testing.T) {
+	hero := [2]table.Card{{Rank: table.RankAce, Suit: table.Spades}, {Rank: table.RankKing, Suit: table.Hearts}}
+	board, err := table.ParseCards("Qd 7c 2h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := RankOnBoard(hero, board, ParseRange("random"))
+
+	top := rk.Top(0.3)
+	band := rk.Band(0, 0.3)
+	if len(top.Combos) != len(band.Combos) {
+		t.Fatalf("Top(0.3) has %d combos, Band(0,0.3) has %d", len(top.Combos), len(band.Combos))
+	}
+	for i := range top.Combos {
+		if top.Combos[i] != band.Combos[i] {
+			t.Fatalf("combo %d differs", i)
+		}
+	}
+}
+
+// The point of the band: it takes the lid off. A range that called is weaker
+// than the top slice of the same size, because the hands above it raised.
+func TestBandBelowTheTopIsWeaker(t *testing.T) {
+	hero := [2]table.Card{{Rank: table.RankAce, Suit: table.Spades}, {Rank: table.RankKing, Suit: table.Hearts}}
+	board, err := table.ParseCards("Qd 7c 2h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := RankOnBoard(hero, board, ParseRange("random"))
+
+	top := rk.Top(0.4)
+	capped := rk.Band(0.1, 0.5)
+	// Rounding each edge independently can differ by one combination, which is
+	// nothing to the equity and everything to an equality test.
+	if d := len(top.Combos) - len(capped.Combos); d < -1 || d > 1 {
+		t.Fatalf("bands of the same width differ in size: %d and %d", len(top.Combos), len(capped.Combos))
+	}
+	// The ranking is strongest first, so the capped band must start further in.
+	if top.Combos[0] == capped.Combos[0] {
+		t.Fatal("the capped band starts at the same hand as the top slice")
+	}
+}
+
+// Rounding must never produce an empty range: equity against nothing is not a
+// number, and callers cannot check for it.
+func TestBandNeverEmpty(t *testing.T) {
+	hero := [2]table.Card{{Rank: table.RankAce, Suit: table.Spades}, {Rank: table.RankKing, Suit: table.Hearts}}
+	board, err := table.ParseCards("Qd 7c 2h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rk := RankOnBoard(hero, board, ParseRange("random"))
+
+	for _, c := range [][2]float64{{0, 0}, {0.5, 0.5}, {1, 1}, {0.999, 1}, {0.4, 0.2}} {
+		if got := rk.Band(c[0], c[1]); len(got.Combos) == 0 {
+			t.Fatalf("Band(%g, %g) is empty", c[0], c[1])
+		}
+	}
+}
