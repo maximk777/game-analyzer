@@ -243,15 +243,11 @@ func Unreadable(state *table.HandState) string {
 	if len(state.Seats) > maxSeats {
 		return fmt.Sprintf("%d seats read at a table that holds %d", len(state.Seats), maxSeats)
 	}
-	live := 0
-	for _, s := range state.Seats {
-		if s.PlayerID != "" && s.PlayerID != state.HeroID && s.IsActive && !s.IsFolded {
-			live++
-		}
-	}
-	if live > maxSeats-1 {
-		return fmt.Sprintf("%d live opponents read at a table that holds %d", live, maxSeats-1)
-	}
+	// There is no separate opponent count here. With the seat count checked
+	// above, a table that holds six can never present more than five
+	// opponents besides hero, and when hero is not seated at all -- the tool
+	// also watches tables it is not playing at -- six live players is an
+	// ordinary six-max table rather than a misread.
 	return ""
 }
 
