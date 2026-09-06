@@ -8,20 +8,66 @@ import Vision
 //   swiftc -parse-as-library pkg/capture/table_vision.swift \
 //          pkg/capture/mac_vision_agent.swift -o bin/mac_vision_agent
 
+/// Windows the client owns that are shaped like a table but are not one. Their
+/// titles are the only thing that separates them: the hand replayer is a table
+/// drawn from a finished hand, so it passes every size and shape test, and
+/// reading it means advising on a hand that ended hours ago.
+let notATableTitle = ["replayer", "lobby", "cashier", "settings", "history", "chat"]
+
+/// How much a window looks like the table being played. Higher is better,
+/// nil means it is not a candidate at all.
+///
+/// The old rule took the first window the system happened to list, and the
+/// system does not list them in any order worth relying on: live, the agent
+/// picked "CoinPoker Hand Replayer", failed to capture it, took a different
+/// window on the next frame and a third on the one after. Every switch is a
+/// frame from somewhere else, which is what the panel jumping is made of.
+func tableScore(_ w: SCWindow) -> Double? {
+    let app = (w.owningApplication?.applicationName ?? "").lowercased()
+    guard app.contains("coin") else { return nil }
+
+    let ratio = w.frame.width / max(w.frame.height, 1)
+    guard w.frame.width > 500, w.frame.height > 350, ratio >= 1.15, ratio <= 1.55 else { return nil }
+
+    let title = (w.title ?? "").lowercased()
+    for bad in notATableTitle where title.contains(bad) { return nil }
+
+    // A table names its game and its stake. That is worth more than any
+    // measurement, because a lobby can be any size but is never called "NLH
+    // 1228036 - 1K/2K".
+    var score = w.frame.width * w.frame.height
+    if title.contains("nlh") || title.contains("plo") {
+        score *= 1_000
+    }
+    return score
+}
+
+/// The window being read, kept between frames.
+///
+/// Re-choosing every frame is what let one bad frame move the agent to another
+/// window. A window that is still open and still looks like a table keeps the
+/// job.
+var currentWindowID: CGWindowID?
+
 func findTargetWindow() async -> SCWindow? {
     guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else {
         return nil
     }
 
-    let coinWins = content.windows.filter {
-        let app = ($0.owningApplication?.applicationName ?? "").lowercased()
-        let isCoinPoker = app.contains("coin")
-        let isTableSize = $0.frame.width > 500 && $0.frame.height > 350
-        let ratio = $0.frame.width / max($0.frame.height, 1)
-        return isCoinPoker && isTableSize && ratio >= 1.15 && ratio <= 1.55
+    let candidates = content.windows.compactMap { w -> (SCWindow, Double)? in
+        guard let score = tableScore(w) else { return nil }
+        return (w, score)
     }
 
-    return coinWins.first
+    if let id = currentWindowID, let held = candidates.first(where: { $0.0.windowID == id }) {
+        return held.0
+    }
+
+    let best = candidates.max { a, b in
+        a.1 == b.1 ? a.0.windowID < b.0.windowID : a.1 < b.1
+    }?.0
+    currentWindowID = best?.windowID
+    return best
 }
 
 @main
@@ -118,6 +164,7 @@ struct MacVisionAgent {
                         // moment it started.
                         print("[MAC-VISION] Table window lost. Is the client still open on a table?")
                         haveWindow = false
+                        currentWindowID = nil
                     }
                 }
                 if consecutiveFailures > 0 {
@@ -128,6 +175,9 @@ struct MacVisionAgent {
                 }
             } catch {
                 consecutiveFailures += 1
+                // Whatever this window is, it is not one that can be read. Let
+                // the next frame choose again rather than retry it forever.
+                currentWindowID = nil
                 let text = String(describing: error)
                 // The same error repeating is one event, not many.
                 if text != lastFailure {

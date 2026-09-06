@@ -1754,7 +1754,16 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     // pixel left of centre scored ~2pi and lost to a seat across the table.
     // Vision's boxes are bottom-left origin, so the bottom of the screen is the
     // smallest y.
-    if heroResolved, !players.isEmpty {
+    //
+    // Cards are not the only evidence that hero is playing. The client only
+    // draws the action strip -- Fold, Check, Call, or the pre-action
+    // checkboxes -- for somebody who is in the hand, and it draws nothing of
+    // the sort for a spectator. Requiring the cards alone meant hero went
+    // unidentified on nearly three frames in four of a live session: the cards
+    // are two small overlapping faces at the bottom of the table and the
+    // reading misses them often, and every frame it missed them was a frame
+    // with no hero, no hero stack and therefore no advice at all.
+    if (heroResolved || !state.hero_buttons.isEmpty), !players.isEmpty {
         var bestIdx = 0
         var lowest = CGFloat.infinity
         for (i, box) in seatBoxes.enumerated() where box.midY < lowest {
@@ -1772,6 +1781,13 @@ func analyzeTable(cgImg: CGImage, title: String, debugDir: URL? = nil) -> Parsed
     // Assigned only once every per-seat field is final: Swift arrays are value
     // types, so writing state.seats earlier and mutating `players` afterwards
     // silently discarded the revealed cards.
+    //
+    // In seat order, which is the only order that does not move. They used to
+    // come out in whatever order the nameplates sorted clockwise from the
+    // bottom, so a seat appearing or dropping out for one frame reordered the
+    // whole list -- and the panel is drawn in the order it is given, so the
+    // list jumped even when every name and number in it was right.
+    players.sort { $0.seat_number < $1.seat_number }
     state.seats = players
 
     // A showdown is more than one player with cards face up, or a hand being
@@ -1815,7 +1831,7 @@ func looksLikeSeatName(_ t: String) -> Bool {
     if trimmed.contains("%") || trimmed.contains("/") { return false }
 
     let lower = trimmed.lowercased()
-    let badges = ["all-in", "all in", "allin", "straddle", "sitting out",
+    let badges = ["enter amount", "all-in", "all in", "allin", "straddle", "sitting out",
                   "quick join", "ouick join", "join", "play next", "app health",
                   "helpdesk", "waiting", "deciding", "next game", "buy in",
                   "buy-in", "rebuy", "add chips", "outs",
