@@ -71,6 +71,8 @@ type Server struct {
 	lastSent   map[string]string
 	lastSentMu sync.Mutex
 
+	coachRunner coachRunner
+
 	roiConfig       vision.ROIConfig
 	roiPath         string
 	roiMu           sync.RWMutex
@@ -325,6 +327,10 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 		Timestamp: now,
 		Reason:    noAdvice,
 	})
+
+	// The second opinion is asked for last and answered later. It never holds
+	// up the recommendation the panel is drawn from.
+	s.askCoach(tableID, event.HandState, rec)
 
 	return rec, nil
 }

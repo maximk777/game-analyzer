@@ -107,6 +107,16 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 	// 5. Initialize Server & WebSocket Hub
 	srv := server.NewServer(cache, db, prof)
 
+	// The second opinion at the table, when there is a model to ask. It is a
+	// separate panel and never the decision: the tool's own answer is computed
+	// and reproducible, this one is a reading in words, and the disagreements
+	// are the part worth looking at.
+	if !cfg.MockLLM && cfg.LLM.Live() {
+		if c, ok := llmClient.(llm.Coach); ok {
+			srv.SetCoach(c)
+		}
+	}
+
 	// The built-in layout and a hand-made one behave very differently, and
 	// there was no way to tell from the outside which was in use.
 	if path, loaded, err := srv.LoadROIConfig(); err != nil {

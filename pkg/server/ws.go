@@ -18,6 +18,9 @@ const (
 	WSMsgPing           WSMessageType = "ping"
 	WSMsgPong           WSMessageType = "pong"
 	WSMsgError          WSMessageType = "error"
+	// WSMsgCoach carries the model's second opinion, which arrives seconds
+	// after the state it is about and therefore cannot ride along with it.
+	WSMsgCoach WSMessageType = "coach"
 )
 
 // WSMessage is the envelope for all WebSocket messages.

@@ -149,6 +149,22 @@
                 </div>
             </section>
 
+            <!-- Second opinion from the model. A separate card on purpose: the
+                 recommendation above is computed and reproducible, this one is
+                 a reading in words, and mixing them would hide which is which. -->
+            <section class="hud-coach-card" id="hudCoachCard" hidden>
+                <div class="coach-header">
+                    <span class="coach-title">🤖 ВТОРОЕ МНЕНИЕ</span>
+                    <span class="coach-verdict" id="hudCoachVerdict"></span>
+                </div>
+                <div class="coach-action-row">
+                    <span class="coach-action" id="hudCoachAction">—</span>
+                    <span class="coach-amount" id="hudCoachAmount"></span>
+                </div>
+                <div class="coach-text" id="hudCoachText">Модель читает стол…</div>
+                <div class="coach-model" id="hudCoachModel"></div>
+            </section>
+
             <!-- Seated Opponents Tendency Drawer (Collapsible) -->
             <section class="hud-opponents-section">
                 <div class="opponents-header" id="btnToggleOpponents">

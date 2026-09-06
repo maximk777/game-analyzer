@@ -1,6 +1,7 @@
 package advisor
 
 import (
+	"strings"
 	"testing"
 
 	"poker-game-analyzer/pkg/table"
@@ -116,4 +117,25 @@ func TestCautionScalesWithHowMuchOfTheStackGoesIn(t *testing.T) {
 		t.Errorf("a %.0f-chip shove is charged only %.2f", big, wantBig)
 	}
 	t.Logf("caution: %.0f-chip bet costs %.2f, %.0f-chip shove costs %.0f", small, wantSmall, big, wantBig)
+}
+
+// The action name in the chart explanation is a Russian word, and it was
+// capitalised by slicing the first byte off it. A Cyrillic letter is two bytes,
+// so the line began with two replacement characters and the rest of the letter
+// was gone: every raise the tool recommended was explained as "??ейз 3000".
+func TestChartReasoningKeepsTheFirstLetterWhole(t *testing.T) {
+	for _, name := range []string{"рейз", "бет", "олл-ин"} {
+		got := chartReasoning(reasoningInput{
+			action: ActionRecommendation{Action: table.ActionRaise, Amount: 3000, SizingLabel: "Chart Open"},
+			pot:    4600,
+		}, "5-вей", map[table.ActionType]string{table.ActionRaise: name})
+
+		if strings.ContainsRune(got, '�') {
+			t.Errorf("%q produced a broken letter: %q", name, got)
+		}
+		want := strings.ToUpper(string([]rune(name)[0])) + string([]rune(name)[1:])
+		if !strings.HasPrefix(got, want) {
+			t.Errorf("%q: got %q, want it to start with %q", name, got, want)
+		}
+	}
 }

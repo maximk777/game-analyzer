@@ -1804,7 +1804,7 @@ func chartReasoning(in reasoningInput, way string, actionRU map[table.ActionType
 			name = string(in.action.Action)
 		}
 		return fmt.Sprintf("%s %.0f (%s) по чарту: рука в диапазоне повышения для этой позиции. %s, банк %.0f, эффективный стек %.0f.",
-			strings.ToUpper(name[:1])+name[1:], in.action.Amount, in.action.SizingLabel,
+			capitalise(name), in.action.Amount, in.action.SizingLabel,
 			way, in.pot, in.effectiveStack)
 	}
 }

@@ -21,6 +21,13 @@
         hudPhaseBadge: document.getElementById("hudPhaseBadge"),
         hudStreetBadge: document.getElementById("hudStreetBadge"),
         hudPotBadge: document.getElementById("hudPotBadge"),
+
+        hudCoachCard: document.getElementById("hudCoachCard"),
+        hudCoachVerdict: document.getElementById("hudCoachVerdict"),
+        hudCoachAction: document.getElementById("hudCoachAction"),
+        hudCoachAmount: document.getElementById("hudCoachAmount"),
+        hudCoachText: document.getElementById("hudCoachText"),
+        hudCoachModel: document.getElementById("hudCoachModel"),
         
         hudHoleCards: document.getElementById("hudHoleCards"),
         hudHandRank: document.getElementById("hudHandRank"),
@@ -194,6 +201,9 @@
                 // rendered, not ignored: dropping it left the previous hand's
                 // recommendation on screen looking current.
                 renderAdvisorRecommendation(msg.payload || null, msg.reason || "");
+                break;
+            case "coach":
+                renderCoach(msg.payload || null);
                 break;
             case "event":
                 if (msg.payload && msg.payload.hand_state) {
@@ -463,6 +473,53 @@
         elements.sizeAmt66.textContent = pot > 0 ? formatChips(fits(curBet + pot * 0.66)) : dash;
         elements.sizeAmtPot.textContent = pot > 0 ? formatChips(fits(curBet + pot)) : dash;
         elements.sizeAmtAllIn.textContent = "All-In";
+    }
+
+    // The model's second opinion. It arrives seconds after the state it is
+    // about, so it has its own message and its own card.
+    //
+    // The card appears only once there is something to say. A model that is
+    // switched off leaves no empty box behind, and a spot the model is still
+    // reading says so rather than showing the previous spot's answer.
+    function renderCoach(update) {
+        if (!update) {
+            elements.hudCoachCard.hidden = true;
+            return;
+        }
+        elements.hudCoachCard.hidden = false;
+
+        if (update.error) {
+            elements.hudCoachVerdict.className = "coach-verdict failed";
+            elements.hudCoachVerdict.textContent = "НЕ ОТВЕТИЛА";
+            elements.hudCoachAction.textContent = "—";
+            elements.hudCoachAmount.textContent = "";
+            elements.hudCoachText.textContent = update.error;
+            return;
+        }
+
+        if (update.pending || !update.advice) {
+            elements.hudCoachVerdict.className = "coach-verdict waiting";
+            elements.hudCoachVerdict.textContent = "ЧИТАЕТ…";
+            elements.hudCoachAction.textContent = "—";
+            elements.hudCoachAmount.textContent = "";
+            elements.hudCoachText.textContent = "Модель читает стол.";
+            return;
+        }
+
+        const a = update.advice;
+        // Agreement is the boring case. A disagreement is the only thing on
+        // this card worth stopping at, so it is the one that is marked.
+        elements.hudCoachVerdict.className = `coach-verdict ${a.agrees ? "agrees" : "differs"}`;
+        elements.hudCoachVerdict.textContent = a.agrees ? "СОГЛАСНА" : "НЕ СОГЛАСНА";
+
+        elements.hudCoachAction.textContent = (a.action || "—").toUpperCase();
+        elements.hudCoachAmount.textContent = a.amount > 0 ? formatChips(a.amount) : "";
+        elements.hudCoachText.textContent = a.reasoning || "";
+
+        const conf = typeof a.confidence === "number" && a.confidence > 0
+            ? ` · уверенность ${Math.round(a.confidence * 100)}%`
+            : "";
+        elements.hudCoachModel.textContent = `${a.model || "модель"}${conf}`;
     }
 
     function renderPlayers(seats) {

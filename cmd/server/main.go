@@ -59,9 +59,13 @@ func main() {
 	// 4. Initialize Opponent Profiler
 	prof := profiler.NewProfiler(cache, db, llmClient)
 	defer prof.Close()
+	coach, hasCoach := llmClient.(llm.Coach)
 
 	// 5. Initialize Server & Hub
 	srv := server.NewServer(cache, db, prof)
+	if hasCoach && !*mockLLMFlag && settings.Live() {
+		srv.SetCoach(coach)
+	}
 
 	// The built-in layout and a hand-made one behave very differently, and
 	// there was no way to tell from the outside which was in use.
