@@ -50,7 +50,12 @@ func (r *Roster) HandState() *table.HandState {
 	// The amount owed and the min raise come from the action offer when we have
 	// it -- they are exact there -- and are left at zero (unknown) otherwise
 	// rather than invented, the same contract HandState documents for blinds.
-	if r.Turn != nil {
+	//
+	// Only hero's own offer counts. Another player's says what their decision
+	// costs, not what hero's does, and an offer that has been spent says what
+	// the last decision cost: read as hero's buttons, a stale one is a fold and
+	// a call and a raise on a street where hero has nothing in front of them.
+	if r.Turn != nil && heroSeat != nil && r.TurnFor == heroSeat.UserName {
 		hs.CurrentBet = r.Turn.RoundMaxBet.Float()
 		if raise := r.Turn.UserTurnOptions[ActionCodeRaise]; len(raise) >= 1 {
 			hs.MinRaise = raise[0].Float()

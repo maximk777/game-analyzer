@@ -19,9 +19,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
+	"poker-game-analyzer/pkg/audit"
 	"poker-game-analyzer/pkg/llm"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/server"
@@ -41,6 +43,7 @@ func main() {
 		heroName = flag.String("hero-name", "", "hero's screen name (alternative to -hero-id)")
 		mockLLM  = flag.Bool("mock-llm", false, "use the deterministic mock profiler")
 		tableID  = flag.String("table-id", "coinpoker-live", "table id the HUD subscribes to; the live table is broadcast under it")
+		auditLog = flag.String("audit", "./bin/logs/decisions.jsonl", "decision audit log (JSONL); empty to disable")
 	)
 	flag.Parse()
 
@@ -48,7 +51,7 @@ func main() {
 		log.Fatal("sfsagent: set -hero-id (or -hero-name) so the assistant knows which seat is yours")
 	}
 
-	srv, prof, cleanup := buildServer(*dbPath, *webDir, *mockLLM)
+	srv, prof, cleanup := buildServer(*dbPath, *webDir, *auditLog, *mockLLM)
 	defer cleanup()
 
 	go serve(srv, *httpPort)
@@ -138,7 +141,7 @@ func detectPorts(pcapFile string) []int {
 
 // buildServer wires the storage, LLM, profiler and HTTP server, mirroring
 // cmd/server. Returns the server, profiler and a cleanup.
-func buildServer(dbPath, webDir string, mockLLM bool) (*server.Server, *profiler.Profiler, func()) {
+func buildServer(dbPath, webDir, auditPath string, mockLLM bool) (*server.Server, *profiler.Profiler, func()) {
 	db, err := storage.NewSQLiteDB(dbPath)
 	if err != nil {
 		log.Fatalf("sfsagent: open db: %v", err)
@@ -166,7 +169,37 @@ func buildServer(dbPath, webDir string, mockLLM bool) (*server.Server, *profiler
 			srv.MountStatic(webDir)
 		}
 	}
+
+	// The decision audit is what makes a live session diagnosable afterwards:
+	// every recommendation is recorded with the inputs it had and, more
+	// usefully, the ones it was missing. Without it a session leaves nothing
+	// behind but the showdowns, and "the panel said nothing on the new hand" has
+	// to be reproduced by hand. Failing to open it must not stop the assistant.
+	var auditLog *audit.Logger
+	if auditPath != "" {
+		if lg, err := audit.NewLogger(auditPath); err != nil {
+			log.Printf("[SFS] decision audit disabled: %v", err)
+		} else {
+			auditLog = lg
+			srv.SetAuditLogger(lg)
+			log.Printf("[SFS] decision audit → %s", auditPath)
+		}
+	}
+
 	cleanup := func() {
+		if auditLog != nil {
+			log.Printf("[AUDIT] %d distinct decisions recorded to %s", auditLog.Written(), auditPath)
+			summary := auditLog.GapSummary()
+			keys := make([]string, 0, len(summary))
+			for k := range summary {
+				keys = append(keys, string(k))
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				log.Printf("[AUDIT]   missing %-20s in %d decisions", k, summary[audit.Gap(k)])
+			}
+			_ = auditLog.Close()
+		}
 		prof.Close()
 		_ = db.Close()
 	}
