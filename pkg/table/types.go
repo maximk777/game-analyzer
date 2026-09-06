@@ -61,6 +61,12 @@ type SeatState struct {
 	// ours spans sessions and theirs resets each one. Zero means not reported.
 	ServerVPIP  float64 `json:"server_vpip,omitempty"`
 	ServerHands int     `json:"server_hands,omitempty"`
+
+	// WonHand is set at showdown for a player who won the pot (or part of it).
+	// With Cards, it is what lets a showdown be counted: who reached it and who
+	// took the money -- the difference between "went to showdown" and "won at
+	// showdown", the read that says whether a player's showdowns are strong.
+	WonHand bool `json:"won_hand,omitempty"`
 }
 
 type ActionRecord struct {

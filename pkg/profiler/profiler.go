@@ -61,6 +61,14 @@ type playerAccumulator struct {
 	RaisesCount           int
 	CallsCount            int
 
+	// Showdowns, counted from the hand's end. SawShowdown is how often the
+	// player reached one, WonShowdown how often they took the pot there, and
+	// ShownHands how many times we actually saw their cards -- the read that
+	// says whether their showdowns are strong, not merely frequent.
+	SawShowdown int
+	WonShowdown int
+	ShownHands  int
+
 	// Counted fold frequencies. See folds.go for why these exist at all.
 	Faced facedCounts
 }
@@ -117,6 +125,17 @@ func (a *playerAccumulator) toStats() storage.PlayerStats {
 	}
 	if v, ok := foldRate(a.Faced.raiseFoldedPost, a.Faced.raiseFacedPost); ok {
 		st.FoldToRaisePost, st.FoldToRaisePostN = v, a.Faced.raiseFacedPost
+	}
+
+	// Showdown reads. WTSD is how often a hand reaches a showdown, W$SD how often
+	// the player wins once there; both are fractions with the count behind them,
+	// left absent below a sample rather than shown as a confident zero.
+	st.WTSD = float64(a.SawShowdown) / float64(a.HandsCount)
+	st.WTSDN = a.HandsCount
+	st.ShownHands = a.ShownHands
+	if a.SawShowdown > 0 {
+		st.WonAtSD = float64(a.WonShowdown) / float64(a.SawShowdown)
+		st.WonAtSDN = a.SawShowdown
 	}
 	if v, ok := foldRate(a.Faced.betFlop, a.Faced.betFlopSpots); ok {
 		st.BetFreqFlop, st.BetFreqFlopN = v, a.Faced.betFlopSpots
@@ -305,9 +324,13 @@ func (p *Profiler) ProcessHandEnd(hand table.HandState) {
 		betsCount   int
 		raisesCount int
 		callsCount  int
+		sawShowdown bool
+		wonShowdown bool
+		shownHand   bool
 	}
 
 	participating := make(map[string]*playerHandMetrics)
+	atShowdown := hand.Street == table.StreetShowdown
 
 	for _, seat := range hand.Seats {
 		if seat.PlayerID == "" || !seat.IsActive {
@@ -317,10 +340,19 @@ func (p *Profiler) ProcessHandEnd(hand table.HandState) {
 		if pName == "" {
 			pName = seat.PlayerID
 		}
-		participating[seat.PlayerID] = &playerHandMetrics{
+		m := &playerHandMetrics{
 			playerID:   seat.PlayerID,
 			playerName: pName,
 		}
+		// A hand that ended at showdown: a player still in it (not folded)
+		// reached the showdown; the winner flag and the shown cards say the
+		// rest. Mucked hands are counted as reached but not shown.
+		if atShowdown && !seat.IsFolded {
+			m.sawShowdown = true
+			m.wonShowdown = seat.WonHand
+			m.shownHand = len(seat.Cards) == 2
+		}
+		participating[seat.PlayerID] = m
 	}
 
 	// Who was bet at, and what they did about it.
@@ -387,6 +419,15 @@ func (p *Profiler) ProcessHandEnd(hand table.HandState) {
 		accum.BetsCount += m.betsCount
 		accum.RaisesCount += m.raisesCount
 		accum.CallsCount += m.callsCount
+		if m.sawShowdown {
+			accum.SawShowdown++
+		}
+		if m.wonShowdown {
+			accum.WonShowdown++
+		}
+		if m.shownHand {
+			accum.ShownHands++
+		}
 		if f, ok := faced[pID]; ok {
 			accum.Faced.raiseFaced += f.raiseFaced
 			accum.Faced.raiseFolded += f.raiseFolded

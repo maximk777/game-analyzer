@@ -187,6 +187,15 @@ func statLine(st *storage.PlayerStats, serverVPIP float64, serverHands int) stri
 		if st.FoldToBetN > 0 {
 			parts = append(parts, fmt.Sprintf("fold-to-bet %.0f%%", st.FoldToBet*100))
 		}
+		// Showdown reads: how often they get there, and whether they win when
+		// they do -- a high WTSD with a low win rate is a station to value-bet.
+		if st.WTSDN > 0 {
+			sd := fmt.Sprintf("WTSD %.0f%%", st.WTSD*100)
+			if st.WonAtSDN > 0 {
+				sd += fmt.Sprintf(" (wins %.0f%% at showdown, %d shown)", st.WonAtSD*100, st.ShownHands)
+			}
+			parts = append(parts, sd)
+		}
 		return strings.Join(parts, ", ")
 	}
 	if serverVPIP > 0 {

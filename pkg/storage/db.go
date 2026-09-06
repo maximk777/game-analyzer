@@ -49,6 +49,17 @@ type PlayerStats struct {
 	BetFreqFlopN int     `json:"bet_freq_flop_n"`
 	BetFreqLate  float64 `json:"bet_freq_late"`
 	BetFreqLateN int     `json:"bet_freq_late_n"`
+
+	// Showdown reads, counted from what the wire reveals at the end of a hand.
+	// WTSD is how often the player reaches a showdown; WonAtSD how often they
+	// win once there; ShownHands how many of their hands we actually saw. As
+	// fractions, with the sample behind them, absent below a threshold rather
+	// than a confident zero.
+	WTSD       float64 `json:"wtsd"`
+	WTSDN      int     `json:"wtsd_n"`
+	WonAtSD    float64 `json:"won_at_sd"`
+	WonAtSDN   int     `json:"won_at_sd_n"`
+	ShownHands int     `json:"shown_hands"`
 }
 
 // LLMProfile represents qualitative and exploitative profile data generated for a player.
@@ -126,6 +137,11 @@ func (s *SQLiteDB) migrate() error {
 			pfr REAL NOT NULL DEFAULT 0.0,
 			three_bet REAL NOT NULL DEFAULT 0.0,
 			af REAL NOT NULL DEFAULT 0.0,
+			wtsd REAL NOT NULL DEFAULT 0.0,
+			wtsd_n INTEGER NOT NULL DEFAULT 0,
+			won_at_sd REAL NOT NULL DEFAULT 0.0,
+			won_at_sd_n INTEGER NOT NULL DEFAULT 0,
+			shown_hands INTEGER NOT NULL DEFAULT 0,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS player_llm_profiles (
@@ -156,6 +172,20 @@ func (s *SQLiteDB) migrate() error {
 			return fmt.Errorf("migration query failed (%s): %w", q, err)
 		}
 	}
+
+	// Add the showdown columns to a player_stats table that predates them. A
+	// fresh database gets them from CREATE TABLE above; an existing one needs
+	// them added, and ALTER on a column that already exists is an error we
+	// expect and ignore, so a second start is not a failure.
+	for _, col := range []string{
+		"ALTER TABLE player_stats ADD COLUMN wtsd REAL NOT NULL DEFAULT 0.0;",
+		"ALTER TABLE player_stats ADD COLUMN wtsd_n INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE player_stats ADD COLUMN won_at_sd REAL NOT NULL DEFAULT 0.0;",
+		"ALTER TABLE player_stats ADD COLUMN won_at_sd_n INTEGER NOT NULL DEFAULT 0;",
+		"ALTER TABLE player_stats ADD COLUMN shown_hands INTEGER NOT NULL DEFAULT 0;",
+	} {
+		_, _ = s.db.Exec(col)
+	}
 	return nil
 }
 
@@ -166,8 +196,8 @@ func (s *SQLiteDB) Close() error {
 
 // SavePlayerStats inserts or updates statistical data for a player.
 func (s *SQLiteDB) SavePlayerStats(p PlayerStats) error {
-	query := `INSERT INTO player_stats (player_id, player_name, hands_count, vpip, pfr, three_bet, af, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	query := `INSERT INTO player_stats (player_id, player_name, hands_count, vpip, pfr, three_bet, af, wtsd, wtsd_n, won_at_sd, won_at_sd_n, shown_hands, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(player_id) DO UPDATE SET
 			player_name = excluded.player_name,
 			hands_count = excluded.hands_count,
@@ -175,9 +205,15 @@ func (s *SQLiteDB) SavePlayerStats(p PlayerStats) error {
 			pfr = excluded.pfr,
 			three_bet = excluded.three_bet,
 			af = excluded.af,
+			wtsd = excluded.wtsd,
+			wtsd_n = excluded.wtsd_n,
+			won_at_sd = excluded.won_at_sd,
+			won_at_sd_n = excluded.won_at_sd_n,
+			shown_hands = excluded.shown_hands,
 			updated_at = CURRENT_TIMESTAMP;`
 
-	_, err := s.db.Exec(query, p.PlayerID, p.PlayerName, p.HandsCount, p.VPIP, p.PFR, p.ThreeBet, p.AF)
+	_, err := s.db.Exec(query, p.PlayerID, p.PlayerName, p.HandsCount, p.VPIP, p.PFR, p.ThreeBet, p.AF,
+		p.WTSD, p.WTSDN, p.WonAtSD, p.WonAtSDN, p.ShownHands)
 	if err != nil {
 		return fmt.Errorf("failed to save player stats for %s: %w", p.PlayerID, err)
 	}
@@ -186,7 +222,8 @@ func (s *SQLiteDB) SavePlayerStats(p PlayerStats) error {
 
 // GetPlayerStats retrieves stats for the given playerID. Returns nil, nil if player is not found.
 func (s *SQLiteDB) GetPlayerStats(playerID string) (*PlayerStats, error) {
-	query := `SELECT player_id, player_name, hands_count, vpip, pfr, three_bet, af
+	query := `SELECT player_id, player_name, hands_count, vpip, pfr, three_bet, af,
+		wtsd, wtsd_n, won_at_sd, won_at_sd_n, shown_hands
 		FROM player_stats WHERE player_id = ?;`
 
 	var p PlayerStats
@@ -198,6 +235,11 @@ func (s *SQLiteDB) GetPlayerStats(playerID string) (*PlayerStats, error) {
 		&p.PFR,
 		&p.ThreeBet,
 		&p.AF,
+		&p.WTSD,
+		&p.WTSDN,
+		&p.WonAtSD,
+		&p.WonAtSDN,
+		&p.ShownHands,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

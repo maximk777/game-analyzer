@@ -821,22 +821,34 @@ body.hud-body {
 /* A bluff the statistics justify: a red-edged callout, shown only when the
    model flags one. */
 .coach-bluff {
-    margin-top: 6px;
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    background: rgba(255, 51, 102, 0.12);
+    border: 1px solid rgba(255, 51, 102, 0.4);
+    border-radius: 8px;
+}
+.coach-bluff-head {
     display: flex;
     align-items: baseline;
-    gap: 7px;
-    padding: 6px 8px;
-    background: rgba(255, 51, 102, 0.1);
-    border: 1px solid rgba(255, 51, 102, 0.3);
-    border-radius: 6px;
+    justify-content: space-between;
+    gap: 8px;
 }
 .coach-bluff-tag {
-    flex-shrink: 0;
     font-family: var(--font-mono);
     font-weight: 700;
-    font-size: 8.5px;
-    letter-spacing: 0.5px;
+    font-size: 11px;
+    letter-spacing: 0.8px;
     color: var(--accent-red);
+}
+.coach-bluff-amt {
+    font-family: var(--font-mono);
+    font-weight: 800;
+    font-size: 18px;
+    color: var(--accent-red);
+    line-height: 1;
 }
 .coach-bluff-text {
     font-size: 10.5px;

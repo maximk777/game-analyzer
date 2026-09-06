@@ -72,6 +72,7 @@ func (r *Roster) HandState() *table.HandState {
 			Cards:       r.HoleCards[s.SeatID],
 			ServerVPIP:  s.Vpip,
 			ServerHands: s.HandsPlayed,
+			WonHand:     r.Winners[s.SeatID],
 		}
 		hs.Seats = append(hs.Seats, seat)
 	}

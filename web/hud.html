@@ -30,7 +30,7 @@
             <section class="hud-cards-section">
                 <!-- Hero Cards & Combo -->
                 <div class="hud-hero-box">
-                    <div class="hud-box-title">HERO HAND</div>
+                    <div class="hud-box-title">КАРТЫ ГЕРОЯ</div>
                     <div class="hud-hole-cards" id="hudHoleCards">
                         <div class="hud-card card-empty" data-slot="0">
                             <span class="card-rank">?</span>
@@ -41,12 +41,12 @@
                             <span class="card-suit"></span>
                         </div>
                     </div>
-                    <div class="hud-hand-rank" id="hudHandRank">Awaiting Cards...</div>
+                    <div class="hud-hand-rank" id="hudHandRank">Ждём карты…</div>
                 </div>
 
                 <!-- Board Ribbon -->
                 <div class="hud-board-box">
-                    <div class="hud-box-title">COMMUNITY BOARD</div>
+                    <div class="hud-box-title">БОРД</div>
                     <div class="hud-board-cards" id="hudBoardCards">
                         <div class="board-card empty">_</div>
                         <div class="board-card empty">_</div>
@@ -54,14 +54,14 @@
                         <div class="board-card empty">_</div>
                         <div class="board-card empty">_</div>
                     </div>
-                    <div class="hud-board-info" id="hudBoardInfo">Waiting for Deal...</div>
+                    <div class="hud-board-info" id="hudBoardInfo">Ждём раздачу…</div>
                 </div>
             </section>
 
             <!-- PRIMARY RECOMMENDATION (Centerpiece) -->
             <section class="hud-recommendation-card" id="hudRecCard">
                 <div class="rec-header">
-                    <span class="rec-tag">RECOMMENDED ACTION</span>
+                    <span class="rec-tag">РЕКОМЕНДАЦИЯ</span>
                     <span class="rec-ev-pill" id="hudEvBadge">EV: +$0.00</span>
                 </div>
                 
@@ -71,7 +71,7 @@
                 </div>
 
                 <div class="rec-edge-callout" id="hudEdgeCallout">
-                    <span id="hudEdgeText">Analyzing table state & pot odds...</span>
+                    <span id="hudEdgeText">Анализирую стол и пот-оддсы…</span>
                 </div>
             </section>
 
@@ -79,7 +79,7 @@
             <section class="hud-gauges-card">
                 <div class="gauge-row">
                     <div class="gauge-header">
-                        <span class="gauge-name">HERO EQUITY</span>
+                        <span class="gauge-name">ЭКВИТИ</span>
                         <span class="gauge-val text-cyan" id="hudEquityVal">0.0%</span>
                     </div>
                     <div class="gauge-track">
@@ -89,7 +89,7 @@
 
                 <div class="gauge-row">
                     <div class="gauge-header">
-                        <span class="gauge-name">POT ODDS REQ.</span>
+                        <span class="gauge-name">ПОТ-ОДДСЫ</span>
                         <span class="gauge-val text-amber" id="hudPotOddsVal">0.0%</span>
                     </div>
                     <div class="gauge-track">
@@ -112,7 +112,7 @@
 
             <!-- Sizing Matrix (Quick Reference for CoinPoker Bet Sizing) -->
             <section class="hud-sizing-card">
-                <div class="sizing-card-title">BET SIZING MATRIX</div>
+                <div class="sizing-card-title">РАЗМЕРЫ СТАВКИ</div>
                 <div class="hud-sizing-grid" id="hudSizingGrid">
                     <div class="sizing-item">
                         <span class="s-tag">Min</span>
@@ -143,9 +143,9 @@
 
             <!-- AI Tactical Strategy & Reasoning -->
             <section class="hud-strategy-card">
-                <div class="strategy-title">💡 STRATEGY & REASONING</div>
+                <div class="strategy-title">💡 ОБОСНОВАНИЕ</div>
                 <div class="strategy-text" id="hudReasoningText">
-                    Live capture connected. Waiting for cards or active turn...
+                    Захват подключён. Ждём карты или ход…
                 </div>
             </section>
 
@@ -167,7 +167,10 @@
                      flags one, because a bluff on tap is the read the numbers
                      buy that the reproducible engine will not make on its own. -->
                 <div class="coach-bluff" id="hudCoachBluff" hidden>
-                    <span class="coach-bluff-tag">БЛЕФ-СПОТ</span>
+                    <div class="coach-bluff-head">
+                        <span class="coach-bluff-tag">🎯 БЛЕФ</span>
+                        <span class="coach-bluff-amt" id="hudCoachBluffAmt"></span>
+                    </div>
                     <span class="coach-bluff-text" id="hudCoachBluffText"></span>
                 </div>
 
@@ -180,11 +183,11 @@
             <!-- Seated Opponents Tendency Drawer (Collapsible) -->
             <section class="hud-opponents-section">
                 <div class="opponents-header" id="btnToggleOpponents">
-                    <span class="opp-title">👥 SEATED PLAYERS (<span id="playerCount">0</span>)</span>
+                    <span class="opp-title">👥 ИГРОКИ (<span id="playerCount">0</span>)</span>
                     <span class="opp-toggle-icon" id="oppToggleIcon">▼</span>
                 </div>
                 <div class="opponents-list" id="hudOpponentsList">
-                    <div class="empty-opp">No player data yet.</div>
+                    <div class="empty-opp">Нет данных об игроках.</div>
                 </div>
             </section>
 

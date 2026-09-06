@@ -68,6 +68,10 @@ type Roster struct {
 	// Actions is the action history of the current hand, as last sent. The wire
 	// sends it cumulatively, so the latest message is the whole hand so far.
 	Actions []ActionEntry
+
+	// Winners are the seat ids that won this hand, from the showdown message.
+	// Cleared at the start of each hand.
+	Winners map[int]bool
 }
 
 // HeroSeat returns the hero's seat, or nil if the hero is not seated at this
@@ -170,7 +174,14 @@ func (r *Roster) Apply(m Message) bool {
 	case KindShowdown:
 		// The showdown is the hand's end. Marking the street as showdown is what
 		// tells the pipeline the hand is over -- to persist it and fold it into
-		// the profiles -- rather than to advise on it.
+		// the profiles -- rather than to advise on it. The winners are recorded
+		// so a showdown can be counted as won, not merely reached.
+		if r.Winners == nil {
+			r.Winners = make(map[int]bool)
+		}
+		for _, w := range m.Showdown.Winners {
+			r.Winners[w.SeatID] = true
+		}
 		if r.Street == "SHOWDOWN" {
 			return false
 		}
@@ -200,6 +211,7 @@ func (r *Roster) applyHistory(h *ActionHistoryMsg) bool {
 		r.WhoseTurn = ""
 		r.Board = nil
 		r.HoleCards = make(map[int][]table.Card)
+		r.Winners = nil
 		for _, s := range r.Seats {
 			s.Bet = table.Zero
 		}
@@ -230,6 +242,7 @@ func (r *Roster) applyHandStart(h *HandStartMsg) bool {
 	r.HoleCards = make(map[int][]table.Card)
 	r.HeroCards = nil
 	r.Turn = nil
+	r.Winners = nil
 	for _, s := range r.Seats {
 		s.Bet = table.Zero
 	}

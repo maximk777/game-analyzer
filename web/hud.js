@@ -28,6 +28,7 @@
         hudCoachAmount: document.getElementById("hudCoachAmount"),
         hudCoachText: document.getElementById("hudCoachText"),
         hudCoachBluff: document.getElementById("hudCoachBluff"),
+        hudCoachBluffAmt: document.getElementById("hudCoachBluffAmt"),
         hudCoachBluffText: document.getElementById("hudCoachBluffText"),
         hudCoachOpinion: document.getElementById("hudCoachOpinion"),
         hudCoachModel: document.getElementById("hudCoachModel"),
@@ -142,6 +143,13 @@
     }
 
     // Connect WebSocket to live stream
+
+    // Russian labels for streets and actions, to match the HUD design.
+    const STREET_RU = { preflop: "ПРЕФЛОП", flop: "ФЛОП", turn: "ТЁРН", river: "РИВЕР", showdown: "ВСКРЫТИЕ" };
+    const ACTION_RU = { fold: "ФОЛД", check: "ЧЕК", call: "КОЛЛ", bet: "БЕТ", raise: "РЕЙЗ", all_in: "ОЛ-ИН", "all-in": "ОЛ-ИН", allin: "ОЛ-ИН" };
+    function streetRU(s) { return STREET_RU[(s || "").toLowerCase()] || (s || "").toUpperCase(); }
+    function actionRU(a) { return ACTION_RU[(a || "").toLowerCase().replace(/\s+/g, "-")] || (a || "").toUpperCase(); }
+
     function connectWebSocket() {
         if (state.ws) {
             try { state.ws.close(); } catch (e) {}
@@ -223,8 +231,8 @@
         // 1. Street & Pot
         const street = (handState.street || "preflop").toLowerCase();
         elements.hudStreetBadge.className = `hud-street-badge street-${street}`;
-        elements.hudStreetBadge.textContent = street.toUpperCase();
-        elements.hudPotBadge.textContent = `Pot: ${formatChips(handState.pot || 0)}`;
+        elements.hudStreetBadge.textContent = streetRU(street);
+        elements.hudPotBadge.textContent = `Банк ${formatChips(handState.pot || 0)}`;
 
         // 2. Hero Cards
         const parsedHero = [];
@@ -275,7 +283,7 @@
         });
 
         if (parsedBoard.length > 0) {
-            elements.hudBoardInfo.textContent = `${street.toUpperCase()} (${parsedBoard.length} cards)`;
+            elements.hudBoardInfo.textContent = `${streetRU(street)} · ${parsedBoard.length}`;
         } else {
             elements.hudBoardInfo.textContent = "Preflop (No Board Cards)";
         }
@@ -332,7 +340,7 @@
         }
 
         const act = (rec.primary_action || "check").toLowerCase();
-        elements.hudActionType.textContent = (rec.primary_action || "CHECK").toUpperCase();
+        elements.hudActionType.textContent = actionRU(rec.primary_action || "check");
         
         if (rec.recommended_amount && rec.recommended_amount > 0) {
             elements.hudActionAmount.textContent = formatChips(rec.recommended_amount);
@@ -523,13 +531,16 @@
         elements.hudCoachVerdict.className = `coach-verdict ${a.agrees ? "agrees" : "differs"}`;
         elements.hudCoachVerdict.textContent = a.agrees ? "СОГЛАСНА" : "НЕ СОГЛАСНА";
 
-        elements.hudCoachAction.textContent = (a.action || "—").toUpperCase();
+        elements.hudCoachAction.textContent = a.action ? actionRU(a.action) : "—";
         elements.hudCoachAmount.textContent = a.amount > 0 ? formatChips(a.amount) : "";
         elements.hudCoachText.textContent = a.reasoning || "";
 
-        // Bluff spot: only when the model flags one and names the tendency.
-        if (a.bluff && a.bluff_reason) {
-            elements.hudCoachBluffText.textContent = a.bluff_reason;
+        // Bluff spot: only when the model flags one. The amount is the bluff
+        // size -- the model's own recommended bet when it is bluffing -- shown
+        // large so "there is a bluff here, this big" reads at a glance.
+        if (a.bluff) {
+            elements.hudCoachBluffAmt.textContent = a.amount > 0 ? formatChips(a.amount) : "";
+            elements.hudCoachBluffText.textContent = a.bluff_reason || "";
             elements.hudCoachBluff.hidden = false;
         }
 
