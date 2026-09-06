@@ -14,7 +14,6 @@ package advice
 import (
 	"math"
 	"math/rand"
-	"time"
 
 	"poker-game-analyzer/pkg/advisor"
 	"poker-game-analyzer/pkg/equity"
@@ -150,7 +149,7 @@ func Evaluate(h *table.HandState, reads Reads, opt Options) Result {
 	}
 	rng := opt.Rng
 	if rng == nil {
-		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+		rng = rand.New(rand.NewSource(seedFor(h)))
 	}
 
 	var oppTendencies map[string]float64
