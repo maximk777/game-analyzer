@@ -82,11 +82,24 @@ func spotKey(h *table.HandState, rec *advisor.AdvisorResponse) string {
 // askCoach starts a second opinion on this spot if there is one to have and it
 // has not been asked yet. It never blocks the frame it was called from.
 func (s *Server) askCoach(tableID string, h *table.HandState, rec *advisor.AdvisorResponse) {
+	r := &s.coachRunner
+
+	// Nothing to advise on. The card is cleared rather than left holding the
+	// last spot's answer, which would sit there looking current for the whole
+	// of the next hand.
 	if h == nil || rec == nil || !h.HeroCanAct() {
+		r.mu.Lock()
+		had := r.coach != nil && r.lastSpot[tableID] != ""
+		if had {
+			r.lastSpot[tableID] = ""
+		}
+		r.mu.Unlock()
+		if had {
+			s.broadcastCoach(tableID, CoachUpdate{})
+		}
 		return
 	}
 
-	r := &s.coachRunner
 	key := spotKey(h, rec)
 
 	r.mu.Lock()

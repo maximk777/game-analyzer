@@ -744,6 +744,11 @@ body.hud-body {
     font-size: 10.5px;
     line-height: 1.35;
     color: var(--text-main);
+    /* A refusal from the service can run long. It scrolls inside its own box
+       rather than pushing the table off the panel. */
+    max-height: 84px;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
 }
 
 .coach-model {

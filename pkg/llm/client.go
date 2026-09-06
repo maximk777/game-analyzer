@@ -184,6 +184,52 @@ type parsedProfileResponse struct {
 	TacticalNotes  string  `json:"tactical_notes"`
 }
 
+// apiErrorMessage reduces a refusal to the sentence a person needs.
+//
+// Google answers a disabled API with about fifteen hundred characters of JSON
+// that says the same thing five times, in a details array, a localized message
+// and an activation URL. That went into the error verbatim, and from there onto
+// the panel, where it pushed the table off the screen. The sentence is what
+// matters; the rest is in the log.
+func apiErrorMessage(body []byte) string {
+	var wrapped struct {
+		Error struct {
+			Message string `json:"message"`
+			Status  string `json:"status"`
+		} `json:"error"`
+	}
+	// Some services wrap the object in an array, which is not the OpenAI shape
+	// and is what Gemini does here.
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var many []json.RawMessage
+		if err := json.Unmarshal(trimmed, &many); err == nil && len(many) > 0 {
+			trimmed = many[0]
+		}
+	}
+	if err := json.Unmarshal(trimmed, &wrapped); err == nil && wrapped.Error.Message != "" {
+		return firstSentence(wrapped.Error.Message)
+	}
+	return firstSentence(string(trimmed))
+}
+
+// firstSentence keeps the claim and drops the instructions that follow it.
+func firstSentence(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '.'); i > 0 && i < 300 {
+		return s[:i+1]
+	}
+	const limit = 300
+	if len(s) <= limit {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return string(r[:limit]) + "..."
+}
+
 // chat sends one completion and returns the assistant's text.
 //
 // The JSON response format is asked for, then dropped for the life of the
@@ -246,7 +292,7 @@ func (c *OpenAIClient) send(ctx context.Context, systemPrompt, userPrompt string
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		failed := fmt.Errorf("llm api returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		failed := fmt.Errorf("llm api returned status %d: %s", resp.StatusCode, apiErrorMessage(bodyBytes))
 		if askForJSON && resp.StatusCode == http.StatusBadRequest {
 			return "", formatRejected{failed}
 		}

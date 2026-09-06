@@ -174,3 +174,30 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("timed out waiting for the coach")
 }
+
+// A hand where hero has no decision must not leave the previous spot's second
+// opinion standing. The card is cleared, and the spot is forgotten -- so if
+// the same decision comes back round, it is a question again rather than a
+// stale answer.
+func TestCoachForgetsTheSpotWhenThereIsNoDecision(t *testing.T) {
+	c := &countingCoach{}
+	srv := newCoachServer(t, c)
+
+	ingest(t, srv, coachState(10000))
+	waitFor(t, func() bool { return atomic.LoadInt32(&c.calls) == 1 })
+
+	folded := coachState(10000)
+	folded.IsHeroTurn = false
+	folded.HeroButtons = nil
+	ingest(t, srv, folded)
+
+	srv.coachRunner.mu.Lock()
+	spot := srv.coachRunner.lastSpot["coach-table"]
+	srv.coachRunner.mu.Unlock()
+	if spot != "" {
+		t.Fatalf("the spot survived a frame with no decision: %q", spot)
+	}
+
+	ingest(t, srv, coachState(10000))
+	waitFor(t, func() bool { return atomic.LoadInt32(&c.calls) == 2 })
+}

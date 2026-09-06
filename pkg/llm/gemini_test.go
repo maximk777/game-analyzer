@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -131,5 +132,38 @@ func TestOpenAIClientSendsTheConfiguredModel(t *testing.T) {
 	}
 	if sent != llm.GeminiModel {
 		t.Fatalf("model: got %q, want %q", sent, llm.GeminiModel)
+	}
+}
+
+// Google answers a disabled API with about fifteen hundred characters of JSON
+// that says the same thing five times, in a details array, a localized message
+// and an activation URL. Verbatim, that went into the error and from there onto
+// the panel, where it pushed the table off the screen.
+func TestAPIRefusalIsReducedToOneSentence(t *testing.T) {
+	body := `[{ "error": { "code": 403, "message": "Gemini API has not been used in project 220159039139 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/generativelanguage.googleapis.com/overview?project=220159039139 then retry. If you enabled this API recently, wait a few minutes for the action to propagate to our systems and retry.", "status": "PERMISSION_DENIED", "details": [ { "@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "SERVICE_DISABLED", "domain": "googleapis.com" } ] } }]`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	_, err := llm.NewOpenAIClient("k", server.URL, llm.GeminiModel).
+		AnalyzePlayer(context.Background(), nil, storage.PlayerStats{PlayerID: "p"})
+	if err == nil {
+		t.Fatal("a 403 reported success")
+	}
+
+	got := err.Error()
+	if len(got) > 200 {
+		t.Errorf("the error is %d characters long:\n%s", len(got), got)
+	}
+	if !strings.Contains(got, "has not been used in project") {
+		t.Errorf("the reason was lost: %q", got)
+	}
+	for _, noise := range []string{"@type", "SERVICE_DISABLED", "console.developers.google.com"} {
+		if strings.Contains(got, noise) {
+			t.Errorf("%q survived into the message: %q", noise, got)
+		}
 	}
 }

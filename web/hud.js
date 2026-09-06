@@ -482,7 +482,10 @@
     // switched off leaves no empty box behind, and a spot the model is still
     // reading says so rather than showing the previous spot's answer.
     function renderCoach(update) {
-        if (!update) {
+        // An empty update is "there is no decision to have a second opinion
+        // about". The card goes away rather than keeping the last spot's
+        // answer on screen through the next hand.
+        if (!update || (!update.spot && !update.error)) {
             elements.hudCoachCard.hidden = true;
             return;
         }
