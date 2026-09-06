@@ -873,3 +873,17 @@ body.hud-body {
     color: var(--text-dim);
     font-family: var(--font-mono);
 }
+
+/* An explanation that belongs to a spot already over. Kept on screen on
+   purpose -- there is nothing to advise between hero's own decisions, and that
+   is when there is time to read why the last advice was what it was -- so it is
+   dimmed and labelled rather than removed. */
+.strategy-text.strategy-past {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.hud-coach-card.coach-past {
+    opacity: 0.72;
+    border-color: rgba(179, 136, 255, 0.16);
+}

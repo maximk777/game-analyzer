@@ -12,7 +12,25 @@
         reconnectTimer: null,
         currentHand: null,
         currentAdvice: null,
+        // The last explanation given, kept after the spot it belonged to is
+        // over. Most of the time there is no decision in front of hero, and a
+        // panel that blanks itself the moment they act is a panel whose
+        // reasoning can only be read in the half-second they are acting. It is
+        // marked as past rather than shown as current.
+        lastReasoning: "",
+        lastReasoningSpot: "",
+        lastCoach: null,
+        lastCoachSpot: "",
     };
+
+    // spotLabel names the decision an explanation belonged to, e.g. "ФЛОП · 12".
+    function spotLabel(hand) {
+        if (!hand) return "";
+        const street = streetRU((hand.street || "").toLowerCase());
+        const id = String(hand.hand_id || "");
+        const tail = id.length > 4 ? id.slice(-4) : id;
+        return tail ? `${street} · ${tail}` : street;
+    }
 
     const elements = {
         hudWidget: document.getElementById("hudWidget"),
@@ -310,9 +328,25 @@
         // tool is broken rather than like a hand that is over.
         elements.hudEdgeText.textContent = reason || "Совет не считается";
         elements.hudEdgeCallout.style.color = "var(--text-muted)";
-        elements.hudReasoningText.textContent = reason
-            ? reason + "."
-            : "Ожидание раздачи с видимыми карманными картами.";
+
+        // The reasoning stays. Between hero's own decisions there is nothing to
+        // advise, and that is exactly when there is time to read why the last
+        // advice was what it was -- so the last explanation is kept and labelled
+        // with the spot it came from, instead of being replaced by a line about
+        // waiting.
+        if (state.lastReasoning) {
+            elements.hudReasoningText.classList.add("strategy-past");
+            elements.hudReasoningText.textContent =
+                `${state.lastReasoningSpot ? state.lastReasoningSpot + " · " : ""}` +
+                `прошлый совет: ${state.lastReasoning}`;
+        } else {
+            elements.hudReasoningText.classList.remove("strategy-past");
+            elements.hudReasoningText.textContent = reason
+                ? reason + "."
+                : "Ожидание раздачи с видимыми карманными картами.";
+        }
+        // The second opinion likewise: kept, dimmed, and marked as past.
+        markCoachPast();
     }
 
     function renderAdvisorRecommendation(rec, reason) {
@@ -387,9 +421,13 @@
             elements.hudEdgeCallout.style.color = "var(--accent-red)";
         }
 
-        // Reasoning Text
+        // Reasoning Text. Kept as the last explanation, so it can still be read
+        // once the spot is over -- see clearAdvisorRecommendation.
         if (rec.reasoning) {
+            elements.hudReasoningText.classList.remove("strategy-past");
             elements.hudReasoningText.textContent = rec.reasoning;
+            state.lastReasoning = rec.reasoning;
+            state.lastReasoningSpot = spotLabel(state.currentHand);
         }
 
         // Advice built on the equilibrium baseline rather than on observed
@@ -492,15 +530,33 @@
     // The card appears only once there is something to say. A model that is
     // switched off leaves no empty box behind, and a spot the model is still
     // reading says so rather than showing the previous spot's answer.
-    function renderCoach(update) {
-        // An empty update is "there is no decision to have a second opinion
-        // about". The card goes away rather than keeping the last spot's
-        // answer on screen through the next hand.
-        if (!update || (!update.spot && !update.error)) {
+    // markCoachPast keeps the last second opinion on screen and says it is the
+    // last one rather than the current one. It is the only way the model's words
+    // can be read at all: the answer arrives while hero is acting and the spot is
+    // over a second later.
+    function markCoachPast() {
+        if (!state.lastCoach) {
             elements.hudCoachCard.hidden = true;
             return;
         }
         elements.hudCoachCard.hidden = false;
+        elements.hudCoachCard.classList.add("coach-past");
+        const a = state.lastCoach.advice || {};
+        const model = a.model || "модель";
+        elements.hudCoachModel.textContent =
+            `${model} · ${state.lastCoachSpot ? state.lastCoachSpot + " · " : ""}прошлый ход`;
+    }
+
+    function renderCoach(update) {
+        // An empty update is "there is no decision to have a second opinion
+        // about" -- the last answer stays, marked as past, so it can be read
+        // between hands instead of vanishing with the spot.
+        if (!update || (!update.spot && !update.error)) {
+            markCoachPast();
+            return;
+        }
+        elements.hudCoachCard.hidden = false;
+        elements.hudCoachCard.classList.remove("coach-past");
 
         // Bluff and opinion belong to a concrete answer; hide them until one
         // arrives, so a pending or failed read shows no stale flag.
@@ -526,6 +582,9 @@
         }
 
         const a = update.advice;
+        // Kept as the last answer, for reading once the spot is over.
+        state.lastCoach = update;
+        state.lastCoachSpot = spotLabel(state.currentHand);
         // Agreement is the boring case. A disagreement is the only thing on
         // this card worth stopping at, so it is the one that is marked.
         elements.hudCoachVerdict.className = `coach-verdict ${a.agrees ? "agrees" : "differs"}`;
@@ -563,6 +622,10 @@
     const profileFetchedAt = {};
     const profilePending = {};
     const PROFILE_TTL_MS = 20000; // stats accumulate as hands play; refresh occasionally
+    // Below this many hands our own frequencies are noise, and the site's own
+    // month-long aggregate describes the same player better. Matches
+    // advice.ThinSample.
+    const OWN_SAMPLE_MIN = 25;
     let lastSeats = [];
 
     // fetchProfile pulls a player's accumulated stats, then re-renders so the
@@ -619,7 +682,8 @@
                 statsHtml = '<span class="opp-you">ВЫ</span>';
             } else {
                 const st = profileCache[s.player_id];
-                if (st && st.hands_count > 0) {
+                const site = s.site_stats;
+                if (st && st.hands_count >= OWN_SAMPLE_MIN) {
                     // Our own accumulated sample: VPIP/PFR/3bet.
                     statsHtml =
                         `<span class="opp-stat ${vpipClass(st.vpip)}">${Math.round(st.vpip)}` +
@@ -627,6 +691,27 @@
                         `<span class="opp-stat-sep">/</span>${Math.round(st.three_bet)}</span>` +
                         `<span class="opp-hands">${formatCount(st.hands_count)}</span>`;
                     fetchProfile(s.player_id); // keep it fresh across hands
+                } else if (site && site.vpip > 0) {
+                    // The site's own aggregate, marked with a degree sign. Its
+                    // hand count is shown when the pool reports one -- the
+                    // real-money pool does not, and "30д" says what it covers.
+                    const v = site.vpip * 100;
+                    statsHtml =
+                        `<span class="opp-stat ${vpipClass(v)}">${Math.round(v)}` +
+                        `<span class="opp-stat-sep">/</span>${Math.round((site.pfr || 0) * 100)}` +
+                        `<span class="opp-stat-sep">/</span>${Math.round((site.three_bet || 0) * 100)}` +
+                        `<span class="opp-stat-sfx">°</span></span>` +
+                        `<span class="opp-hands">${site.hands > 0 ? formatCount(site.hands) : "30д"}</span>`;
+                    fetchProfile(s.player_id);
+                } else if (st && st.hands_count > 0) {
+                    // Our own thin sample, better than nothing and marked as
+                    // small by the count beside it.
+                    statsHtml =
+                        `<span class="opp-stat ${vpipClass(st.vpip)}">${Math.round(st.vpip)}` +
+                        `<span class="opp-stat-sep">/</span>${Math.round(st.pfr)}` +
+                        `<span class="opp-stat-sep">/</span>${Math.round(st.three_bet)}</span>` +
+                        `<span class="opp-hands">${formatCount(st.hands_count)}</span>`;
+                    fetchProfile(s.player_id);
                 } else if (s.server_vpip > 0) {
                     // No sample yet: the site's own session VPIP, marked.
                     statsHtml =
