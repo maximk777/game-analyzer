@@ -39,6 +39,9 @@ type Config struct {
 	LLM         llm.Settings
 	WebDir      string
 	AuditPath   string
+	// VisionHelperPath is the ScreenCaptureKit reader. It is configurable so a
+	// test can start something harmless in its place.
+	VisionHelperPath string
 }
 
 // AgentApp encapsulates the entire runtime environment for the live assistant.
@@ -174,9 +177,30 @@ func (app *AgentApp) Start(ctx context.Context) error {
 		}
 	}()
 
-	if err := app.liveAgent.Start(ctx); err != nil {
-		_ = app.srv.Stop(context.Background())
-		return fmt.Errorf("failed to start live agent: %w", err)
+	// One reader, not two.
+	//
+	// Both of these read the same table and post to the same server, and the
+	// stabiliser merged whatever arrived: names came from one source and money
+	// from the other. Live on 2026-09-06 the panel showed the right five
+	// nicknames beside a pot of 7.9 and stacks of 5, 0.6 and 55, at a table
+	// playing 1K/2K with two hundred thousand in front of every seat. The
+	// audit log has both readings of the same second, one of them carrying a
+	// player called "F7FFFF$" -- and no blinds, which is the tell, because the
+	// helper takes them from the window title and the ROI reader has no title
+	// to take them from.
+	//
+	// The helper wins where it exists: it uses the system's own text
+	// recognition, while the ROI reader matches glyphs against a hand-drawn
+	// 5x7 bitmap font that was never going to read anti-aliased text drawn by
+	// a game engine.
+	if app.startVisionHelper() {
+		log.Printf("[AGENT] Reading the table with the ScreenCaptureKit helper")
+	} else {
+		log.Printf("[AGENT] Reading the table with the built-in ROI reader; its text recognition is a bitmap font and reads the client badly")
+		if err := app.liveAgent.Start(ctx); err != nil {
+			_ = app.srv.Stop(context.Background())
+			return fmt.Errorf("failed to start live agent: %w", err)
+		}
 	}
 
 	hudURL := fmt.Sprintf("http://localhost:%d/hud.html", app.cfg.Port)
@@ -191,35 +215,53 @@ func (app *AgentApp) Start(ctx context.Context) error {
 		log.Printf("[AGENT] HUD not started. Run `make ui` for the floating panel, or open %s", hudURL)
 	}
 
-	// On macOS, launch ScreenCaptureKit Vision Helper if available
-	if runtime.GOOS == "darwin" {
-		binPath := "./bin/mac_vision_agent"
-		if info, err := os.Stat(binPath); err == nil {
-			// `go run` rebuilds the Go half and nothing else, so a stale Swift
-			// helper keeps running old card recognition while the logs look
-			// fresh. Saying so out loud costs a stat call and saves a long
-			// evening of debugging behaviour that was already fixed.
-			if newer := swiftSourcesNewerThan(info.ModTime()); len(newer) > 0 {
-				log.Printf("[AGENT] WARNING: %s is older than %s -- run `make` to rebuild the vision helper",
-					binPath, strings.Join(newer, ", "))
-			}
+	return nil
+}
+
+// defaultVisionHelper is the ScreenCaptureKit reader as `make vision` builds it.
+const defaultVisionHelper = "./bin/mac_vision_agent"
+
+// startVisionHelper launches the ScreenCaptureKit reader and reports whether it
+// is running. Nothing else may read the table while it is.
+func (app *AgentApp) startVisionHelper() bool {
+	binPath := app.cfg.VisionHelperPath
+	if binPath == "" {
+		if runtime.GOOS != "darwin" {
+			return false
 		}
-		if _, err := os.Stat(binPath); err == nil {
-			cmd := exec.Command(binPath)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			// Without this the helper posts to port 8080 regardless of -port.
-			cmd.Env = append(os.Environ(), fmt.Sprintf(
-				"POKER_RTA_ENDPOINT=http://127.0.0.1:%d/api/v1/tables/%s/events",
-				app.cfg.Port, app.cfg.TableID))
-			if err := cmd.Start(); err == nil {
-				app.macVisionCmd = cmd
-				log.Printf("[AGENT] Native macOS ScreenCaptureKit Vision helper started (PID %d)", cmd.Process.Pid)
-			}
-		}
+		binPath = defaultVisionHelper
 	}
 
-	return nil
+	info, err := os.Stat(binPath)
+	if err != nil {
+		log.Printf("[AGENT] %s is not built -- run `make vision`", binPath)
+		return false
+	}
+
+	// `go run` rebuilds the Go half and nothing else, so a stale helper keeps
+	// running old recognition while the logs look fresh. Saying so out loud
+	// costs a stat call and saves a long evening of debugging behaviour that
+	// was already fixed.
+	if newer := swiftSourcesNewerThan(info.ModTime()); len(newer) > 0 {
+		log.Printf("[AGENT] WARNING: %s is older than %s -- run `make` to rebuild the vision helper",
+			binPath, strings.Join(newer, ", "))
+	}
+
+	cmd := exec.Command(binPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	// Without this the helper posts to port 8080 regardless of -port.
+	cmd.Env = append(os.Environ(), fmt.Sprintf(
+		"POKER_RTA_ENDPOINT=http://127.0.0.1:%d/api/v1/tables/%s/events",
+		app.cfg.Port, app.cfg.TableID))
+	if err := cmd.Start(); err != nil {
+		log.Printf("[AGENT] %s would not start: %v", binPath, err)
+		return false
+	}
+
+	app.macVisionCmd = cmd
+	log.Printf("[AGENT] Native macOS ScreenCaptureKit Vision helper started (PID %d)", cmd.Process.Pid)
+	return true
 }
 
 // Stop gracefully shuts down all running agent services.
