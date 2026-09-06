@@ -36,8 +36,7 @@ type Config struct {
 	TableID     string
 	HeroID      string
 	MockLLM     bool
-	OpenAIKey   string
-	OpenAIModel string
+	LLM         llm.Settings
 	WebDir      string
 	AuditPath   string
 }
@@ -78,16 +77,8 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 	if cfg.DBPath == "" {
 		cfg.DBPath = "./bin/db/poker_analyzer.db"
 	}
-	if cfg.OpenAIModel == "" {
-		cfg.OpenAIModel = "gpt-4o-mini"
-	}
 	if cfg.WebDir == "" {
 		cfg.WebDir = "web"
-	}
-
-	apiKey := cfg.OpenAIKey
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
 	}
 
 	// 1. Initialize SQLite storage
@@ -101,10 +92,10 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 
 	// 3. Initialize LLM Client
 	var llmClient llm.Client
-	if cfg.MockLLM || apiKey == "" {
+	if cfg.MockLLM || !cfg.LLM.Live() {
 		llmClient = llm.NewMockClient()
 	} else {
-		llmClient = llm.NewOpenAIClient(apiKey, "", cfg.OpenAIModel)
+		llmClient = llm.NewOpenAIClient(cfg.LLM.Key, cfg.LLM.BaseURL, cfg.LLM.Model)
 	}
 
 	// 4. Initialize Opponent Profiler
@@ -366,27 +357,24 @@ func hudPanelCandidates() []string {
 }
 func main() {
 	var (
-		windowFlag      = flag.String("window", "CoinPoker", "Target poker window query")
-		portFlag        = flag.Int("port", 8080, "Server HTTP/WebSocket port")
-		fpsFlag         = flag.Int("fps", 3, "Frame grabber capture rate")
-		dbPathFlag      = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
-		openHUDFlag     = flag.Bool("open-hud", false, "Open the native floating HUD panel with the server (see `make ui` to run it separately)")
-		tableIDFlag     = flag.String("table-id", "coinpoker-live", "Active table ID")
-		heroIDFlag      = flag.String("hero-id", "Hero", "Active hero player ID")
-		mockLLMFlag     = flag.Bool("mock-llm", false, "Use offline deterministic mock profiler")
-		openAIKeyFlag   = flag.String("openai-key", "", "OpenAI API key (falls back to OPENAI_API_KEY env)")
-		openAIModelFlag = flag.String("openai-model", "gpt-4o-mini", "OpenAI model name")
-		webDirFlag      = flag.String("web-dir", "web", "Web assets directory")
-		auditPathFlag   = flag.String("audit", "./bin/logs/decisions.jsonl", "Decision audit log (JSONL); empty to disable")
+		windowFlag    = flag.String("window", "CoinPoker", "Target poker window query")
+		portFlag      = flag.Int("port", 8080, "Server HTTP/WebSocket port")
+		fpsFlag       = flag.Int("fps", 3, "Frame grabber capture rate")
+		dbPathFlag    = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
+		openHUDFlag   = flag.Bool("open-hud", false, "Open the native floating HUD panel with the server (see `make ui` to run it separately)")
+		tableIDFlag   = flag.String("table-id", "coinpoker-live", "Active table ID")
+		heroIDFlag    = flag.String("hero-id", "Hero", "Active hero player ID")
+		mockLLMFlag   = flag.Bool("mock-llm", false, "Use offline deterministic mock profiler")
+		llmKeyFlag    = flag.String("llm-key", "", "API key; falls back to GEMINI_API_KEY, GOOGLE_API_KEY or OPENAI_API_KEY")
+		llmURLFlag    = flag.String("llm-url", "", "OpenAI-compatible base URL; defaults to Gemini, or to OpenAI when the key came from OPENAI_API_KEY")
+		llmModelFlag  = flag.String("llm-model", "", "Model name; defaults to "+llm.GeminiModel)
+		webDirFlag    = flag.String("web-dir", "web", "Web assets directory")
+		auditPathFlag = flag.String("audit", "./bin/logs/decisions.jsonl", "Decision audit log (JSONL); empty to disable")
 	)
 	flag.Parse()
 
-	apiKey := *openAIKeyFlag
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
-
-	useMockLLM := *mockLLMFlag || apiKey == ""
+	settings := llm.Resolve(*llmKeyFlag, *llmURLFlag, *llmModelFlag, os.Getenv)
+	useMockLLM := *mockLLMFlag || !settings.Live()
 
 	cfg := Config{
 		WindowQuery: *windowFlag,
@@ -397,8 +385,7 @@ func main() {
 		TableID:     *tableIDFlag,
 		HeroID:      *heroIDFlag,
 		MockLLM:     useMockLLM,
-		OpenAIKey:   apiKey,
-		OpenAIModel: *openAIModelFlag,
+		LLM:         settings,
 		WebDir:      *webDirFlag,
 		AuditPath:   *auditPathFlag,
 	}
@@ -409,9 +396,9 @@ func main() {
 	log.Printf("[AGENT] Table ID: %q | Hero ID: %q", cfg.TableID, cfg.HeroID)
 	log.Printf("[AGENT] Server Port: %d | Database: %q", cfg.Port, cfg.DBPath)
 	if cfg.MockLLM {
-		log.Printf("[AGENT] Profiler Mode: Deterministic Mock LLM (Offline)")
+		log.Printf("[AGENT] Profiler: rules only, no model (%s)", cfg.LLM.Describe())
 	} else {
-		log.Printf("[AGENT] Profiler Mode: OpenAI (%s)", cfg.OpenAIModel)
+		log.Printf("[AGENT] Profiler: %s", cfg.LLM.Describe())
 	}
 	log.Printf("[AGENT] Open Floating HUD: %v", cfg.OpenHUD)
 	log.Printf("[AGENT] ===================================================")

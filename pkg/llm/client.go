@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"poker-game-analyzer/pkg/storage"
@@ -100,6 +101,9 @@ type OpenAIClient struct {
 	model      string
 	httpClient *http.Client
 	timeout    time.Duration
+	// plainText records that this endpoint refused the JSON response format,
+	// so the rest of the session does not pay for the same rejection again.
+	plainText atomic.Bool
 }
 
 // WithHTTPClient sets a custom HTTP client for OpenAIClient.
@@ -180,6 +184,91 @@ type parsedProfileResponse struct {
 	TacticalNotes  string  `json:"tactical_notes"`
 }
 
+// chat sends one completion and returns the assistant's text.
+//
+// The JSON response format is asked for, then dropped for the life of the
+// process if the service rejects it. Not every OpenAI-compatible endpoint
+// accepts the field -- Gemini's does not accept every spelling of it -- and a
+// rejected field returns a 400 that looks exactly like a bad key, so profiling
+// would have failed for a reason nobody could see. The prompt asks for strict
+// JSON either way, and the caller copes with a fenced answer.
+func (c *OpenAIClient) chat(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	text, err := c.send(ctx, systemPrompt, userPrompt, !c.plainText.Load())
+	var rejected formatRejected
+	if errors.As(err, &rejected) && !c.plainText.Swap(true) {
+		return c.send(ctx, systemPrompt, userPrompt, false)
+	}
+	return text, err
+}
+
+// formatRejected marks the one failure worth retrying differently.
+type formatRejected struct{ err error }
+
+func (f formatRejected) Error() string { return f.err.Error() }
+func (f formatRejected) Unwrap() error { return f.err }
+
+func (c *OpenAIClient) send(ctx context.Context, systemPrompt, userPrompt string, askForJSON bool) (string, error) {
+	reqBody := openAIChatRequest{
+		Model: c.model,
+		Messages: []openAIChatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Temperature: 0.2,
+	}
+	if askForJSON {
+		reqBody.ResponseFormat = map[string]string{"type": "json_object"}
+	}
+
+	data, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	endpoint := strings.TrimSuffix(c.baseURL, "/") + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		failed := fmt.Errorf("llm api returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		if askForJSON && resp.StatusCode == http.StatusBadRequest {
+			return "", formatRejected{failed}
+		}
+		return "", failed
+	}
+
+	var chatResp openAIChatResponse
+	if err := json.Unmarshal(bodyBytes, &chatResp); err != nil {
+		return "", fmt.Errorf("failed to decode chat response: %w", err)
+	}
+
+	if chatResp.Error != nil && chatResp.Error.Message != "" {
+		return "", fmt.Errorf("llm api error: %s", chatResp.Error.Message)
+	}
+
+	if len(chatResp.Choices) == 0 {
+		return "", errors.New("llm returned empty choices")
+	}
+
+	return strings.TrimSpace(chatResp.Choices[0].Message.Content), nil
+}
+
 // AnalyzePlayer invokes the OpenAI chat completions API to analyze the player and returns an LLMProfile.
 func (c *OpenAIClient) AnalyzePlayer(ctx context.Context, history []table.HandState, stats storage.PlayerStats) (*storage.LLMProfile, error) {
 	if err := ctx.Err(); err != nil {
@@ -228,59 +317,10 @@ Output STRICT JSON matching this exact schema:
 Classify the archetype, evaluate bluff frequency and fold tendencies (as 0.0-1.0 probabilities), and provide tactical exploit recommendations.`,
 		stats.PlayerID, stats.PlayerName, stats.HandsCount, stats.VPIP, stats.PFR, stats.ThreeBet, stats.AF, historySummary.String())
 
-	reqBody := openAIChatRequest{
-		Model: c.model,
-		Messages: []openAIChatMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userPrompt},
-		},
-		ResponseFormat: map[string]string{"type": "json_object"},
-		Temperature:    0.2,
-	}
-
-	data, err := json.Marshal(reqBody)
+	rawContent, err := c.chat(ctx, systemPrompt, userPrompt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal chat request: %w", err)
+		return nil, err
 	}
-
-	endpoint := c.baseURL + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create http request: %w", err)
-	}
-
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("llm api returned status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var chatResp openAIChatResponse
-	if err := json.Unmarshal(bodyBytes, &chatResp); err != nil {
-		return nil, fmt.Errorf("failed to decode chat response: %w", err)
-	}
-
-	if chatResp.Error != nil && chatResp.Error.Message != "" {
-		return nil, fmt.Errorf("llm api error: %s", chatResp.Error.Message)
-	}
-
-	if len(chatResp.Choices) == 0 {
-		return nil, errors.New("llm returned empty choices")
-	}
-
-	rawContent := strings.TrimSpace(chatResp.Choices[0].Message.Content)
 	// Clean markdown json fences if present
 	if strings.HasPrefix(rawContent, "```") {
 		lines := strings.Split(rawContent, "\n")

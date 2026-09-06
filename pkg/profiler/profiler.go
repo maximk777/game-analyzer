@@ -2,6 +2,7 @@ package profiler
 
 import (
 	"context"
+	"log"
 	"math"
 	"sync"
 	"time"
@@ -141,6 +142,14 @@ type Profiler struct {
 	rawStats        map[string]*playerAccumulator
 	lastAnalyzedAt  map[string]time.Time
 
+	// The last failure reported, so a model that is refusing every call says
+	// so once rather than once a hand -- and says so at all. A failed analysis
+	// used to return in silence, so a wrong key, a wrong model name or an
+	// exhausted quota all looked exactly like a table where nobody had played
+	// enough hands to profile.
+	failureMu   sync.Mutex
+	lastFailure string
+
 	taskQueue chan string
 	wg        sync.WaitGroup
 	quit      chan struct{}
@@ -196,6 +205,30 @@ func (p *Profiler) workerLoop() {
 	}
 }
 
+// reportFailure says once why profiling is not producing anything. The same
+// error repeating is one event, not one per hand.
+func (p *Profiler) reportFailure(err error) {
+	text := err.Error()
+	p.failureMu.Lock()
+	defer p.failureMu.Unlock()
+	if text == p.lastFailure {
+		return
+	}
+	p.lastFailure = text
+	log.Printf("[PROFILER] opponent profiling failed, falling back to statistics: %s", text)
+}
+
+// reportRecovery closes the report the first failure opened.
+func (p *Profiler) reportRecovery() {
+	p.failureMu.Lock()
+	defer p.failureMu.Unlock()
+	if p.lastFailure == "" {
+		return
+	}
+	p.lastFailure = ""
+	log.Printf("[PROFILER] opponent profiling is answering again")
+}
+
 func (p *Profiler) processAnalysisTask(playerID string) {
 	defer p.pendingWg.Done()
 
@@ -219,9 +252,10 @@ func (p *Profiler) processAnalysisTask(playerID string) {
 
 	profile, err := p.llmClient.AnalyzePlayer(ctx, history, stats)
 	if err != nil {
-		// Log or handle LLM error gracefully without crashing
+		p.reportFailure(err)
 		return
 	}
+	p.reportRecovery()
 
 	if profile != nil {
 		if p.cache != nil {

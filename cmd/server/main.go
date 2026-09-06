@@ -19,19 +19,17 @@ import (
 
 func main() {
 	var (
-		portFlag        = flag.Int("port", 8080, "HTTP and WebSocket server port")
-		dbPathFlag      = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
-		openAIKeyFlag   = flag.String("openai-key", "", "OpenAI API key (falls back to OPENAI_API_KEY env)")
-		openAIModelFlag = flag.String("openai-model", "gpt-4o-mini", "OpenAI model name")
-		mockLLMFlag     = flag.Bool("mock-llm", false, "Use mock deterministic LLM profiler")
-		webDirFlag      = flag.String("web-dir", "web", "Directory containing static frontend assets")
+		portFlag     = flag.Int("port", 8080, "HTTP and WebSocket server port")
+		dbPathFlag   = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
+		llmKeyFlag   = flag.String("llm-key", "", "API key; falls back to GEMINI_API_KEY, GOOGLE_API_KEY or OPENAI_API_KEY")
+		llmURLFlag   = flag.String("llm-url", "", "OpenAI-compatible base URL; defaults to Gemini, or to OpenAI when the key came from OPENAI_API_KEY")
+		llmModelFlag = flag.String("llm-model", "", "Model name; defaults to "+llm.GeminiModel)
+		mockLLMFlag  = flag.Bool("mock-llm", false, "Use mock deterministic LLM profiler")
+		webDirFlag   = flag.String("web-dir", "web", "Directory containing static frontend assets")
 	)
 	flag.Parse()
 
-	apiKey := *openAIKeyFlag
-	if apiKey == "" {
-		apiKey = os.Getenv("OPENAI_API_KEY")
-	}
+	settings := llm.Resolve(*llmKeyFlag, *llmURLFlag, *llmModelFlag, os.Getenv)
 
 	log.Printf("[SERVER] Starting Poker RTA Engine & Live HUD Server...")
 	log.Printf("[SERVER] Database: %s", *dbPathFlag)
@@ -50,12 +48,12 @@ func main() {
 
 	// 3. Initialize LLM Client
 	var llmClient llm.Client
-	if *mockLLMFlag || apiKey == "" {
-		log.Printf("[SERVER] Using deterministic Mock LLM Client (offline mode)")
+	if *mockLLMFlag || !settings.Live() {
+		log.Printf("[SERVER] Profiler: rules only, no model (%s)", settings.Describe())
 		llmClient = llm.NewMockClient()
 	} else {
-		log.Printf("[SERVER] Using OpenAI LLM Client (model: %s)", *openAIModelFlag)
-		llmClient = llm.NewOpenAIClient(apiKey, "", *openAIModelFlag)
+		log.Printf("[SERVER] Profiler: %s", settings.Describe())
+		llmClient = llm.NewOpenAIClient(settings.Key, settings.BaseURL, settings.Model)
 	}
 
 	// 4. Initialize Opponent Profiler
