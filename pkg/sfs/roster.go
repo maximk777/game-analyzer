@@ -60,10 +60,13 @@ type Roster struct {
 	HeroName  string
 	HeroCards []table.Card
 
-	// Turn holds the most recent action offer -- the legal actions and their
-	// amounts for whoever is to act. It is the hero's own buttons when Turn.Who
-	// is the hero.
-	Turn *TurnOptionsMsg
+	// Turn holds the action offer in force -- the legal actions and their
+	// amounts -- and TurnFor names the player it was addressed to. An offer is
+	// one player's, on one street: it is dropped when the turn passes, when the
+	// street ends and when the hand does, so it can never be read as somebody
+	// else's buttons.
+	Turn    *TurnOptionsMsg
+	TurnFor string
 
 	// Actions is the action history of the current hand, as last sent. The wire
 	// sends it cumulatively, so the latest message is the whole hand so far.
@@ -113,6 +116,7 @@ func (r *Roster) Apply(m Message) bool {
 		}
 		if m.Pot.RoundName != "" && r.Street != m.Pot.RoundName {
 			r.Street = m.Pot.RoundName
+			r.endStreet()
 			changed = true
 		}
 		return changed
@@ -121,6 +125,10 @@ func (r *Roster) Apply(m Message) bool {
 			return false
 		}
 		r.WhoseTurn = m.Turn.WhoseTurn
+		// The turn has passed to somebody else, so the offer in hand is spent.
+		if r.TurnFor != m.Turn.WhoseTurn {
+			r.endTurn()
+		}
 		return true
 	case KindActionHistory:
 		return r.applyHistory(m.ActionHistory)
@@ -161,10 +169,17 @@ func (r *Roster) Apply(m Message) bool {
 		// only so it is not left to the scanner as an unknown object.
 		return false
 	case KindTurnOptions:
-		r.Turn = m.TurnOptions
-		if m.TurnOptions.WhoseTurn != "" {
-			r.WhoseTurn = m.TurnOptions.WhoseTurn
+		// An offer addressed to nobody is not a turn. The client is also sent a
+		// pre-action panel -- check-fold and call-any, ahead of its turn, under
+		// its own option codes -- with an empty whoseTurn, and reading that as
+		// the hero's buttons left a check on the panel for the rest of the hand:
+		// advice on every opponent's turn, priced off a roundMaxBet of zero.
+		if m.TurnOptions.WhoseTurn == "" {
+			return false
 		}
+		r.Turn = m.TurnOptions
+		r.TurnFor = m.TurnOptions.WhoseTurn
+		r.WhoseTurn = m.TurnOptions.WhoseTurn
 		return true
 	case KindGameInfo:
 		// The bare gameId is a correlation counter, not the hand id -- it
@@ -186,6 +201,7 @@ func (r *Roster) Apply(m Message) bool {
 			return false
 		}
 		r.Street = "SHOWDOWN"
+		r.endStreet()
 		return true
 	default:
 		// Dealer chat carries no roster field the seat, pot and history messages
@@ -206,22 +222,76 @@ func (r *Roster) applyHistory(h *ActionHistoryMsg) bool {
 	changed := false
 	if last.HandID != 0 && last.HandID != r.HandID {
 		r.HandID = last.HandID
-		r.Pot = table.Zero
+		r.startHand()
 		r.Street = ""
-		r.WhoseTurn = ""
-		r.Board = nil
-		r.HoleCards = make(map[int][]table.Card)
-		r.Winners = nil
-		for _, s := range r.Seats {
-			s.Bet = table.Zero
-		}
 		changed = true
 	}
 	if last.RoundName != "" && r.Street != last.RoundName {
 		r.Street = last.RoundName
+		r.endStreet()
 		changed = true
 	}
 	return changed
+}
+
+// startHand clears everything that belonged to the hand just finished. The
+// seats themselves persist -- the players are still there -- but nothing they
+// did last hand does.
+//
+// The action badges are the part that mattered. The wire leaves a seat's last
+// caption standing until that seat next changes, so "Fold" from the previous
+// hand was still on hero's seat when the new one was dealt; the advisor read it
+// and refused to advise -- correctly, for what it had been told -- until hero
+// acted and the seat was re-sent. At a cash table a player who is not in the
+// blinds is not re-sent before their own turn, which is exactly the first
+// decision the advice was wanted for.
+func (r *Roster) startHand() {
+	r.Pot = table.Zero
+	r.WhoseTurn = ""
+	r.Board = nil
+	r.HoleCards = make(map[int][]table.Card)
+	r.HeroCards = nil
+	r.Winners = nil
+	r.endTurn()
+	for _, s := range r.Seats {
+		s.Bet = table.Zero
+		s.LastAction = ""
+		if perHandCaption(s.Status) {
+			s.Status = ""
+		}
+	}
+}
+
+// endTurn drops the action offer in force. An offer is one player's, for one
+// street: past that it describes neither whose turn it is nor what it costs.
+func (r *Roster) endTurn() {
+	r.Turn = nil
+	r.TurnFor = ""
+}
+
+// endStreet drops the offer and forgets whose turn it was. A street cannot end
+// while somebody is still to act on it, so the name standing there is the last
+// player who acted, not the next one -- and left standing on hero it says hero
+// is being asked to act on a street the wire has not asked them about yet.
+func (r *Roster) endStreet() {
+	r.endTurn()
+	r.WhoseTurn = ""
+}
+
+// perHandCaption reports whether a seat caption describes what the player did
+// this hand, rather than how they are sitting at the table. The first kind is
+// cleared when a hand starts; the second -- sitting out, disconnected, waiting
+// for a big blind -- outlives the hand and is left alone, because clearing it
+// would forget a player is not in the game until the server mentions it again.
+func perHandCaption(status string) bool {
+	switch strings.ToUpper(status) {
+	case "FOLD", "CHECK", "CALL", "BET", "RAISE", "ALLIN", "ALL IN", "ALL-IN",
+		"ANTE", "SB", "BB", "POST", "POSTBB", "POST BB", "STRADDLE", "MUCK",
+		"WIN", "WINNER", "SHOW":
+		return true
+	default:
+		return false
+	}
 }
 
 // applyHandStart opens a new hand: it sets the blinds, ante and button/blind
@@ -235,17 +305,8 @@ func (r *Roster) applyHandStart(h *HandStartMsg) bool {
 	r.DealerSeat = h.DealerSeatID
 	r.SBSeat = h.SBSeatID
 	r.BBSeat = h.BBSeatID
-	r.Pot = table.Zero
+	r.startHand()
 	r.Street = "PREFLOP"
-	r.WhoseTurn = ""
-	r.Board = nil
-	r.HoleCards = make(map[int][]table.Card)
-	r.HeroCards = nil
-	r.Turn = nil
-	r.Winners = nil
-	for _, s := range r.Seats {
-		s.Bet = table.Zero
-	}
 	return true
 }
 
