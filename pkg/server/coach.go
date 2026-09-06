@@ -117,12 +117,13 @@ func (s *Server) askCoach(tableID string, h *table.HandState, rec *advisor.Advis
 
 	state := cloneForCoach(h)
 	profiles := s.profilesFor(h)
+	stats := s.statsFor(h)
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), coachTimeout)
 		defer cancel()
 
-		advice, err := coach.AdviseHand(ctx, llm.CoachInput{State: state, Own: rec, Profiles: profiles})
+		advice, err := coach.AdviseHand(ctx, llm.CoachInput{State: state, Own: rec, Profiles: profiles, Stats: stats})
 
 		r.mu.Lock()
 		delete(r.inFlight, key)
@@ -178,6 +179,24 @@ func (s *Server) profilesFor(h *table.HandState) []storage.LLMProfile {
 		}
 		if p := s.prof.GetProfile(seat.PlayerID); p != nil {
 			out = append(out, *p)
+		}
+	}
+	return out
+}
+
+// statsFor gathers the numeric tendencies of the opponents still in the hand,
+// keyed by player id, so the coach can find the bluffs the statistics justify.
+func (s *Server) statsFor(h *table.HandState) map[string]*storage.PlayerStats {
+	if s.prof == nil {
+		return nil
+	}
+	out := make(map[string]*storage.PlayerStats)
+	for _, seat := range h.Seats {
+		if seat.IsFolded || seat.PlayerID == h.HeroID || seat.PlayerID == "" {
+			continue
+		}
+		if st := s.prof.GetStats(seat.PlayerID); st != nil {
+			out[seat.PlayerID] = st
 		}
 	}
 	return out

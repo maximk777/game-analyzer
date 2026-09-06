@@ -10,7 +10,6 @@ import (
 	"poker-game-analyzer/pkg/llm"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
-	"poker-game-analyzer/pkg/vision"
 )
 
 type countingCoach struct {
@@ -65,12 +64,11 @@ func newCoachServer(t *testing.T, c llm.Coach) *Server {
 
 func ingest(t *testing.T, srv *Server, h *table.HandState) {
 	t.Helper()
-	if _, err := srv.ProcessEvent(vision.VisionEvent{
-		Type:      vision.EventHeroTurn,
-		TableID:   "coach-table",
-		HandState: h,
-	}); err != nil {
-		t.Fatalf("ProcessEvent: %v", err)
+	if h.TableID == "" {
+		h.TableID = "coach-table"
+	}
+	if _, err := srv.IngestLiveState(h); err != nil {
+		t.Fatalf("ingest: %v", err)
 	}
 }
 

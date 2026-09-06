@@ -13,7 +13,6 @@ import (
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
-	"poker-game-analyzer/pkg/vision"
 )
 
 func TestWebSocket_ConnectAndInitialState(t *testing.T) {
@@ -131,16 +130,10 @@ func TestWebSocket_EventBroadcastAndTableIsolation(t *testing.T) {
 		},
 	}
 
-	eventA := vision.VisionEvent{
-		Type:      vision.EventHeroTurn,
-		TableID:   "table-A",
-		HandState: handStateA,
-	}
-
-	// Ingest event for table A
-	_, err = srv.ProcessEvent(eventA)
+	// Ingest state for table A
+	_, err = srv.IngestLiveState(handStateA)
 	if err != nil {
-		t.Fatalf("ProcessEvent error: %v", err)
+		t.Fatalf("ingest error: %v", err)
 	}
 
 	// Verify both A1 and A2 receive recommendations/updates
@@ -272,16 +265,10 @@ func TestWebSocket_BroadcastPerformance(t *testing.T) {
 		},
 	}
 
-	event := vision.VisionEvent{
-		Type:      vision.EventHeroTurn,
-		TableID:   "table-perf",
-		HandState: state,
-	}
-
 	start := time.Now()
-	_, err = srv.ProcessEvent(event)
+	_, err = srv.IngestLiveState(state)
 	if err != nil {
-		t.Fatalf("ProcessEvent error: %v", err)
+		t.Fatalf("ingest error: %v", err)
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))

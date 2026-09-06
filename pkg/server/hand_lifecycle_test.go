@@ -5,70 +5,13 @@ import (
 
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
-	"poker-game-analyzer/pkg/vision"
 )
 
-// End to end over the live path: the vision layer never sends a showdown, so
-// this is the only route by which a hand can reach the database. Before the
-// stabiliser owned the hand lifecycle, a full session left hand_histories and
-// player_stats both empty.
-func TestProcessEvent_PersistsHandsWithoutAShowdown(t *testing.T) {
-	db, err := storage.NewSQLiteDB(":memory:")
-	if err != nil {
-		t.Fatalf("opening database: %v", err)
-	}
-	defer db.Close()
-
-	srv := NewServer(storage.NewMemoryCache(), db, nil)
-
-	board, err := table.ParseCards("10c 8s 2c")
-	if err != nil {
-		t.Fatalf("parsing board: %v", err)
-	}
-
-	// A hand plays out, exactly as the vision layer reports it: no showdown,
-	// hand id always the placeholder.
-	flop := &table.HandState{
-		TableID: "t", HandID: "live-hand", Street: table.StreetFlop, Pot: 4280,
-		CommunityCards: board,
-		Seats: []table.SeatState{
-			{PlayerID: "villain", PlayerName: "villain", Stack: 5000, IsActive: true},
-		},
-	}
-	if _, err := srv.ProcessEvent(vision.VisionEvent{TableID: "t", HandState: flop}); err != nil {
-		t.Fatalf("ProcessEvent flop: %v", err)
-	}
-
-	// The next hand begins: board cleared, pot reset.
-	next := &table.HandState{
-		TableID: "t", HandID: "live-hand", Street: table.StreetPreflop, Pot: 300,
-		Seats: []table.SeatState{
-			{PlayerID: "villain", PlayerName: "villain", Stack: 5000, IsActive: true},
-		},
-	}
-	if _, err := srv.ProcessEvent(vision.VisionEvent{TableID: "t", HandState: next}); err != nil {
-		t.Fatalf("ProcessEvent next hand: %v", err)
-	}
-
-	hands, err := db.ListHandHistories(10)
-	if err != nil {
-		t.Fatalf("listing hand histories: %v", err)
-	}
-	if len(hands) != 1 {
-		t.Fatalf("expected the finished hand to be saved, got %d hands", len(hands))
-	}
-	if hands[0].Pot != 4280 {
-		t.Errorf("saved the wrong hand: pot %.0f, want 4280", hands[0].Pot)
-	}
-	if hands[0].HandID == "" || hands[0].HandID == "live-hand" {
-		t.Errorf("hand saved under the placeholder id %q, so the next hand would overwrite it", hands[0].HandID)
-	}
-}
-
-// A player who has folded has no decision left. The fold badge on the nameplate
-// is read, but nothing consulted it before advising: live, hero had folded and
-// the HUD went on recommending an all-in, sized off another player's stack.
-func TestProcessEvent_NoAdviceAfterHeroFolds(t *testing.T) {
+// A player who has folded has no decision left. The guard against advising a
+// folded hand lives in the advisor; this checks the server honours it: live,
+// hero had folded and the HUD went on recommending an all-in, sized off another
+// player's stack.
+func TestIngest_NoAdviceAfterHeroFolds(t *testing.T) {
 	srv := NewServer(storage.NewMemoryCache(), nil, nil)
 
 	hero, err := table.ParseCards("8h 5h")
@@ -96,28 +39,28 @@ func TestProcessEvent_NoAdviceAfterHeroFolds(t *testing.T) {
 		}
 	}
 
-	rec, err := srv.ProcessEvent(vision.VisionEvent{TableID: "t", HandState: state(false)})
+	rec, err := srv.IngestLiveState(state(false))
 	if err != nil {
-		t.Fatalf("ProcessEvent while live: %v", err)
+		t.Fatalf("ingest while live: %v", err)
 	}
 	if rec == nil {
 		t.Fatal("expected advice while hero is still in the hand")
 	}
 
-	rec, err = srv.ProcessEvent(vision.VisionEvent{TableID: "t", HandState: state(true)})
+	rec, err = srv.IngestLiveState(state(true))
 	if err != nil {
-		t.Fatalf("ProcessEvent after folding: %v", err)
+		t.Fatalf("ingest after folding: %v", err)
 	}
 	if rec != nil {
 		t.Errorf("advised %s %.0f after hero folded", rec.PrimaryAction, rec.RecommendedAmount)
 	}
 }
 
-// A hand that actually reaches a showdown must be saved like any other: with a
-// minted id, and with the board and seats it accumulated over the hand. It used
-// to bypass the stabiliser entirely, so it kept the vision placeholder id and
-// every showdown hand overwrote the same row.
-func TestProcessEvent_ShowdownHandIsSavedWithMintedID(t *testing.T) {
+// A hand is persisted when, and only when, it ends -- the wire marks the end by
+// setting the street to showdown. A live (river) state is not saved; the
+// showdown state that follows is, once, with its wire hand id, the board it
+// finished on, and the hands that were shown.
+func TestIngest_ShowdownHandIsPersistedOnce(t *testing.T) {
 	db, err := storage.NewSQLiteDB(":memory:")
 	if err != nil {
 		t.Fatalf("opening database: %v", err)
@@ -135,22 +78,25 @@ func TestProcessEvent_ShowdownHandIsSavedWithMintedID(t *testing.T) {
 		t.Fatalf("parsing revealed cards: %v", err)
 	}
 
-	// The hand plays to the river.
+	// The hand plays to the river -- not terminal, so it is not saved.
 	river := &table.HandState{
-		TableID: "t", HandID: "live-hand", Street: table.StreetRiver, Pot: 80000,
+		TableID: "t", HandID: "128051400099", Street: table.StreetRiver, Pot: 80000,
 		CommunityCards: board,
 		Seats: []table.SeatState{
 			{PlayerID: "steen", PlayerName: "steen", Stack: 5000, IsActive: true},
 			{PlayerID: "jaffeth", PlayerName: "jaffeth", Stack: 5000, IsActive: true},
 		},
 	}
-	if _, err := srv.ProcessEvent(vision.VisionEvent{TableID: "t", HandState: river}); err != nil {
-		t.Fatalf("ProcessEvent river: %v", err)
+	if _, err := srv.IngestLiveState(river); err != nil {
+		t.Fatalf("ingest river: %v", err)
+	}
+	if hands, _ := db.ListHandHistories(10); len(hands) != 0 {
+		t.Fatalf("a non-terminal state was persisted: %d hands", len(hands))
 	}
 
-	// Cards are turned over.
+	// Cards are turned over: the showdown state ends the hand.
 	showdown := &table.HandState{
-		TableID: "t", HandID: "live-hand", Street: table.StreetShowdown, Pot: 80000,
+		TableID: "t", HandID: "128051400099", Street: table.StreetShowdown, Pot: 80000,
 		CommunityCards: board,
 		Seats: []table.SeatState{
 			{PlayerID: "steen", PlayerName: "steen", Stack: 5000, IsActive: true,
@@ -158,8 +104,8 @@ func TestProcessEvent_ShowdownHandIsSavedWithMintedID(t *testing.T) {
 			{PlayerID: "jaffeth", PlayerName: "jaffeth", Stack: 5000, IsActive: true},
 		},
 	}
-	if _, err := srv.ProcessEvent(vision.VisionEvent{TableID: "t", HandState: showdown}); err != nil {
-		t.Fatalf("ProcessEvent showdown: %v", err)
+	if _, err := srv.IngestLiveState(showdown); err != nil {
+		t.Fatalf("ingest showdown: %v", err)
 	}
 
 	hands, err := db.ListHandHistories(10)
@@ -167,18 +113,17 @@ func TestProcessEvent_ShowdownHandIsSavedWithMintedID(t *testing.T) {
 		t.Fatalf("listing hand histories: %v", err)
 	}
 	if len(hands) != 1 {
-		t.Fatalf("expected the showdown hand to be saved once, got %d", len(hands))
+		t.Fatalf("expected the showdown hand saved once, got %d", len(hands))
 	}
 	saved := hands[0]
-
-	if saved.HandID == "" || saved.HandID == "live-hand" {
-		t.Errorf("showdown hand saved under the placeholder id %q", saved.HandID)
+	if saved.HandID != "128051400099" {
+		t.Errorf("hand id: got %q, want the wire id 128051400099", saved.HandID)
 	}
 	if saved.Street != table.StreetShowdown {
 		t.Errorf("street: got %q, want %q", saved.Street, table.StreetShowdown)
 	}
 	if len(saved.CommunityCards) != 5 {
-		t.Errorf("the board was not carried into the showdown: %v", saved.CommunityCards)
+		t.Errorf("board not carried into the showdown: %v", saved.CommunityCards)
 	}
 	var revealed int
 	for _, s := range saved.Seats {

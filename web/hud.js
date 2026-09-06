@@ -27,6 +27,9 @@
         hudCoachAction: document.getElementById("hudCoachAction"),
         hudCoachAmount: document.getElementById("hudCoachAmount"),
         hudCoachText: document.getElementById("hudCoachText"),
+        hudCoachBluff: document.getElementById("hudCoachBluff"),
+        hudCoachBluffText: document.getElementById("hudCoachBluffText"),
+        hudCoachOpinion: document.getElementById("hudCoachOpinion"),
         hudCoachModel: document.getElementById("hudCoachModel"),
         
         hudHoleCards: document.getElementById("hudHoleCards"),
@@ -491,6 +494,11 @@
         }
         elements.hudCoachCard.hidden = false;
 
+        // Bluff and opinion belong to a concrete answer; hide them until one
+        // arrives, so a pending or failed read shows no stale flag.
+        elements.hudCoachBluff.hidden = true;
+        elements.hudCoachOpinion.hidden = true;
+
         if (update.error) {
             elements.hudCoachVerdict.className = "coach-verdict failed";
             elements.hudCoachVerdict.textContent = "НЕ ОТВЕТИЛА";
@@ -519,29 +527,128 @@
         elements.hudCoachAmount.textContent = a.amount > 0 ? formatChips(a.amount) : "";
         elements.hudCoachText.textContent = a.reasoning || "";
 
+        // Bluff spot: only when the model flags one and names the tendency.
+        if (a.bluff && a.bluff_reason) {
+            elements.hudCoachBluffText.textContent = a.bluff_reason;
+            elements.hudCoachBluff.hidden = false;
+        }
+
+        // The model's own opinion, quoted in its own words.
+        if (a.opinion) {
+            elements.hudCoachOpinion.textContent = `«${a.opinion}»`;
+            elements.hudCoachOpinion.hidden = false;
+        }
+
         const conf = typeof a.confidence === "number" && a.confidence > 0
             ? ` · уверенность ${Math.round(a.confidence * 100)}%`
             : "";
         elements.hudCoachModel.textContent = `${a.model || "модель"}${conf}`;
     }
 
+    // Accumulated stats per player, fetched once from the profile endpoint and
+    // kept for the session. The wire carries the site's own session VPIP on the
+    // seat, which fills the gap until our own sample exists.
+    const profileCache = {};
+    const profileFetchedAt = {};
+    const profilePending = {};
+    const PROFILE_TTL_MS = 20000; // stats accumulate as hands play; refresh occasionally
+    let lastSeats = [];
+
+    // fetchProfile pulls a player's accumulated stats, then re-renders so the
+    // numbers appear as they arrive without blocking the frame. It refetches
+    // once the cached copy is older than the TTL, so a player's stats grow with
+    // the session rather than freezing at what they were when first seen.
+    function fetchProfile(playerID) {
+        if (!playerID || profilePending[playerID]) return;
+        // Skip if we attempted within the TTL, whether or not it yielded stats.
+        if (profileFetchedAt[playerID] && Date.now() - profileFetchedAt[playerID] < PROFILE_TTL_MS) return;
+        profilePending[playerID] = true;
+        fetch(`/api/v1/players/${encodeURIComponent(playerID)}/profile`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data) => {
+                if (data && data.stats) profileCache[playerID] = data.stats;
+            })
+            .catch(() => {})
+            .finally(() => {
+                // Stamp on every outcome so a player with no stats yet is not
+                // refetched on every re-render -- only once per TTL.
+                profileFetchedAt[playerID] = Date.now();
+                delete profilePending[playerID];
+                renderPlayers(lastSeats);
+            });
+    }
+
+    // POS_CLASS tints the position chip so seat order reads at a glance.
+    const POS_CLASS = { BTN: "pos-btn", SB: "pos-sb", BB: "pos-bb", CO: "pos-co", MP: "pos-mp", UTG: "pos-utg" };
+
+    // vpipClass is a tightness cue: loose is a target, tight is a warning.
+    function vpipClass(v) {
+        return v >= 40 ? "stat-loose" : v >= 25 ? "stat-mid" : "stat-tight";
+    }
+
     function renderPlayers(seats) {
-        elements.playerCount.textContent = seats.length;
-        if (!seats || seats.length === 0) {
-            elements.hudOpponentsList.innerHTML = '<div class="empty-opp">No player data yet.</div>';
+        lastSeats = seats || [];
+        const heroID = (state.currentHand && state.currentHand.hero_id) || "";
+        elements.playerCount.textContent = lastSeats.length;
+        if (lastSeats.length === 0) {
+            elements.hudOpponentsList.innerHTML = '<div class="empty-opp">Нет данных об игроках.</div>';
             return;
         }
 
         let html = "";
-        seats.forEach(s => {
-            html += `
-                <div class="opp-row">
-                    <span class="opp-name">${s.player_name || "Player"}</span>
-                    <span class="opp-stack">${s.stack > 0 ? formatChips(s.stack) : "Active"}</span>
-                </div>
-            `;
+        lastSeats.forEach((s) => {
+            const isHero = s.player_id && s.player_id === heroID;
+            const pos = s.position || "";
+            const posClass = POS_CLASS[pos] || "pos-none";
+            const stack = s.stack > 0 ? formatChips(s.stack) : "—";
+            const folded = s.is_folded ? " opp-folded" : "";
+
+            let statsHtml;
+            if (isHero) {
+                statsHtml = '<span class="opp-you">ВЫ</span>';
+            } else {
+                const st = profileCache[s.player_id];
+                if (st && st.hands_count > 0) {
+                    // Our own accumulated sample: VPIP/PFR/3bet.
+                    statsHtml =
+                        `<span class="opp-stat ${vpipClass(st.vpip)}">${Math.round(st.vpip)}` +
+                        `<span class="opp-stat-sep">/</span>${Math.round(st.pfr)}` +
+                        `<span class="opp-stat-sep">/</span>${Math.round(st.three_bet)}</span>` +
+                        `<span class="opp-hands">${formatCount(st.hands_count)}</span>`;
+                    fetchProfile(s.player_id); // keep it fresh across hands
+                } else if (s.server_vpip > 0) {
+                    // No sample yet: the site's own session VPIP, marked.
+                    statsHtml =
+                        `<span class="opp-stat ${vpipClass(s.server_vpip)}">${Math.round(s.server_vpip)}` +
+                        `<span class="opp-stat-sfx">*</span></span>` +
+                        `<span class="opp-hands">${formatCount(s.server_hands || 0)}</span>`;
+                    fetchProfile(s.player_id);
+                } else {
+                    statsHtml = '<span class="opp-stat stat-none">—</span>';
+                    fetchProfile(s.player_id);
+                }
+            }
+
+            html +=
+                `<div class="opp-row${folded}">` +
+                `<span class="opp-pos ${posClass}">${pos || "·"}</span>` +
+                `<span class="opp-name">${escapeHtml(s.player_name || "Player")}</span>` +
+                `<span class="opp-stack">${stack}</span>` +
+                statsHtml +
+                `</div>`;
         });
         elements.hudOpponentsList.innerHTML = html;
+    }
+
+    // formatCount abbreviates a hands count: 1600 -> "1.6К".
+    function formatCount(n) {
+        if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "К";
+        return String(n);
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
 
     // Toggle Seated Players Drawer

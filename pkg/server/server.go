@@ -1,16 +1,12 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image"
-	"image/jpeg"
-	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -20,11 +16,9 @@ import (
 	"poker-game-analyzer/pkg/advice"
 	"poker-game-analyzer/pkg/advisor"
 	"poker-game-analyzer/pkg/audit"
-	"poker-game-analyzer/pkg/capture"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
-	"poker-game-analyzer/pkg/vision"
 )
 
 // TableInitRequest is the request body for initializing a poker table.
@@ -34,13 +28,6 @@ type TableInitRequest struct {
 	Seats    []table.SeatState `json:"seats,omitempty"`
 	Pot      float64           `json:"pot,omitempty"`
 	MinRaise float64           `json:"min_raise,omitempty"`
-}
-
-// EventIngestResponse is the HTTP response for ingested vision/game events.
-type EventIngestResponse struct {
-	Status         string                   `json:"status"`
-	Recommendation *advisor.AdvisorResponse `json:"recommendation,omitempty"`
-	Event          *vision.VisionEvent      `json:"event,omitempty"`
 }
 
 // PlayerProfileResponse encapsulates player statistics and LLM behavioral analysis.
@@ -60,42 +47,28 @@ type Server struct {
 	mux        *http.ServeMux
 	httpServer *http.Server
 	upgrader   websocket.Upgrader
-	stabilizer *table.StateStabilizer
 	auditLog   *audit.Logger
 	mu         sync.Mutex
 
-	// What was last sent for each table. Vision delivers a frame every few
-	// dozen milliseconds and most of them say exactly what the one before
-	// said; broadcasting each one made the panel redraw constantly, which is
-	// what "the whole screen jumps" is.
+	// What was last sent for each table. The wire re-sends a seat or pot many
+	// times a second and most of them say exactly what the one before said;
+	// broadcasting each one made the panel redraw constantly, which is what
+	// "the whole screen jumps" is.
 	lastSent   map[string]string
 	lastSentMu sync.Mutex
 
 	coachRunner coachRunner
-
-	roiConfig       vision.ROIConfig
-	roiPath         string
-	roiMu           sync.RWMutex
-	snapshotData    []byte
-	snapshotType    string
-	snapshotMu      sync.RWMutex
-	windowsProvider func() ([]capture.WindowInfo, error)
-	windowsMu       sync.RWMutex
 }
 
 // NewServer initializes and configures a new Server instance.
 func NewServer(cache *storage.MemoryCache, db *storage.SQLiteDB, prof *profiler.Profiler) *Server {
 	hub := NewWSHub()
 	s := &Server{
-		cache:           cache,
-		db:              db,
-		prof:            prof,
-		hub:             hub,
-		mux:             http.NewServeMux(),
-		roiConfig:       vision.DefaultCoinPoker6MaxROI(),
-		roiPath:         roiConfigPath(),
-		windowsProvider: capture.ListAllWindows,
-		stabilizer:      table.NewStateStabilizer(),
+		cache: cache,
+		db:    db,
+		prof:  prof,
+		hub:   hub,
+		mux:   http.NewServeMux(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -112,15 +85,8 @@ func NewServer(cache *storage.MemoryCache, db *storage.SQLiteDB, prof *profiler.
 func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/tables", s.handleInitTable)
 	s.mux.HandleFunc("GET /api/v1/tables/{id}/state", s.handleGetTableState)
-	s.mux.HandleFunc("POST /api/v1/tables/{id}/events", s.handleIngestEvent)
 	s.mux.HandleFunc("GET /api/v1/players/{id}/profile", s.handleGetPlayerProfile)
 	s.mux.HandleFunc("GET /ws/tables/{id}", s.handleWebSocket)
-
-	// Live capture, ROI calibration & Window discovery endpoints
-	s.mux.HandleFunc("GET /api/v1/snapshot", s.handleGetSnapshot)
-	s.mux.HandleFunc("GET /api/v1/roi", s.handleGetROI)
-	s.mux.HandleFunc("POST /api/v1/roi", s.handleSetROI)
-	s.mux.HandleFunc("GET /api/v1/windows", s.handleGetWindows)
 }
 
 // Router returns the configured http.Handler for the server.
@@ -180,143 +146,102 @@ func (s *Server) Stop(ctx context.Context) error {
 	return nil
 }
 
-// ProcessEvent executes the end-to-end real-time analysis pipeline for an incoming event.
-func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorResponse, error) {
-	tableID := event.TableID
-	if tableID == "" && event.HandState != nil {
-		tableID = event.HandState.TableID
+// ingestState folds one table state into the pipeline: the cache, hand-end
+// persistence and profiling, the advisor, the audit log, and the WebSocket
+// broadcast the HUD is drawn from.
+//
+// The state comes off the wire exact -- seats, stacks, cards, pot and actions as
+// the server stated them -- so nothing here smooths or second-guesses it. A hand
+// has ended when its street is showdown; that is the wire's own signal, decided
+// by the source, and the moment the hand is persisted and the players profiled.
+func (s *Server) ingestState(state *table.HandState) (*advisor.AdvisorResponse, error) {
+	if state == nil {
+		return nil, errors.New("nil hand state provided")
 	}
+	tableID := state.TableID
 	if tableID == "" {
-		return nil, errors.New("missing table id in event")
+		return nil, errors.New("missing table id in state")
 	}
 
-	// Whether a hand has ended is decided from the incoming event, before any
-	// smoothing. The stabilizer works on vision noise and must not get a vote
-	// on the terminal state, or a showdown frame can be smoothed back into a
-	// river frame and the hand is never persisted or profiled.
-	isHandEnd := event.Type == vision.EventHandEnd || (event.HandState != nil && event.HandState.Street == table.StreetShowdown)
+	isHandEnd := state.Street == table.StreetShowdown
 
-	// 0. State Stabilization (filter frame glitches, dropouts & maintain monotonic card/pot state)
-	//
-	// Showdown states go through it too. Skipping them left the stabiliser's
-	// showdown branch dead: a hand that actually reached a showdown was saved
-	// under the vision placeholder id instead of a minted one, so every such
-	// hand overwrote the same row, and the seats and board it had accumulated
-	// over the hand were dropped in favour of whatever the final frame happened
-	// to read. Whether the hand has ended is still decided from the raw event
-	// above, before any smoothing.
-	var completed *table.HandState
-	if event.HandState != nil && s.stabilizer != nil {
-		event.HandState = s.stabilizer.Stabilize(event.HandState)
-		// A hand is otherwise recognised as finished when the next one starts:
-		// most hands end with everyone folding, and no showdown is shown at all.
-		completed = s.stabilizer.TakeCompletedHand()
-	}
-
-	// 1. Cache update
-	if event.HandState != nil {
-		if event.HandState.TableID == "" {
-			event.HandState.TableID = tableID
-		}
-		if s.cache != nil {
-			s.cache.SetTableState(tableID, event.HandState)
-		}
+	// 1. Cache
+	if s.cache != nil {
+		s.cache.SetTableState(tableID, state)
 	}
 
 	// 2. Hand end persistence & profiler updates
-	finished := completed
-	if isHandEnd && event.HandState != nil {
-		finished = event.HandState
-	}
-	if finished != nil {
-		if finished.TableID == "" {
-			finished.TableID = tableID
-		}
+	if isHandEnd {
 		if s.prof != nil {
-			s.prof.ProcessHandEnd(*finished)
+			s.prof.ProcessHandEnd(*state)
 		}
 		if s.db != nil {
-			_ = s.db.SaveHandHistory(*finished)
+			_ = s.db.SaveHandHistory(*state)
 		}
 	}
 
-	// 3. Real-time Equity and Advisor Recommendation calculation
-	//
-	// The whole of it now lives in pkg/advice, because a second caller appeared
-	// that has to reach the same decision: the harness in pkg/sim, which plays
-	// the strategy out over whole hands and measures what it wins. What is left
-	// here is gathering the reads the profiler holds and handing them over.
+	// 3. Advisor recommendation. The decision itself lives in pkg/advice,
+	// shared with the offline harness; what is left here is gathering the reads
+	// the profiler holds and handing them over.
 	var rec *advisor.AdvisorResponse
 	var auditReads map[string]map[string]float64
 	noAdvice := ""
-	if reason := audit.Unreadable(event.HandState); reason != "" && !isHandEnd {
-		// A misread frame is withheld rather than advised on. The panel keeps
-		// whatever it last had and says why, which is steadier than advice
-		// recomputed from a table that was not there.
+	if reason := audit.Unreadable(state); reason != "" && !isHandEnd {
 		noAdvice = "state not readable: " + reason
-	} else if event.HandState != nil && !isHandEnd {
-		h := event.HandState
+	} else if !isHandEnd {
 		reads := advice.Reads{
 			Tendencies: make(map[string]map[string]float64),
 			RangeWidth: make(map[string]float64),
 		}
 		if s.prof != nil {
-			for _, seat := range h.Seats {
-				if seat.PlayerID == "" || seat.PlayerID == h.HeroID {
+			for _, seat := range state.Seats {
+				if seat.PlayerID == "" || seat.PlayerID == state.HeroID {
 					continue
 				}
 				if t := s.prof.GetPlayerTendencies(seat.PlayerID); len(t) > 0 {
 					reads.Tendencies[seat.PlayerID] = t
 				}
+				// Our own accumulated VPIP if we have one; otherwise the
+				// operator's session VPIP off the wire, so a player we have
+				// never seen still gets a read from the first hand.
 				if stats := s.prof.GetStats(seat.PlayerID); stats != nil && stats.VPIP > 0 {
 					reads.RangeWidth[seat.PlayerID] = stats.VPIP
+				} else if seat.ServerVPIP > 0 {
+					reads.RangeWidth[seat.PlayerID] = seat.ServerVPIP
 				}
 			}
 		}
 
-		res := advice.Evaluate(h, reads, advice.Options{})
+		res := advice.Evaluate(state, reads, advice.Options{})
 		rec = res.Recommendation
 		noAdvice = res.NoAdvice
 		auditReads = res.SeatReads
 	}
 
 	if lg := s.auditLogger(); lg != nil {
-		_ = lg.Log(audit.Build(event.HandState, rec, auditReads))
+		_ = lg.Log(audit.Build(state, rec, auditReads))
 	}
 
 	// 4. WebSocket broadcast
 	now := time.Now().UnixMilli()
 
-	// A frame that says what the last one said is not news. The panel is
+	// A state that says what the last one said is not news. The panel is
 	// redrawn from these messages, so sending them anyway is what makes it
-	// flicker; nothing downstream loses anything by not hearing the same
-	// thing twice.
-	if s.alreadySent(tableID, event.HandState, rec, noAdvice) {
+	// flicker; nothing downstream loses anything by not hearing it twice.
+	if s.alreadySent(tableID, state, rec, noAdvice) {
 		return rec, nil
 	}
 
 	s.hub.BroadcastToTable(tableID, WSMessage{
-		Type:      WSMsgEvent,
+		Type:      WSMsgStateUpdate,
 		TableID:   tableID,
-		Payload:   event,
+		Payload:   state,
 		Timestamp: now,
 	})
 
-	if event.HandState != nil {
-		s.hub.BroadcastToTable(tableID, WSMessage{
-			Type:      WSMsgStateUpdate,
-			TableID:   tableID,
-			Payload:   event.HandState,
-			Timestamp: now,
-		})
-	}
-
 	// A recommendation is broadcast on every processed state, including the
-	// ones that produced none. Sending only when advice exists leaves the HUD
-	// holding the previous hand's recommendation with nothing to tell it the
-	// advice has expired -- live, that showed a confident CHECK, computed for a
-	// pot of 4,280, while the table sat at 61,680 and hero was facing a raise.
-	// A null payload is the signal that there is currently no advice.
+	// ones that produced none: a null payload is the signal that there is
+	// currently no advice, so the HUD does not go on showing the last hand's.
 	if isHandEnd && rec == nil && noAdvice == "" {
 		noAdvice = "Раздача закончена"
 	}
@@ -330,7 +255,7 @@ func (s *Server) ProcessEvent(event vision.VisionEvent) (*advisor.AdvisorRespons
 
 	// The second opinion is asked for last and answered later. It never holds
 	// up the recommendation the panel is drawn from.
-	s.askCoach(tableID, event.HandState, rec)
+	s.askCoach(tableID, state, rec)
 
 	return rec, nil
 }
@@ -369,22 +294,12 @@ func (s *Server) alreadySent(tableID string, state *table.HandState,
 	return false
 }
 
-// IngestLiveState updates the table state in cache, runs Monte Carlo equity and Advisor recommendation calculations, and broadcasts the state update over WebSocket.
+// IngestLiveState folds a table state into the pipeline: cache, hand-end
+// persistence and profiling, the advisor, and the WebSocket broadcast. It is
+// the sole ingest path -- the wire source (pkg/sfs) calls it with each state it
+// reconstructs.
 func (s *Server) IngestLiveState(state *table.HandState) (*advisor.AdvisorResponse, error) {
-	if state == nil {
-		return nil, errors.New("nil hand state provided")
-	}
-	event := vision.VisionEvent{
-		Type:      vision.EventHeroTurn,
-		TableID:   state.TableID,
-		HandState: state,
-	}
-	return s.ProcessEvent(event)
-}
-
-// IngestEvent processes an incoming game/vision event, updating cache, profiler, and broadcasting over WebSocket.
-func (s *Server) IngestEvent(event vision.VisionEvent) (*advisor.AdvisorResponse, error) {
-	return s.ProcessEvent(event)
+	return s.ingestState(state)
 }
 
 func (s *Server) handleInitTable(w http.ResponseWriter, r *http.Request) {
@@ -447,62 +362,6 @@ func (s *Server) handleGetTableState(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(state)
-}
-
-func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
-	tableID := r.PathValue("id")
-	if tableID == "" {
-		http.Error(w, "table id required", http.StatusBadRequest)
-		return
-	}
-
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
-		return
-	}
-
-	var event vision.VisionEvent
-	if err := json.Unmarshal(bodyBytes, &event); err == nil && (event.Type != "" || event.HandState != nil) {
-		if event.TableID == "" {
-			event.TableID = tableID
-		}
-		rec, err := s.ProcessEvent(event)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		resp := EventIngestResponse{
-			Status:         "ok",
-			Recommendation: rec,
-			Event:          &event,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-		return
-	}
-
-	// Try unmarshaling directly as HandState
-	var state table.HandState
-	if err := json.Unmarshal(bodyBytes, &state); err == nil {
-		if state.TableID == "" {
-			state.TableID = tableID
-		}
-		rec, err := s.IngestLiveState(&state)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":         "ok",
-			"recommendation": rec,
-			"state":          state,
-		})
-		return
-	}
-
-	http.Error(w, "invalid event or hand state payload", http.StatusBadRequest)
 }
 
 func (s *Server) handleGetPlayerProfile(w http.ResponseWriter, r *http.Request) {
@@ -580,179 +439,4 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	go client.writePump()
 	go client.readPump()
-}
-
-// SetSnapshot encodes the provided image to JPEG format and updates the server's live snapshot frame.
-func (s *Server) SetSnapshot(img image.Image) {
-	if img == nil {
-		s.snapshotMu.Lock()
-		s.snapshotData = nil
-		s.snapshotType = ""
-		s.snapshotMu.Unlock()
-		return
-	}
-
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 85}); err != nil {
-		return
-	}
-
-	s.snapshotMu.Lock()
-	s.snapshotData = buf.Bytes()
-	s.snapshotType = "image/jpeg"
-	s.snapshotMu.Unlock()
-}
-
-// SetSnapshotBytes sets the raw snapshot image payload and content type.
-func (s *Server) SetSnapshotBytes(data []byte, contentType string) {
-	s.snapshotMu.Lock()
-	defer s.snapshotMu.Unlock()
-	s.snapshotData = data
-	if contentType == "" {
-		contentType = "image/jpeg"
-	}
-	s.snapshotType = contentType
-}
-
-// GetSnapshot retrieves a copy of the current snapshot bytes and its content type.
-func (s *Server) GetSnapshot() ([]byte, string) {
-	s.snapshotMu.RLock()
-	defer s.snapshotMu.RUnlock()
-	if len(s.snapshotData) == 0 {
-		return nil, ""
-	}
-	out := make([]byte, len(s.snapshotData))
-	copy(out, s.snapshotData)
-	return out, s.snapshotType
-}
-
-// SetROIConfig updates the active table layout and keeps it.
-//
-// Calibration is done by hand against one client's layout, so it has to
-// survive the process that took it. A layout that cannot be written is still
-// applied: the operator has calibrated, and refusing to use it because it
-// could not be filed would be the wrong way round.
-func (s *Server) SetROIConfig(cfg vision.ROIConfig) error {
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-	s.roiMu.Lock()
-	s.roiConfig = cfg
-	path := s.roiPath
-	s.roiMu.Unlock()
-
-	if path == "" {
-		return nil
-	}
-	return vision.SaveROIConfig(path, cfg)
-}
-
-// LoadROIConfig applies the saved calibration, if there is one.
-//
-// Reports what it did so a start-up line can say which layout is in use: the
-// built-in one and a hand-made one behave very differently, and until now
-// there was no way to tell them apart from the outside.
-func (s *Server) LoadROIConfig() (path string, loaded bool, err error) {
-	s.roiMu.RLock()
-	path = s.roiPath
-	s.roiMu.RUnlock()
-	if path == "" {
-		return "", false, nil
-	}
-	cfg, found, err := vision.LoadROIConfig(path)
-	if err != nil || !found {
-		return path, false, err
-	}
-	s.roiMu.Lock()
-	s.roiConfig = cfg
-	s.roiMu.Unlock()
-	return path, true, nil
-}
-
-// roiConfigPath is where calibrations are kept, or empty when this machine
-// will not say where its configuration lives.
-func roiConfigPath() string {
-	p, err := vision.ROIConfigPath()
-	if err != nil {
-		return ""
-	}
-	return p
-}
-
-// GetROIConfig returns the active table Region of Interest layout.
-func (s *Server) GetROIConfig() vision.ROIConfig {
-	s.roiMu.RLock()
-	defer s.roiMu.RUnlock()
-	return s.roiConfig
-}
-
-// SetWindowsProvider sets a custom window enumeration provider (useful for testing).
-func (s *Server) SetWindowsProvider(provider func() ([]capture.WindowInfo, error)) {
-	s.windowsMu.Lock()
-	defer s.windowsMu.Unlock()
-	s.windowsProvider = provider
-}
-
-// GetWindows discovers and returns on-screen windows.
-func (s *Server) GetWindows() ([]capture.WindowInfo, error) {
-	s.windowsMu.RLock()
-	provider := s.windowsProvider
-	s.windowsMu.RUnlock()
-
-	if provider != nil {
-		return provider()
-	}
-	return capture.ListAllWindows()
-}
-
-func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
-	data, contentType := s.GetSnapshot()
-	if len(data) == 0 {
-		http.Error(w, "no snapshot available", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
-}
-
-func (s *Server) handleGetROI(w http.ResponseWriter, r *http.Request) {
-	cfg := s.GetROIConfig()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(cfg)
-}
-
-func (s *Server) handleSetROI(w http.ResponseWriter, r *http.Request) {
-	var cfg vision.ROIConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-		http.Error(w, "invalid roi json payload", http.StatusBadRequest)
-		return
-	}
-
-	// A layout that cannot read a table is refused here rather than accepted
-	// and discovered later as an empty board and nameless players.
-	if err := s.SetROIConfig(cfg); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(cfg)
-}
-
-func (s *Server) handleGetWindows(w http.ResponseWriter, r *http.Request) {
-	windows, err := s.GetWindows()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to list windows: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if windows == nil {
-		windows = []capture.WindowInfo{}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(windows)
 }

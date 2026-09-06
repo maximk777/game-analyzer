@@ -10,6 +10,7 @@ import (
 
 	"poker-game-analyzer/pkg/advisor"
 	"poker-game-analyzer/pkg/llm"
+	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
 )
 
@@ -150,5 +151,38 @@ func TestCoachNormalisesAPercentConfidence(t *testing.T) {
 	}
 	if got.Confidence != 0.7 {
 		t.Fatalf("confidence: got %v, want 0.7", got.Confidence)
+	}
+}
+
+// The opponents' statistics must reach the model -- they are what a bluff
+// decision is made from -- and the bluff and opinion fields must read back.
+func TestCoachGetsStatsAndReturnsBluffAndOpinion(t *testing.T) {
+	var prompt string
+	srv := serve(t, `{"action":"raise","amount":6000,"confidence":0.65,"agrees":false,
+"reasoning":"Оппонент часто пасует на к-бет.","bluff":true,"bluff_reason":"fold-to-cbet 72% на малой выборке",
+"opinion":"Тул зовёт, но против такого фолдера ставка забирает банк чаще, чем окупается колл."}`, &prompt)
+	defer srv.Close()
+
+	in := spot()
+	in.Stats = map[string]*storage.PlayerStats{
+		"opp": {PlayerID: "opp", HandsCount: 140, VPIP: 28, PFR: 20, ThreeBet: 6,
+			FoldToCBet: 0.72, FoldToCBetN: 40},
+	}
+
+	got, err := llm.NewOpenAIClient("k", srv.URL, llm.GeminiModel).AdviseHand(context.Background(), in)
+	if err != nil {
+		t.Fatalf("AdviseHand: %v", err)
+	}
+	if !strings.Contains(prompt, "fold-to-cbet 72%") {
+		t.Errorf("opponent fold-to-cbet not in the prompt:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "VPIP 28%") {
+		t.Errorf("opponent VPIP not in the prompt")
+	}
+	if !got.Bluff || got.BluffReason == "" {
+		t.Errorf("bluff not read back: %+v", got)
+	}
+	if got.Opinion == "" {
+		t.Error("opinion not read back")
 	}
 }

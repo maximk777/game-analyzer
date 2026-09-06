@@ -8,7 +8,6 @@ import (
 	"poker-game-analyzer/pkg/audit"
 	"poker-game-analyzer/pkg/storage"
 	"poker-game-analyzer/pkg/table"
-	"poker-game-analyzer/pkg/vision"
 )
 
 // Every processed event must reach the decision audit, including the ones that
@@ -30,17 +29,14 @@ func TestProcessEvent_WritesToAuditLog(t *testing.T) {
 		t.Fatalf("parsing board: %v", err)
 	}
 
-	ev := vision.VisionEvent{
-		TableID: "t",
-		HandState: &table.HandState{
-			TableID: "t", Street: table.StreetFlop, Pot: 1000,
-			CommunityCards: board,
-			Seats:          []table.SeatState{{PlayerID: "v", Stack: 5000, IsActive: true}},
-		},
+	state := &table.HandState{
+		TableID: "t", Street: table.StreetFlop, Pot: 1000,
+		CommunityCards: board,
+		Seats:          []table.SeatState{{PlayerID: "v", Stack: 5000, IsActive: true}},
 	}
 
-	if _, err := srv.ProcessEvent(ev); err != nil {
-		t.Fatalf("ProcessEvent: %v", err)
+	if _, err := srv.IngestLiveState(state); err != nil {
+		t.Fatalf("ingest: %v", err)
 	}
 
 	if got := lg.Written(); got != 1 {

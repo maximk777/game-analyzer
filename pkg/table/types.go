@@ -52,6 +52,15 @@ type SeatState struct {
 	// what someone actually held for a line: frequencies say how often a player
 	// bets, showdowns say with what.
 	Cards []Card `json:"cards,omitempty"`
+
+	// ServerVPIP and ServerHands are the operator's own per-seat statistic,
+	// reported on the wire with every seat update (vpipPercentage 0..100 and the
+	// hands played this session). It is a read available from the first hand,
+	// before we have accumulated a sample of our own -- worth having on a player
+	// we have never seen, and worth nothing once our own count exceeds it, since
+	// ours spans sessions and theirs resets each one. Zero means not reported.
+	ServerVPIP  float64 `json:"server_vpip,omitempty"`
+	ServerHands int     `json:"server_hands,omitempty"`
 }
 
 type ActionRecord struct {

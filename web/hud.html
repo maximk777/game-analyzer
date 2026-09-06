@@ -162,6 +162,18 @@
                     <span class="coach-amount" id="hudCoachAmount"></span>
                 </div>
                 <div class="coach-text" id="hudCoachText">Модель читает стол…</div>
+
+                <!-- Bluff spot the statistics justify. Shown only when the model
+                     flags one, because a bluff on tap is the read the numbers
+                     buy that the reproducible engine will not make on its own. -->
+                <div class="coach-bluff" id="hudCoachBluff" hidden>
+                    <span class="coach-bluff-tag">БЛЕФ-СПОТ</span>
+                    <span class="coach-bluff-text" id="hudCoachBluffText"></span>
+                </div>
+
+                <!-- The model's own words: where it disagrees and why. -->
+                <div class="coach-opinion" id="hudCoachOpinion" hidden></div>
+
                 <div class="coach-model" id="hudCoachModel"></div>
             </section>
 

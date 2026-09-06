@@ -19,3 +19,6 @@ bin/
 
 # Diagnostic capture corpus (large PNG frames)
 testdata/diag/
+
+# design canvas scratch (published as an Artifact)
+scratch-design/
