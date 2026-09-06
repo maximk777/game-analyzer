@@ -21,7 +21,7 @@ func main() {
 	var (
 		portFlag     = flag.Int("port", 8080, "HTTP and WebSocket server port")
 		dbPathFlag   = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
-		llmKeyFlag   = flag.String("llm-key", "", "API key; falls back to GEMINI_API_KEY, GOOGLE_API_KEY or OPENAI_API_KEY")
+		llmKeyFlag   = flag.String("llm-key", "", "API key; falls back to GEMINI_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, then to Vertex on the machine's Google credentials")
 		llmURLFlag   = flag.String("llm-url", "", "OpenAI-compatible base URL; defaults to Gemini, or to OpenAI when the key came from OPENAI_API_KEY")
 		llmModelFlag = flag.String("llm-model", "", "Model name; defaults to "+llm.GeminiModel)
 		mockLLMFlag  = flag.Bool("mock-llm", false, "Use mock deterministic LLM profiler")
@@ -48,22 +48,26 @@ func main() {
 
 	// 3. Initialize LLM Client
 	var llmClient llm.Client
-	if *mockLLMFlag || !settings.Live() {
-		log.Printf("[SERVER] Profiler: rules only, no model (%s)", settings.Describe())
+	var coach llm.Coach
+	if *mockLLMFlag {
+		log.Printf("[SERVER] Profiler: rules only, no model")
+		llmClient = llm.NewMockClient()
+	} else if c, resolved, err := llm.NewClient(context.Background(), settings); err != nil {
+		log.Printf("[SERVER] No model: %v", err)
 		llmClient = llm.NewMockClient()
 	} else {
+		settings = resolved
 		log.Printf("[SERVER] Profiler: %s", settings.Describe())
-		llmClient = llm.NewOpenAIClient(settings.Key, settings.BaseURL, settings.Model)
+		llmClient, coach = c, c
 	}
 
 	// 4. Initialize Opponent Profiler
 	prof := profiler.NewProfiler(cache, db, llmClient)
 	defer prof.Close()
-	coach, hasCoach := llmClient.(llm.Coach)
 
 	// 5. Initialize Server & Hub
 	srv := server.NewServer(cache, db, prof)
-	if hasCoach && !*mockLLMFlag && settings.Live() {
+	if coach != nil {
 		srv.SetCoach(coach)
 	}
 

@@ -94,11 +94,30 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 	cache := storage.NewMemoryCache()
 
 	// 3. Initialize LLM Client
+	//
+	// An API key is the simple path. Without one, the credentials on the
+	// machine are tried, which reaches the same models through a Cloud project
+	// on a service account -- so a machine with `gcloud auth
+	// application-default login` behind it needs no key at all.
 	var llmClient llm.Client
-	if cfg.MockLLM || !cfg.LLM.Live() {
+	var coach llm.Coach
+	if cfg.MockLLM {
+		llmClient = llm.NewMockClient()
+	} else if c, resolved, err := llm.NewClient(context.Background(), cfg.LLM); err != nil {
+		log.Printf("[AGENT] No model: %v", err)
+		cfg.MockLLM = true
 		llmClient = llm.NewMockClient()
 	} else {
-		llmClient = llm.NewOpenAIClient(cfg.LLM.Key, cfg.LLM.BaseURL, cfg.LLM.Model)
+		cfg.LLM = resolved
+		llmClient, coach = c, c
+	}
+	// Said after resolution, not before: a project discovered from the
+	// machine's credentials is not one anybody typed on the command line.
+	if cfg.MockLLM {
+		log.Printf("[AGENT] Profiler: rules only, no model (%s)", cfg.LLM.Describe())
+	} else {
+		log.Printf("[AGENT] Profiler: %s", cfg.LLM.Describe())
+		log.Printf("[AGENT] Second opinion at the table: on")
 	}
 
 	// 4. Initialize Opponent Profiler
@@ -111,10 +130,8 @@ func NewAgentApp(cfg Config, grabber capture.FrameGrabber) (*AgentApp, error) {
 	// separate panel and never the decision: the tool's own answer is computed
 	// and reproducible, this one is a reading in words, and the disagreements
 	// are the part worth looking at.
-	if !cfg.MockLLM && cfg.LLM.Live() {
-		if c, ok := llmClient.(llm.Coach); ok {
-			srv.SetCoach(c)
-		}
+	if coach != nil {
+		srv.SetCoach(coach)
 	}
 
 	// The built-in layout and a hand-made one behave very differently, and
@@ -417,7 +434,7 @@ func main() {
 		tableIDFlag   = flag.String("table-id", "coinpoker-live", "Active table ID")
 		heroIDFlag    = flag.String("hero-id", "Hero", "Active hero player ID")
 		mockLLMFlag   = flag.Bool("mock-llm", false, "Use offline deterministic mock profiler")
-		llmKeyFlag    = flag.String("llm-key", "", "API key; falls back to GEMINI_API_KEY, GOOGLE_API_KEY or OPENAI_API_KEY")
+		llmKeyFlag    = flag.String("llm-key", "", "API key; falls back to GEMINI_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, then to Vertex on the machine's Google credentials")
 		llmURLFlag    = flag.String("llm-url", "", "OpenAI-compatible base URL; defaults to Gemini, or to OpenAI when the key came from OPENAI_API_KEY")
 		llmModelFlag  = flag.String("llm-model", "", "Model name; defaults to "+llm.GeminiModel)
 		webDirFlag    = flag.String("web-dir", "web", "Web assets directory")
@@ -426,7 +443,6 @@ func main() {
 	flag.Parse()
 
 	settings := llm.Resolve(*llmKeyFlag, *llmURLFlag, *llmModelFlag, os.Getenv)
-	useMockLLM := *mockLLMFlag || !settings.Live()
 
 	cfg := Config{
 		WindowQuery: *windowFlag,
@@ -436,7 +452,7 @@ func main() {
 		OpenHUD:     *openHUDFlag,
 		TableID:     *tableIDFlag,
 		HeroID:      *heroIDFlag,
-		MockLLM:     useMockLLM,
+		MockLLM:     *mockLLMFlag,
 		LLM:         settings,
 		WebDir:      *webDirFlag,
 		AuditPath:   *auditPathFlag,
@@ -447,11 +463,6 @@ func main() {
 	log.Printf("[AGENT] Target Window: %q | Capture FPS: %d", cfg.WindowQuery, cfg.FPS)
 	log.Printf("[AGENT] Table ID: %q | Hero ID: %q", cfg.TableID, cfg.HeroID)
 	log.Printf("[AGENT] Server Port: %d | Database: %q", cfg.Port, cfg.DBPath)
-	if cfg.MockLLM {
-		log.Printf("[AGENT] Profiler: rules only, no model (%s)", cfg.LLM.Describe())
-	} else {
-		log.Printf("[AGENT] Profiler: %s", cfg.LLM.Describe())
-	}
 	log.Printf("[AGENT] Open Floating HUD: %v", cfg.OpenHUD)
 	log.Printf("[AGENT] ===================================================")
 

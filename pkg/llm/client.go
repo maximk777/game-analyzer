@@ -96,7 +96,7 @@ type OpenAIOption func(*OpenAIClient)
 
 // OpenAIClient implements Client communicating with OpenAI-compatible chat completion endpoints.
 type OpenAIClient struct {
-	apiKey     string
+	tokens     Tokens
 	baseURL    string
 	model      string
 	httpClient *http.Client
@@ -133,7 +133,7 @@ func NewOpenAIClient(apiKey string, baseURL string, model string, opts ...OpenAI
 	}
 
 	c := &OpenAIClient{
-		apiKey:     apiKey,
+		tokens:     staticToken(apiKey),
 		baseURL:    baseURL,
 		model:      model,
 		timeout:    30 * time.Second,
@@ -144,6 +144,15 @@ func NewOpenAIClient(apiKey string, baseURL string, model string, opts ...OpenAI
 		opt(c)
 	}
 
+	return c
+}
+
+// newTokenClient is NewOpenAIClient for a credential that expires. The
+// difference is the whole reason Tokens exists: a service account's token is
+// good for an hour, and holding it as a string worked for exactly that long.
+func newTokenClient(tokens Tokens, baseURL, model string) *OpenAIClient {
+	c := NewOpenAIClient("", baseURL, model)
+	c.tokens = tokens
 	return c
 }
 
@@ -277,7 +286,11 @@ func (c *OpenAIClient) send(ctx context.Context, systemPrompt, userPrompt string
 		return "", fmt.Errorf("failed to create http request: %w", err)
 	}
 
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	token, err := c.tokens.Token(ctx)
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
