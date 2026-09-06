@@ -172,11 +172,13 @@ const (
 	// keeps a say, because a player's frequency in the spots we happened to
 	// observe is not their frequency in this spot.
 	maxMeasuredWeight = 0.60
-	// maxModelledWeight caps a tendency that came from the language model
-	// rather than from counted events. It is an opinion formed from summary
-	// statistics, and it must never be able to carry a decision on its own --
-	// "he is definitely bluffing, shove" is exactly the failure being designed
-	// out here.
+	// maxModelledWeight caps a tendency with no counted sample of ours behind
+	// it. That is the language model's opinion, formed from summary statistics,
+	// which must never be able to carry a decision on its own -- "he is
+	// definitely bluffing, shove" is exactly the failure being designed out
+	// here. It is also the site's own aggregate (pkg/coinpoker), which is
+	// measured rather than guessed but arrives without the sample size behind
+	// it, so it cannot be weighted as a fact either.
 	maxModelledWeight = 0.25
 )
 

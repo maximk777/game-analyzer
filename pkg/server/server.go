@@ -193,22 +193,28 @@ func (s *Server) ingestState(state *table.HandState) (*advisor.AdvisorResponse, 
 			Tendencies: make(map[string]map[string]float64),
 			RangeWidth: make(map[string]float64),
 		}
-		if s.prof != nil {
-			for _, seat := range state.Seats {
-				if seat.PlayerID == "" || seat.PlayerID == state.HeroID {
-					continue
+		for _, seat := range state.Seats {
+			if seat.PlayerID == "" || seat.PlayerID == state.HeroID {
+				continue
+			}
+			var own map[string]float64
+			var ownVPIP float64
+			var ownHands int
+			if s.prof != nil {
+				own = s.prof.GetPlayerTendencies(seat.PlayerID)
+				if stats := s.prof.GetStats(seat.PlayerID); stats != nil {
+					ownVPIP, ownHands = stats.VPIP, stats.HandsCount
 				}
-				if t := s.prof.GetPlayerTendencies(seat.PlayerID); len(t) > 0 {
-					reads.Tendencies[seat.PlayerID] = t
-				}
-				// Our own accumulated VPIP if we have one; otherwise the
-				// operator's session VPIP off the wire, so a player we have
-				// never seen still gets a read from the first hand.
-				if stats := s.prof.GetStats(seat.PlayerID); stats != nil && stats.VPIP > 0 {
-					reads.RangeWidth[seat.PlayerID] = stats.VPIP
-				} else if seat.ServerVPIP > 0 {
-					reads.RangeWidth[seat.PlayerID] = seat.ServerVPIP
-				}
+			}
+			// What we counted, over what the site counted. On a table where we
+			// have no history the second is the whole read, and without it every
+			// opponent was a stranger for the first hour -- 0/0/0 in the panel
+			// beside the client's own popup showing 25/20/9.
+			if t := advice.WithSiteRead(own, seat.Site); len(t) > 0 {
+				reads.Tendencies[seat.PlayerID] = t
+			}
+			if w, ok := advice.RangeWidthVPIP(ownVPIP, ownHands, seat.Site, seat.ServerVPIP); ok {
+				reads.RangeWidth[seat.PlayerID] = w
 			}
 		}
 

@@ -62,11 +62,47 @@ type SeatState struct {
 	ServerVPIP  float64 `json:"server_vpip,omitempty"`
 	ServerHands int     `json:"server_hands,omitempty"`
 
+	// Site is the operator's own aggregate for this player -- the numbers its
+	// client shows in the player popup, fetched from the same endpoint (see
+	// pkg/coinpoker). Nil means it was not asked for, or the site had nothing.
+	Site *SiteStats `json:"site_stats,omitempty"`
+
 	// WonHand is set at showdown for a player who won the pot (or part of it).
 	// With Cards, it is what lets a showdown be counted: who reached it and who
 	// took the money -- the difference between "went to showdown" and "won at
 	// showdown", the read that says whether a player's showdowns are strong.
 	WonHand bool `json:"won_hand,omitempty"`
+}
+
+// SiteStats is what the site itself has counted about a player: a thirty-day
+// aggregate over every table they have sat at, which is a read available before
+// the first card rather than after two hundred hands of our own.
+//
+// Every frequency is a fraction, as the site states it: a VPIP of 0.27 is
+// twenty-seven percent. Converting to the percentages the tool's own tendencies
+// use happens where the two meet, so that what is carried here is what was said.
+type SiteStats struct {
+	VPIP           float64 `json:"vpip,omitempty"`
+	PFR            float64 `json:"pfr,omitempty"`
+	ThreeBet       float64 `json:"three_bet,omitempty"`
+	FoldToThreeBet float64 `json:"fold_to_3bet,omitempty"`
+	CBet           float64 `json:"cbet,omitempty"`
+	FoldToCBet     float64 `json:"fold_to_cbet,omitempty"`
+	Steal          float64 `json:"steal,omitempty"`
+	CheckRaise     float64 `json:"check_raise,omitempty"`
+	WTSD           float64 `json:"wtsd,omitempty"`
+	WSD            float64 `json:"wsd,omitempty"`
+
+	// Hands is the sample the aggregate was computed over, and zero means the
+	// site did not report one -- which on real-money tables it does not, even
+	// when every frequency is populated. So it may not be used to decide whether
+	// the rest is real, and a weight cannot be derived from it there.
+	Hands int `json:"hands,omitempty"`
+
+	// Pool is which game these describe: real money or play money. They are
+	// separate histories at this site, and a player may have one, both, or
+	// neither.
+	Pool string `json:"pool,omitempty"`
 }
 
 type ActionRecord struct {

@@ -20,10 +20,12 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"syscall"
 	"time"
 
 	"poker-game-analyzer/pkg/audit"
+	"poker-game-analyzer/pkg/coinpoker"
 	"poker-game-analyzer/pkg/llm"
 	"poker-game-analyzer/pkg/profiler"
 	"poker-game-analyzer/pkg/server"
@@ -34,16 +36,17 @@ import (
 
 func main() {
 	var (
-		httpPort = flag.Int("port", 8080, "HTTP and WebSocket server port")
-		dbPath   = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
-		webDir   = flag.String("web-dir", "web", "static frontend assets directory")
-		iface    = flag.String("i", "en0", "capture interface")
-		pcapFile = flag.String("r", "", "replay a pcap file instead of capturing live")
-		heroID   = flag.Int64("hero-id", 0, "hero's userId (identifies our seat)")
-		heroName = flag.String("hero-name", "", "hero's screen name (alternative to -hero-id)")
-		mockLLM  = flag.Bool("mock-llm", false, "use the deterministic mock profiler")
-		tableID  = flag.String("table-id", "coinpoker-live", "table id the HUD subscribes to; the live table is broadcast under it")
-		auditLog = flag.String("audit", "./bin/logs/decisions.jsonl", "decision audit log (JSONL); empty to disable")
+		httpPort  = flag.Int("port", 8080, "HTTP and WebSocket server port")
+		dbPath    = flag.String("db", "./bin/db/poker_analyzer.db", "SQLite database file path")
+		webDir    = flag.String("web-dir", "web", "static frontend assets directory")
+		iface     = flag.String("i", "en0", "capture interface")
+		pcapFile  = flag.String("r", "", "replay a pcap file instead of capturing live")
+		heroID    = flag.Int64("hero-id", 0, "hero's userId (identifies our seat)")
+		heroName  = flag.String("hero-name", "", "hero's screen name (alternative to -hero-id)")
+		mockLLM   = flag.Bool("mock-llm", false, "use the deterministic mock profiler")
+		tableID   = flag.String("table-id", "coinpoker-live", "table id the HUD subscribes to; the live table is broadcast under it")
+		auditLog  = flag.String("audit", "./bin/logs/decisions.jsonl", "decision audit log (JSONL); empty to disable")
+		siteStats = flag.Bool("site-stats", true, "ask the site for its own reads on the players at the table")
 	)
 	flag.Parse()
 
@@ -56,6 +59,18 @@ func main() {
 
 	go serve(srv, *httpPort)
 
+	// The site's own reads for whoever is at the table. The wire says what this
+	// session has seen -- a hand or two at a new table -- while the site holds a
+	// month of every table the player has sat at, and hands it over on request.
+	// Asked for in the background; the states carry whatever has arrived.
+	var feed *coinpoker.Feed
+	if *siteStats {
+		feed = coinpoker.NewFeed()
+		if *heroID != 0 {
+			feed.SetHero(strconv.FormatInt(*heroID, 10))
+		}
+	}
+
 	live := &sfs.Live{
 		HeroID:   *heroID,
 		HeroName: *heroName,
@@ -64,6 +79,7 @@ func main() {
 			// real wire table number stays the hand id's prefix for the record;
 			// this is only the room the single HUD subscribes to.
 			hs.TableID = *tableID
+			feed.Annotate(hs)
 			if _, err := srv.IngestLiveState(hs); err != nil {
 				log.Printf("[SFS] ingest: %v", err)
 			}
