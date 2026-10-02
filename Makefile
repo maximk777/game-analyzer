@@ -15,15 +15,18 @@ overlay: bin/overlay
 #
 # The agent reads the game wire (SmartFoxServer traffic off :700x, no OCR),
 # rebuilds the table, decides, and serves the HUD over HTTP/WebSocket. The
-# overlay is the window that shows what it decided, pinned to the table.
+# overlay is the window that shows what it decided. It is not tied to the game
+# window: always visible, remembers where you put it (OVERLAY_ARGS=--match
+# CoinPoker brings back "show only while CoinPoker is in front").
 #
 #   make agent HERO_ID=712757     the reader, decisions and HTTP/WS endpoint
-#   make ui                       the floating panel, pinned to CoinPoker
+#   make ui                       the floating panel, independent of the game window
 #   make app  HERO_ID=712757      both
 #
 # HERO_ID (or HERO_NAME) tells the agent which seat is yours. It needs BPF
 # access for live capture -- install ChmodBPF once, or run under sudo.
 PORT ?= 8080
+OVERLAY_ARGS ?=
 HERO_ID ?=
 HERO_NAME ?=
 
@@ -41,14 +44,14 @@ server:
 	go run ./cmd/server --port $(PORT)
 
 ui: bin/overlay
-	bin/overlay --url http://localhost:$(PORT)/hud.html --match CoinPoker
+	bin/overlay --url http://localhost:$(PORT)/hud.html $(OVERLAY_ARGS)
 
 app: bin/overlay
 	@echo "starting agent on :$(PORT) and the overlay -- Ctrl-C to stop both"
 	@( go run ./cmd/sfsagent -port $(PORT) \
 		$(if $(HERO_ID),-hero-id $(HERO_ID),) $(if $(HERO_NAME),-hero-name $(HERO_NAME),) & \
 	   AGENT=$$!; \
-	   sleep 2; bin/overlay --url http://localhost:$(PORT)/hud.html --match CoinPoker; \
+	   sleep 2; bin/overlay --url http://localhost:$(PORT)/hud.html $(OVERLAY_ARGS); \
 	   kill $$AGENT 2>/dev/null )
 
 # The harness: plays the advisor out over whole hands against simulated

@@ -1,28 +1,34 @@
-// overlay is the HUD's window: a floating panel that shows the assistant only
-// while CoinPoker is the app in front, and gets out of the way the moment you
-// switch to anything else.
+// overlay is the HUD's window: a floating panel that hosts the page the agent
+// serves, on its own and independent of the game window.
 //
-// The HUD is a web page served by the agent; a browser tab cannot float above
-// one app and hide behind another, so this hosts the page in a native panel and
-// ties its visibility to the frontmost application. Two window traits do the
-// work: the panel is non-activating (showing it never steals focus from the
-// table) and it floats above normal windows; a workspace observer flips it on
-// when CoinPoker comes forward and off when it leaves.
+// A browser tab cannot float above other apps, so the page is hosted in a native
+// panel. The panel is non-activating (showing it or clicking it never steals
+// focus from the table) and floats above normal windows. It is not tied to the
+// game: it is always visible, stays where you put it -- the position is
+// remembered between launches -- and works on a second monitor or with the
+// table in any state.
+//
+// Pass --match to get the old behaviour back: the panel then shows only while
+// an app whose name contains the string is in front, and hides when you switch
+// to anything else.
 //
 //	swiftc -O tools/overlay/overlay.swift -o bin/overlay
-//	bin/overlay                       # defaults: localhost:8080/hud.html, "CoinPoker"
-//	bin/overlay --url http://localhost:8080/hud.html --match CoinPoker
+//	bin/overlay                       # localhost:8080/hud.html, always visible
+//	bin/overlay --url http://localhost:8080/hud.html
+//	bin/overlay --match CoinPoker     # opt in: show only while CoinPoker is in front
+//	bin/overlay --reset-position      # forget the saved position
 //
 // It needs the agent (cmd/sfsagent) running to serve the page.
 
 import AppKit
 import WebKit
 
-// Config is the two things worth changing: where the HUD is served, and which
-// app the panel should ride with.
+// Config is what is worth changing: where the HUD is served, and, optionally,
+// an app the panel should ride with.
 struct Config {
     var url = "http://localhost:8080/hud.html"
-    var match = "CoinPoker" // matched as a case-insensitive substring of the app name
+    var match = "" // empty: always visible. Else a case-insensitive substring of an app name
+    var resetPosition = false
     var width = 400.0
     var height = 900.0
     var margin = 24.0 // gap from the screen's top-right corner
@@ -35,6 +41,7 @@ func parseArgs() -> Config {
         switch a {
         case "--url": if let v = it.next() { cfg.url = v }
         case "--match": if let v = it.next() { cfg.match = v }
+        case "--reset-position": cfg.resetPosition = true
         case "--width": if let v = it.next(), let n = Double(v) { cfg.width = n }
         case "--height": if let v = it.next(), let n = Double(v) { cfg.height = n }
         default: break
@@ -81,13 +88,37 @@ final class OverlayController: NSObject {
         if let url = URL(string: cfg.url) {
             web.load(URLRequest(url: url))
         }
+
+        // Where the user put it last time, if anywhere sensible. The panel is
+        // dragged by its background, and AppKit saves the frame under this name
+        // every time it moves, so the position survives a restart.
+        let name = "PokerAnalyzerOverlay"
+        if cfg.resetPosition {
+            NSWindow.removeFrame(usingName: name)
+        }
+        // Default spot first: the first launch has nothing to restore, and
+        // AppKit records the frame at the moment the name is set, so it has to be
+        // the placed one and not the origin the panel was created at.
         position()
+        if panel.setFrameAutosaveName(name), !isOnScreen(panel.frame) {
+            position()
+        }
+    }
+
+    // isOnScreen reports whether enough of the frame is visible to grab. A saved
+    // position on a monitor that has since been unplugged would otherwise leave
+    // the panel running somewhere nobody can reach it.
+    func isOnScreen(_ frame: NSRect) -> Bool {
+        for screen in NSScreen.screens {
+            let hit = screen.visibleFrame.intersection(frame)
+            if hit.width >= 100 && hit.height >= 100 { return true }
+        }
+        return false
     }
 
     // position parks the panel at the top-right of the main screen, inside the
-    // visible frame (below the menu bar). Fixed placement is enough to keep it
-    // off the table; riding the CoinPoker window's exact frame would need the
-    // accessibility permission and is a later refinement.
+    // visible frame (below the menu bar). It is only the first-run default; after
+    // that the panel stays wherever it was dragged.
     func position() {
         guard let screen = NSScreen.main else { return }
         let vf = screen.visibleFrame
@@ -103,8 +134,13 @@ final class OverlayController: NSObject {
 
     // rideWith shows the panel only while the named app is frontmost. It is
     // called on every application switch, and once at launch for the app that is
-    // already in front.
+    // already in front. Without --match there is nothing to ride with and the
+    // panel is simply always shown.
     func rideWith(_ app: NSRunningApplication?) {
+        if cfg.match.isEmpty {
+            show()
+            return
+        }
         let name = app?.localizedName ?? ""
         let mine = app?.processIdentifier == ProcessInfo.processInfo.processIdentifier
         if name.range(of: cfg.match, options: .caseInsensitive) != nil || mine {
@@ -123,15 +159,17 @@ appKit.setActivationPolicy(.accessory)
 
 let controller = OverlayController(cfg: cfg)
 
-// React to every application activation: this is what makes the panel follow
-// CoinPoker and leave when you go to the terminal.
+// Only with --match: react to every application activation, which makes the
+// panel follow that app and leave when you go to the terminal.
 let ws = NSWorkspace.shared
-ws.notificationCenter.addObserver(
-    forName: NSWorkspace.didActivateApplicationNotification,
-    object: nil, queue: .main
-) { note in
-    let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-    controller.rideWith(app)
+if !cfg.match.isEmpty {
+    ws.notificationCenter.addObserver(
+        forName: NSWorkspace.didActivateApplicationNotification,
+        object: nil, queue: .main
+    ) { note in
+        let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+        controller.rideWith(app)
+    }
 }
 
 // Set the initial state from whatever is in front right now.
