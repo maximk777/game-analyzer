@@ -6,6 +6,23 @@
 (function () {
     "use strict";
 
+    // The panel is whatever size the window is, and the layout is drawn for a
+    // width of about FIT_WIDTH css pixels, so the whole page is scaled to the
+    // window: the text is as large as the window allows rather than as large as
+    // a stylesheet guessed.
+    const FIT_WIDTH = 520;
+    function fitToWindow() {
+        const zoom = Math.min(2.4, Math.max(1, window.innerWidth / FIT_WIDTH));
+        const root = document.documentElement.style;
+        root.setProperty("--ui-zoom", zoom.toFixed(2));
+        // The window's height in the zoomed page's own pixels. vh cannot be used:
+        // under zoom it does not come out as the window height, which left the
+        // widget ending short with bare background below it.
+        root.setProperty("--ui-height", (window.innerHeight / zoom).toFixed(1) + "px");
+    }
+    fitToWindow();
+    window.addEventListener("resize", fitToWindow);
+
     const state = {
         tableId: "coinpoker-live",
         ws: null,

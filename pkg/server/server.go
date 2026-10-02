@@ -95,8 +95,16 @@ func (s *Server) Router() http.Handler {
 }
 
 // MountStatic serves static assets from the specified local directory.
+//
+// Served uncached: the HUD is a local page that is edited and rebuilt while a
+// panel is open on it, and a browser or web view that keeps a copy of the
+// stylesheet keeps showing the previous layout.
 func (s *Server) MountStatic(dir string) {
-	s.mux.Handle("GET /", http.FileServer(http.Dir(dir)))
+	files := http.FileServer(http.Dir(dir))
+	s.mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache")
+		files.ServeHTTP(w, r)
+	}))
 }
 
 // SetAuditLogger attaches a decision audit log. Every recommendation, and

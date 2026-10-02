@@ -13,10 +13,11 @@
 // to anything else.
 //
 //	swiftc -O tools/overlay/overlay.swift -o bin/overlay
-//	bin/overlay                       # localhost:8080/hud.html, always visible
+//	bin/overlay                       # localhost:8080/hud.html, right half of the screen
 //	bin/overlay --url http://localhost:8080/hud.html
 //	bin/overlay --match CoinPoker     # opt in: show only while CoinPoker is in front
-//	bin/overlay --reset-position      # forget the saved position
+//	bin/overlay --width 500 --height 800   # a fixed size instead of the right half
+//	bin/overlay --reset-position      # forget the saved position and size
 //
 // It needs the agent (cmd/sfsagent) running to serve the page.
 
@@ -29,9 +30,10 @@ struct Config {
     var url = "http://localhost:8080/hud.html"
     var match = "" // empty: always visible. Else a case-insensitive substring of an app name
     var resetPosition = false
-    var width = 400.0
-    var height = 900.0
-    var margin = 24.0 // gap from the screen's top-right corner
+    // Zero means "fill": the right half of the screen, full height. A size on
+    // the command line overrides either dimension.
+    var width = 0.0
+    var height = 0.0
 }
 
 func parseArgs() -> Config {
@@ -58,7 +60,7 @@ final class OverlayController: NSObject {
     init(cfg: Config) {
         self.cfg = cfg
 
-        let frame = NSRect(x: 0, y: 0, width: cfg.width, height: cfg.height)
+        let frame = NSRect(x: 0, y: 0, width: cfg.width > 0 ? cfg.width : 800, height: cfg.height > 0 ? cfg.height : 900)
 
         // A non-activating panel: it can show and take clicks without becoming
         // the active application, so the poker table keeps the keyboard and the
@@ -86,7 +88,10 @@ final class OverlayController: NSObject {
         super.init()
 
         if let url = URL(string: cfg.url) {
-            web.load(URLRequest(url: url))
+            // Never from cache: the page and its stylesheet are served by a local
+            // agent that changes under the panel, and a cached copy of either
+            // shows the layout of a previous build.
+            web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData))
         }
 
         // Where the user put it last time, if anywhere sensible. The panel is
@@ -116,15 +121,26 @@ final class OverlayController: NSObject {
         return false
     }
 
-    // position parks the panel at the top-right of the main screen, inside the
-    // visible frame (below the menu bar). It is only the first-run default; after
-    // that the panel stays wherever it was dragged.
+    // targetScreen is the screen the mouse is on, which is the one being worked
+    // on when this is launched from a terminal; NSScreen.main follows keyboard
+    // focus and, for a freshly started accessory app, can be any display.
+    func targetScreen() -> NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.screens.first
+    }
+
+    // position puts the panel on the right half of the main screen, the full
+    // height of the visible frame (below the menu bar, above the Dock): the HUD
+    // is read between hands and wants room for large text, and the table sits
+    // comfortably in the other half. It is only the default; once the panel has
+    // been dragged or resized the saved frame wins (see init).
     func position() {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = targetScreen() else { return }
         let vf = screen.visibleFrame
-        let x = vf.maxX - cfg.width - cfg.margin
-        let y = vf.maxY - cfg.height - cfg.margin
-        panel.setFrame(NSRect(x: x, y: y, width: cfg.width, height: cfg.height), display: true)
+        let w = cfg.width > 0 ? cfg.width : (vf.width / 2).rounded()
+        let h = cfg.height > 0 ? min(cfg.height, vf.height) : vf.height
+        panel.setFrame(NSRect(x: vf.maxX - w, y: vf.maxY - h, width: w, height: h), display: true)
     }
 
     // show / hide without stealing focus. orderFrontRegardless brings the panel
